@@ -18,7 +18,7 @@ The agent reads all three files at the start of each session, executes one task,
 
 ## Getting started
 
-### Use the generator
+### 1. Scaffold a new project
 
 Paste the contents of `generator-prompt.md` into an AI chat (Claude, ChatGPT, etc.). It will interview you about your project and generate all three files.
 
@@ -28,9 +28,19 @@ The generator will:
 - Draft a task breakdown and iterate with you
 - Generate the prompt, task list, and notes files
 
+### 2. Add features
+
+Once your project is scaffolded, use `feature-prompt.md` to plan and add new features. Paste it into an AI chat and it will interview you about the feature, read your codebase, and generate:
+
+1. **Feature prompt** (`<feature>-prompt.md`) — A self-contained prompt for the feature with overview, architecture decisions, key files, and patterns to follow.
+2. **Feature tasks** (`memory/<feature>-tasks.md`) — Task checklist scoped to the feature.
+3. **Feature notes** (`memory/<feature>-notes.md`) — Feature-specific context, decisions, and technical reference.
+
+Run the feature prompt the same way you run the project prompt — paste it in, the agent picks up the next task, does it, and stops.
+
 ### Or write them manually
 
-Use the template structure in `generator-prompt.md` as a reference and create the three files yourself.
+Use the template structures in `generator-prompt.md` and `feature-prompt.md` as a reference and create the files yourself.
 
 ## Usage
 
@@ -46,5 +56,6 @@ Repeat until done.
 
 ## Files
 
-- `generator-prompt.md` — The meta-prompt. Give this to your AI to start a new project.
+- `generator-prompt.md` — The meta-prompt. Give this to your AI to scaffold a new project.
+- `feature-prompt.md` — The feature meta-prompt. Give this to your AI to plan and add a feature to an existing project.
 
