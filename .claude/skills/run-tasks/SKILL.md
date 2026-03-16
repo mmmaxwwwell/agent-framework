@@ -38,9 +38,46 @@ You are a lightweight orchestrator. Your job is to dispatch sub-agents to execut
    - Re-read the task list only (the sub-agent may have updated it)
    - Report progress to the user
    - If a task was marked `[?]` (blocked), stop and ask the user for input
-   - If the sub-agent failed, stop and report the issue
+   - If the sub-agent reports a build/test failure it couldn't resolve, try the **fix-build escalation** (see below) before giving up
 
 6. **Continue until done** — Keep dispatching until all tasks are complete, one is blocked, or a failure occurs.
+
+## Fix-build escalation
+
+If a sub-agent completes its work but reports that a build command, test suite, or linter is still failing:
+
+1. **Extract the failing command** from the sub-agent's response (e.g. `npm run build`, `cargo test`, `nix build .#foo`)
+2. **Spawn a fix-build loop** — use the fix-build skill's sub-agent pattern: dispatch an Opus sub-agent that runs the failing command, diagnoses the error, and fixes it. If it still fails, dispatch again with the previous error context. Repeat up to 5 iterations (shorter limit than standalone fix-build since this is mid-task).
+3. **If fix-build succeeds** — continue to the next task as normal. Include a note in the progress report that fix-build resolved a build issue.
+4. **If fix-build fails after 5 attempts** — mark the task `[?]` with the remaining error and stop.
+
+The fix-build sub-agent prompt should include the project context files (prompt, task list, notes) so it understands the project, plus the failing command and error output. Use this template:
+
+```
+You are fixing a build/test failure that occurred while working on an agent-framework project.
+
+Read these files for project context:
+- Prompt file (project spec): <prompt file path>
+- Task list: <task list path>
+- Notes & context: <notes file path>
+
+## Command
+Run this command:
+<the failing command>
+
+## Previous attempts
+<if attempt 2+, one-line summary of what was tried and what error remained>
+
+## Rules
+- Run the command EXACTLY as written above. Do not modify it, pipe it through other commands, or add redirections. Run it verbatim.
+- Read any files referenced in the error output to understand the problem.
+- Investigate the root cause before making changes.
+- Make the minimal fix needed. Do not refactor unrelated code.
+- After fixing, run the command again (exactly as written) to verify.
+- In your final response, clearly state:
+  1. Whether the command now passes or still fails
+  2. A one-line summary of what you fixed (or what error remains)
+```
 
 ## Sub-agent prompt template
 
@@ -68,6 +105,7 @@ Execute ONLY this task:
 - If the task turns out to be unnecessary, mark it `- [~]` with why.
 - If you discover new tasks are needed, add them to the task list.
 - Test your work before marking complete.
+- If a build or test command fails and you cannot fix it, report the exact command that failed and the error summary in your final response so the orchestrator can escalate to fix-build.
 - Prefer minimal changes. Don't refactor unrelated code.
 ```
 

@@ -35,6 +35,7 @@ The skill files at `.claude/skills/*/SKILL.md` contain the full prompts. Paste t
 
 | Skill | Description |
 |-------|-------------|
+| [`fix-build`](.claude/skills/fix-build/SKILL.md) | Iteratively fix a failing build/test command with sub-agents |
 | [`generate-project`](.claude/skills/generate-project/SKILL.md) | Scaffold a new agent-framework project via interview |
 | [`generate-feature`](.claude/skills/generate-feature/SKILL.md) | Plan and add a feature to an existing project |
 | [`run-tasks`](.claude/skills/run-tasks/SKILL.md) | Automate task execution with Opus sub-agents |
