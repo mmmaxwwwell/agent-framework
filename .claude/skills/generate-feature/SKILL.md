@@ -70,9 +70,9 @@ Ask:
 
 ## What to generate
 
-Once you've gathered enough information, generate these three files.
+Once you've gathered enough information, generate these three files. All files go in an `agent-work/` folder in the project directory.
 
-### File 1: `<feature>-prompt.md`
+### File 1: `agent-work/<feature>-prompt.md`
 
 This is a self-contained prompt file that an agent reads to execute the feature one task at a time.
 
@@ -80,19 +80,19 @@ This is a self-contained prompt file that an agent reads to execute the feature 
 # <Feature Name> — Prompt File
 
 ## Instructions
-Run this prompt file to execute the next incomplete task from `memory/<feature>-tasks.md`. Execute ONE task, then stop and let the user run this prompt again for the next task.
+Run this prompt file to execute the next incomplete task from `<feature>-tasks.md`. Execute ONE task, then stop and let the user run this prompt again for the next task.
 
 ## Steps
-1. Read `memory/<feature>-tasks.md` to find the next incomplete (`- [ ]`) task
-2. Read `memory/<feature>-notes.md` for feature-specific context and accumulated learnings
+1. Read `<feature>-tasks.md` to find the next incomplete (`- [ ]`) task
+2. Read `<feature>-notes.md` for feature-specific context and accumulated learnings
 3. Pre-task review — Before starting, think about:
    - Does this task have everything it needs? Are there missing details or ambiguous requirements?
    - Are there dependencies on earlier tasks that aren't done yet?
    - Will this task affect other parts of the codebase?
    - **If anything is unclear, ASK the user before proceeding.**
 4. Execute that single task
-5. Update `memory/<feature>-tasks.md` — mark the task `[x]` with a short summary of what was done
-6. Update `memory/<feature>-notes.md` with any new learnings, decisions, or architectural notes
+5. Update `<feature>-tasks.md` — mark the task `[x]` with a short summary of what was done
+6. Update `<feature>-notes.md` with any new learnings, decisions, or architectural notes
 7. Post-task review — After completing:
    - Did anything come up that changes the plan?
    - Are there open questions for upcoming tasks?
@@ -125,7 +125,7 @@ Run this prompt file to execute the next incomplete task from `memory/<feature>-
 
 **Customize the prompt** based on the feature. Not every section is needed. Add feature-specific rules or sections where they make sense. The goal is a prompt that gives the agent everything it needs to execute tasks without asking basic questions.
 
-### File 2: `memory/<feature>-tasks.md`
+### File 2: `agent-work/<feature>-tasks.md`
 
 ```markdown
 # <Feature Name> — Tasks
@@ -145,7 +145,7 @@ Run this prompt file to execute the next incomplete task from `memory/<feature>-
 ...
 ```
 
-### File 3: `memory/<feature>-notes.md`
+### File 3: `agent-work/<feature>-notes.md`
 
 Seed the notes file with everything learned during the interview and your own research.
 

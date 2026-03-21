@@ -86,14 +86,14 @@ Ask:
 
 ## What to generate
 
-Once you've gathered enough information, generate these three files. Ask the user where they want the files written (default: current project directory).
+Once you've gathered enough information, generate these three files. All files go in an `agent-work/` folder in the project directory. Ask the user where they want the files written (default: `agent-work/` in the current project directory).
 
 **Prompt quality targets:**
 - The prompt file should be **dense but scannable** — enough detail that the agent can execute tasks without asking basic questions, but not so long it becomes a wall of text. Aim for the level of detail you'd put in a good technical design doc.
 - Use bullet points, tables, and code-formatted paths/endpoints for scannability.
 - Every claim in the prompt should be specific and actionable. "Uses React" is too vague. "React 19 + Vite + Three.js" with key file paths is useful.
 
-### File 1: `<project>-prompt.md`
+### File 1: `agent-work/<project>-prompt.md`
 
 Use this template structure:
 
@@ -116,15 +116,15 @@ Use this template structure:
 <From interview section 5, if applicable>
 
 ## Reference files
-- `memory/<project>-tasks.md` — task checklist with progress
-- `memory/<project>-notes.md` — detailed decisions, architecture notes, reference details
+- `<project>-tasks.md` — task checklist with progress
+- `<project>-notes.md` — detailed decisions, architecture notes, reference details
 
 ---
 
 ## How to work
 
-1. **Read the task list** at `memory/<project>-tasks.md` — find the FIRST unchecked task (`- [ ]`)
-2. **Read the memory file** at `memory/<project>-notes.md` — review decisions, architecture notes, and any blockers from previous sessions
+1. **Read the task list** at `<project>-tasks.md` — find the FIRST unchecked task (`- [ ]`)
+2. **Read the memory file** at `<project>-notes.md` — review decisions, architecture notes, and any blockers from previous sessions
 3. **Pre-task review** — Before starting, think about:
    - Does this task have everything it needs? Are there missing details, ambiguous requirements, or design decisions that should be made first?
    - Are there dependencies on earlier tasks that aren't done yet?
@@ -161,7 +161,7 @@ Use this template structure:
 - If the user says "never modify X," add a rule about protected files/directories
 - Don't just dump project-specific rules at the end — integrate them so the Rules section reads as one coherent list
 
-### File 2: `memory/<project>-tasks.md`
+### File 2: `agent-work/<project>-tasks.md`
 
 Generate a task checklist based on interview section 6:
 
@@ -184,7 +184,7 @@ Generate a task checklist based on interview section 6:
 ...
 ```
 
-### File 3: `memory/<project>-notes.md`
+### File 3: `agent-work/<project>-notes.md`
 
 Seed the memory file with everything learned during the interview **and your own research**. This file should be a useful technical reference, not just a summary of the conversation.
 

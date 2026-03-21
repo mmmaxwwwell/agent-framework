@@ -25,8 +25,8 @@ You are a lightweight orchestrator. Your job is to dispatch sub-agents to execut
 1. **Find the prompt file** — Use `$ARGUMENTS` if provided, otherwise glob for `*-prompt.md` files (excluding `generator-prompt.md` and `feature-prompt.md`). If multiple exist, list them and ask the user which one to run.
 
 2. **Extract file paths** — Read the prompt file ONLY to identify:
-   - The path to the task list (`memory/*-tasks.md`)
-   - The path to the notes file (`memory/*-notes.md`)
+   - The path to the task list (`*-tasks.md`)
+   - The path to the notes file (`*-notes.md`)
    - The prompt file path itself
    Then stop reading. Do not absorb the project spec into your context.
 
@@ -131,8 +131,8 @@ After each task completes, output a brief status update:
 If all tasks complete:
 ```
 All tasks complete! Review the final state:
-- Task list: memory/<project>-tasks.md
-- Notes: memory/<project>-notes.md
+- Task list: agent-work/<project>-tasks.md
+- Notes: agent-work/<project>-notes.md
 ```
 
 ## Error handling
