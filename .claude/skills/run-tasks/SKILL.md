@@ -104,7 +104,7 @@ Execute ONLY this task:
 - If the task is blocked or unclear, mark it `- [?]` with the specific question and do NOT proceed.
 - If the task turns out to be unnecessary, mark it `- [~]` with why.
 - If you discover new tasks are needed, add them to the task list.
-- Test your work before marking complete.
+- Test your work before marking complete. Run builds, tests, and linters to completion no matter how long they take — do not skip, truncate, or time out on long-running commands. If a build takes 10 minutes, wait for it.
 - If a build or test command fails and you cannot fix it, report the exact command that failed and the error summary in your final response so the orchestrator can escalate to fix-build.
 - Prefer minimal changes. Don't refactor unrelated code.
 ```
@@ -137,6 +137,6 @@ All tasks complete! Review the final state:
 
 ## Error handling
 
-- If a sub-agent times out or errors, report the failure and stop
+- If a sub-agent errors (not a timeout), report the failure and stop. Use generous timeouts (up to 10 minutes) for sub-agents — builds can be slow and that's expected.
 - If the task list or notes file can't be found, ask the user for the correct paths
 - If the prompt file references files that don't exist yet (greenfield project), note this in the sub-agent prompt so it knows to create them

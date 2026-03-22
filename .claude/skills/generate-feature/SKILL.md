@@ -119,7 +119,7 @@ Run this prompt file to execute the next incomplete task from `<feature>-tasks.m
 - If a task is unnecessary, mark it `- [~]` with why and move on.
 - If you discover NEW tasks are needed, add them to the task list and note them.
 - Prefer minimal changes. Don't refactor unrelated code.
-- Test your work before marking complete.
+- Test your work before marking complete. Run builds, tests, and linters to completion — no matter how long they take. Do not skip or shortcut long-running commands. If a build takes 10 minutes, wait for it.
 - If you need user input, ask and do NOT proceed until answered.
 ```
 

@@ -150,7 +150,7 @@ Use this template structure:
 - If you discover NEW tasks are needed during implementation, add them as subtasks in the task list, update the memory file, and note them in the prompt context.
 - Always read both files before starting — context from previous sessions matters.
 - Prefer minimal changes. Don't refactor unrelated code.
-- Test your work before marking complete (build check, type check, or manual test).
+- Test your work before marking complete. Run builds, tests, type checks, and linters to completion — no matter how long they take. Do not skip or shortcut long-running commands. If a build takes 10 minutes, wait for it. The whole point is that you handle this so the user doesn't have to.
 - If you need user input (e.g., design decision), ask and do NOT proceed until answered.
 - **Always verify the license** of any external code/repo before cloning or vendoring it. Confirm the license is compatible (MIT, Apache-2.0, BSD, etc.) and note it in the memory file.
 ```
