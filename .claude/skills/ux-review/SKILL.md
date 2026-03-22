@@ -32,23 +32,22 @@ If you are unsure which mode you're in, default to user-invoked (present finding
 
 ## Orchestration — Sub-agent architecture
 
-You are the **orchestrator**. You keep your context focused on decision-making and delegate long-running code generation work to sub-agents. The primary benefit is **context window management** — writing Playwright scripts, Mermaid diagrams, and integration tests produces large outputs that would bloat your context. Sub-agents handle the heavy generation and report back concise summaries.
+You are the **orchestrator**. You keep your context focused on decision-making and delegate heavy work to sub-agents. The primary benefit is **context window management** — analyzing screenshots, writing Playwright scripts, Mermaid diagrams, and integration tests produces large outputs that would bloat your context. Sub-agents handle the heavy generation and report back concise summaries.
 
-### Execution plan — strictly sequential
-
-Every phase depends on the output of the previous phase. Do not parallelize.
+### Execution plan
 
 ```
 Phase 1:   Codebase recon .................. YOU (main agent)
-Phase 0:   Screenshot collection ........... SUB-AGENT (needs routes from Phase 1)
-Phase 2:   Structured review ............... YOU (needs screenshots from Phase 0)
-Phase 3:   Findings report ................. YOU (needs review from Phase 2)
-Phase 3.5: Mermaid UI flow ................ SUB-AGENT (needs findings from Phase 3 to map to screens)
+Phase 2:   Screenshot collection ........... SUB-AGENT (needs routes from Phase 1)
+Phase 3:   Structured review + findings .... SUB-AGENT (needs screenshots from Phase 2 + code from Phase 1)
+Phase 4:   Mermaid UI flow ................ SUB-AGENT (needs routes from Phase 1 — parallel with Phase 3)
   ↓ (if user-invoked, present findings + diagram and wait for approval here)
-Phase 4:   Implementation .................. SUB-AGENT (needs approved findings from Phase 3)
-Phase 5:   Integration tests ............... SUB-AGENT (needs implementation from Phase 4 to test)
+Phase 5:   Implementation .................. SUB-AGENT (needs approved findings from Phase 3)
+Phase 6:   Integration tests ............... SUB-AGENT (needs implementation from Phase 5)
 Final:     Verification .................... YOU (summarize results, capture after-screenshots)
 ```
+
+**Parallelism:** Phases 3 and 4 can run in parallel — Phase 3 (review) needs screenshots + code; Phase 4 (UI flow diagram) only needs routes and nav components from Phase 1. Launch both after Phase 2 completes.
 
 ### Sub-agent rules
 
@@ -93,13 +92,33 @@ Do NOT guess at answers to important questions (auth credentials, business logic
 
 ### Sub-agent prompt templates
 
-Below, each phase marked **SUB-AGENT** includes a prompt template. Fill in the `<placeholders>` with the actual values you discovered in Phase 1 or Phase 2.
+Below, each phase marked **SUB-AGENT** includes a prompt template. Fill in the `<placeholders>` with the actual values you discovered in Phase 1.
 
 ---
 
-## Phase 0: Automated screenshot collection — SUB-AGENT
+## Phase 1: Codebase reconnaissance
 
-Spawn this sub-agent right after Phase 1 completes. Run in parallel with the Phase 3.5 sub-agent.
+Before reviewing anything, understand the project:
+
+1. **Identify the stack** — Glob for `package.json`, `tailwind.config.*`, `components.json` (shadcn), `tsconfig.json`. Read them to determine:
+   - Framework: Next.js, Vite, Remix, CRA, etc.
+   - Styling: Tailwind, CSS Modules, styled-components, MUI, Chakra, etc.
+   - Components: shadcn/ui, MUI, Radix, Ant Design, custom, etc.
+   - Testing: Playwright, Cypress, Vitest, Jest, Testing Library, etc.
+
+2. **Assess migration needs** — If the project does NOT use shadcn/ui + Tailwind CSS:
+   - Note what migration work is needed
+   - Include migration tasks in your implementation plan
+   - Prioritize incremental migration — migrate the components being reviewed, not the whole app at once
+   - If the project uses a different component library (MUI, Chakra, Ant), map existing components to shadcn/ui equivalents
+
+3. **Find the components** — Locate the source files for the screens/components being reviewed. Read them thoroughly before assessing.
+
+---
+
+## Phase 2: Automated screenshot collection — SUB-AGENT
+
+Spawn this sub-agent right after Phase 1 completes.
 
 ### Sub-agent prompt
 
@@ -142,41 +161,50 @@ You are writing and running a Playwright script to capture screenshots of every 
 - Report back: list of screenshot files created, any routes that were skipped and why
 ```
 
-### After screenshots come back
-
-The orchestrator (you) reads the screenshot images to perform the visual analysis in Phase 2. If screenshots failed for some routes, proceed with the screenshots you have and note the gaps.
-
 ---
 
-## Phase 1: Codebase reconnaissance
+## Phase 3: Structured review + findings — SUB-AGENT
 
-Before reviewing anything, understand the project:
+Spawn this sub-agent after Phase 2 completes. **Run in parallel with Phase 4.**
 
-1. **Identify the stack** — Glob for `package.json`, `tailwind.config.*`, `components.json` (shadcn), `tsconfig.json`. Read them to determine:
-   - Framework: Next.js, Vite, Remix, CRA, etc.
-   - Styling: Tailwind, CSS Modules, styled-components, MUI, Chakra, etc.
-   - Components: shadcn/ui, MUI, Radix, Ant Design, custom, etc.
-   - Testing: Playwright, Cypress, Vitest, Jest, Testing Library, etc.
+This is the heaviest analysis phase — the sub-agent reads all screenshot images across 3 viewports, walks through structured checklists, reads component source code, and produces the findings table. Delegating this keeps the orchestrator's context clean.
 
-2. **Assess migration needs** — If the project does NOT use shadcn/ui + Tailwind CSS:
-   - Note what migration work is needed
-   - Include migration tasks in your implementation plan
-   - Prioritize incremental migration — migrate the components being reviewed, not the whole app at once
-   - If the project uses a different component library (MUI, Chakra, Ant), map existing components to shadcn/ui equivalents
+### Sub-agent prompt
 
-3. **Find the components** — Locate the source files for the screens/components being reviewed. Read them thoroughly before assessing.
+```
+You are a senior UX engineer and accessibility specialist performing a structured heuristic review of a React application. You will analyze screenshots AND source code, then produce a findings table.
 
----
+## Project info
+- Project root: <project root path>
+- Framework: <Next.js / Vite / Remix / etc.>
+- Styling: <Tailwind / CSS Modules / styled-components / MUI / Chakra / etc.>
+- Components: <shadcn/ui / MUI / Radix / Ant Design / custom / etc.>
 
-## Phase 2: Structured review
+## Screenshots to review
+<list all screenshot file paths from Phase 2, e.g.:
+- ux-review-screenshots/home-mobile.png
+- ux-review-screenshots/home-tablet.png
+- ux-review-screenshots/home-desktop.png
+- ux-review-screenshots/dashboard-mobile.png
+...
+>
 
-**Critical: Use the structured checklist below. Do NOT open-end "what's wrong with this."** Research shows raw LLM UX audits have an 80% error rate with open-ended prompting. Structured heuristic evaluation achieves 95% accuracy by separating pattern identification from quality judgment.
+## Component source files
+<list component file paths and a brief description of each, from Phase 1, e.g.:
+- src/components/Dashboard.tsx — main dashboard page with stats cards and chart
+- src/components/Sidebar.tsx — navigation sidebar with route links
+- src/components/Modal.tsx — generic modal wrapper used by multiple pages
+>
+
+## Task
+
+**Critical: Use the structured checklist below. Do NOT open-end "what's wrong with this."** Structured heuristic evaluation achieves far higher accuracy than open-ended prompting by separating pattern identification from quality judgment.
 
 Run three passes. For each finding, record: severity, criterion, location, and specific fix.
 
 ### Pass 1: Visual analysis (from screenshots)
 
-Walk through each check. Skip items that are clearly fine — only record issues.
+Read every screenshot image. Walk through each check. Skip items that are clearly fine — only record issues.
 
 | Category | Checks |
 |----------|--------|
@@ -195,6 +223,8 @@ Walk through each check. Skip items that are clearly fine — only record issues
 | **Breakpoint behavior** | Check transitions between breakpoints: mobile (≤479px) → tablet (480–1023px) → desktop (≥1024px). No layout jumps, orphaned elements, or content that disappears between breakpoints. Tailwind responsive prefixes should be mobile-first (`flex-col md:flex-row`, not the reverse). |
 
 ### Pass 2: Code analysis (from React source)
+
+Read the component source files listed above.
 
 | Category | Checks |
 |----------|--------|
@@ -222,11 +252,7 @@ Walk through each check. Skip items that are clearly fine — only record issues
 | **Error prevention** | Validation before submit. Confirmation for destructive actions. No redundant data entry (WCAG 3.3.7). |
 | **Information architecture** | Logical grouping. ≤3 clicks to any feature. Clear labeling. Search for >10 items. |
 
----
-
-## Phase 3: Findings report
-
-Structure your findings as a table. Every finding needs all four columns.
+## Output format
 
 ### Severity levels
 
@@ -236,21 +262,39 @@ Structure your findings as a table. Every finding needs all four columns.
 | **Major** | Significant usability problem. Confusing layout. Missing labels on forms. Poor hierarchy makes content hard to scan. |
 | **Minor** | Suboptimal but functional. Spacing inconsistencies. Non-ideal touch target size. Missing `aria-live` on a toast. |
 
-### Findings table format
+### Produce a findings table
 
-```
+Every finding needs all five columns:
+
 | # | Severity | Criterion | Finding | Fix |
 |---|----------|-----------|---------|-----|
 | 1 | Critical | WCAG 1.4.3 | Body text has 2.8:1 contrast ratio against gray background | Change bg to white or text to #1a1a1a for 7:1 ratio |
 | 2 | Major | Gestalt: Proximity | Form labels equidistant between fields — unclear which label belongs to which input | Reduce gap between label and its input to 4px, increase gap between fields to 24px |
 | 3 | Major | Nielsen #3 | Modal has no close button or escape handler — user is trapped | Add X button, wire Escape key, return focus to trigger on close |
+
+Write the full findings table to `agent-work/ux-review/findings.md`.
+
+In your response back to the orchestrator, return:
+1. The complete findings table (markdown)
+2. A summary: total findings count by severity
+3. Which component files are affected by which findings (for the implementation sub-agent)
+
+## Rules
+- Be thorough — check every screenshot at every viewport
+- Be specific — cite exact elements, selectors, or line numbers
+- Be actionable — every finding must have a concrete fix, not just "improve contrast"
+- Do not invent issues that aren't visible in screenshots or code
 ```
+
+### After findings come back
+
+The orchestrator receives the findings table from the sub-agent's response. In user-invoked mode, present the findings to the user (along with the UI flow diagram from Phase 4) and wait for approval. In agent-invoked mode, proceed directly to Phase 5.
 
 ### Limitations disclaimer
 
-After the findings table, always state:
+When presenting findings (user-invoked mode), always include:
 
-> **Verified by integration tests** (Phase 5 covers these automatically):
+> **Verified by integration tests** (Phase 6 covers these automatically):
 > - Keyboard tab order — tested via Playwright tab-through assertions
 > - Focus trapping in modals — tested via Playwright keyboard + focus assertions
 > - WCAG violations — tested via axe-core automated scan
@@ -264,14 +308,14 @@ After the findings table, always state:
 
 ---
 
-## Phase 3.5: UI flow diagram — SUB-AGENT
+## Phase 4: UI flow diagram — SUB-AGENT
 
-Spawn this sub-agent after Phase 3 (findings) completes.
+Spawn this sub-agent after Phase 2 completes. **Run in parallel with Phase 3** — this phase only needs routes and nav components from Phase 1, not the findings.
 
 ### Sub-agent prompt
 
 ```
-You are generating a Mermaid UI flow diagram for a React application that has just been reviewed for UX and accessibility issues. Write the diagram to `UI_FLOW.md` in the project root (same directory as `CLAUDE.md`).
+You are generating a Mermaid UI flow diagram for a React application. Write the diagram to `UI_FLOW.md` in the project root (same directory as `CLAUDE.md`).
 
 ## Project info
 - Project root: <project root path>
@@ -283,9 +327,6 @@ You are generating a Mermaid UI flow diagram for a React application that has ju
 
 ## Navigation components
 <list nav components and the links/actions they contain, from Phase 1>
-
-## Findings from review
-<paste the full findings table from Phase 3>
 
 ## Task
 1. Read the router config and navigation components to map all page transitions
@@ -301,17 +342,13 @@ You are generating a Mermaid UI flow diagram for a React application that has ju
    - Use `classDef` to color-code: pages (slate), modals (amber), states (red)
 5. Include a screen inventory table: Screen | Route | Purpose | Entry points
 6. Document key user flows as numbered step sequences (happy path, error recovery, etc.)
-7. Map findings to screens — cross-reference each finding by number to the screen/transition it affects
-8. If findings suggest flow changes (adding/removing screens, changing navigation), generate BOTH a "Current" and "Proposed" diagram
 
 ## Output format
 Write a single markdown file with the structure:
 - `# UI Flow — <App Name>`
 - `## Current application flow` (Mermaid diagram)
-- `## Proposed application flow` (Mermaid diagram — only if flow changes are recommended)
 - `## Screen inventory` (table)
 - `## Key flows` (numbered step sequences)
-- `## Findings mapped to flow` (cross-reference list)
 
 ## Rules
 - Read the actual code — do not guess at routes or transitions
@@ -320,11 +357,21 @@ Write a single markdown file with the structure:
 - Report back: path to the file written, number of screens mapped, number of transitions mapped
 ```
 
+### After both Phase 3 and Phase 4 complete
+
+Wait for both sub-agents to finish. The orchestrator now has:
+- Findings table (from Phase 3)
+- UI flow diagram (from Phase 4)
+
+In **user-invoked mode**: Present the findings table and reference the UI flow diagram. Wait for approval before proceeding to Phase 5.
+
+In **agent-invoked mode**: Proceed directly to Phase 5.
+
 ---
 
-## Phase 4: Implementation — SUB-AGENT
+## Phase 5: Implementation — SUB-AGENT
 
-Spawn this sub-agent after Phase 3.5 completes (or after user approval in user-invoked mode).
+Spawn this sub-agent after user approval (user-invoked mode) or immediately after Phase 3 + 4 complete (agent-invoked mode).
 
 ### Sub-agent prompt
 
@@ -433,9 +480,9 @@ You are an expert. Do not just fix the minimum. Make holistic design decisions:
 
 ---
 
-## Phase 5: Integration tests — SUB-AGENT
+## Phase 6: Integration tests — SUB-AGENT
 
-Spawn this sub-agent after Phase 4 (implementation) completes.
+Spawn this sub-agent after Phase 5 (implementation) completes.
 
 ### Sub-agent prompt
 
@@ -590,19 +637,20 @@ All sub-agents write their results to the `agent-work/ux-review/` directory in t
 | File | Written by | Contents |
 |------|-----------|----------|
 | `agent-work/ux-review/recon-summary.md` | Orchestrator (Phase 1) | Stack info, routes, components, migration needs |
-| `agent-work/ux-review/screenshots/` | Sub-agent (Phase 0) | Before/after screenshots at all viewports |
-| `agent-work/ux-review/findings.md` | Orchestrator (Phase 3) | Full findings table with severity/criterion/fix |
-| `UI_FLOW.md` (project root, next to CLAUDE.md) | Sub-agent (Phase 3.5) | Mermaid diagram, screen inventory, flow documentation |
-| `agent-work/ux-review/implementation-summary.md` | Sub-agent (Phase 4) | List of files modified, what changed, build status |
-| `agent-work/ux-review/test-results.md` | Sub-agent (Phase 5) | Tests written, pass/fail results, new issues found |
+| `agent-work/ux-review/screenshots/` | Sub-agent (Phase 2) | Before/after screenshots at all viewports |
+| `agent-work/ux-review/findings.md` | Sub-agent (Phase 3) | Full findings table with severity/criterion/fix |
+| `UI_FLOW.md` (project root, next to CLAUDE.md) | Sub-agent (Phase 4) | Mermaid diagram, screen inventory, flow documentation |
+| `agent-work/ux-review/implementation-summary.md` | Sub-agent (Phase 5) | List of files modified, what changed, build status |
+| `agent-work/ux-review/test-results.md` | Sub-agent (Phase 6) | Tests written, pass/fail results, new issues found |
 
 **Sub-agent reporting rule:** Every sub-agent must write its summary to the appropriate file in `agent-work/ux-review/` AND return a concise summary in its response. The orchestrator reads the response summary; the files are for the user's reference and for downstream sub-agents that need prior context.
 
 **Loading context into sub-agents:** Each sub-agent prompt includes `<placeholders>` that the orchestrator fills with actual values. In addition:
-- Phase 0 sub-agent: receives routes and stack info from Phase 1
-- Phase 3.5 sub-agent: receives routes, nav components from Phase 1 AND the full findings table from Phase 3. Tell it to write `UI_FLOW.md` in the project root (same level as `CLAUDE.md`).
-- Phase 4 sub-agent: receives stack info, findings table, and component file paths. Tell it to read `agent-work/ux-review/recon-summary.md` and `agent-work/ux-review/findings.md` for full context.
-- Phase 5 sub-agent: receives routes, findings table, and implementation summary. Tell it to read `agent-work/ux-review/implementation-summary.md` to understand what changed.
+- Phase 2 sub-agent: receives routes and stack info from Phase 1
+- Phase 3 sub-agent: receives screenshot file paths from Phase 2, component file paths from Phase 1
+- Phase 4 sub-agent: receives routes and nav components from Phase 1. Tell it to write `UI_FLOW.md` in the project root (same level as `CLAUDE.md`).
+- Phase 5 sub-agent: receives stack info, findings table from Phase 3, and component file paths. Tell it to read `agent-work/ux-review/recon-summary.md` and `agent-work/ux-review/findings.md` for full context.
+- Phase 6 sub-agent: receives routes, findings table, and implementation summary. Tell it to read `agent-work/ux-review/implementation-summary.md` to understand what changed.
 
 ---
 
