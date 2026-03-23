@@ -35,10 +35,14 @@ The skill files at `.claude/skills/*/SKILL.md` contain the full prompts. Paste t
 
 | Skill | Description |
 |-------|-------------|
+| [`code-review`](.claude/skills/code-review/SKILL.md) | Review code for bugs, security, performance — language-agnostic base layer |
+| [`code-review-node`](.claude/skills/code-review-node/SKILL.md) | Node.js-specific review (extends code-review with async, event loop, dependency checks) |
+| [`code-review-react`](.claude/skills/code-review-react/SKILL.md) | React-specific review (extends code-review with hooks, render perf, state management checks) |
 | [`fix-build`](.claude/skills/fix-build/SKILL.md) | Iteratively fix a failing build/test command with sub-agents |
 | [`generate-project`](.claude/skills/generate-project/SKILL.md) | Scaffold a new agent-framework project via interview |
 | [`generate-feature`](.claude/skills/generate-feature/SKILL.md) | Plan and add a feature to an existing project |
 | [`run-tasks`](.claude/skills/run-tasks/SKILL.md) | Automate task execution with Opus sub-agents |
+| [`spec-kit`](.claude/skills/spec-kit/SKILL.md) | Initialize and drive spec-kit (SDD) projects — specs, plans, tasks, implementation |
 | [`ux-review`](.claude/skills/ux-review/SKILL.md) | Review and fix accessibility, layout, and UX in React apps |
 
 ## License

@@ -2,7 +2,7 @@
 name: run-tasks
 description: Process agent-framework task lists by spawning Opus sub-agents to execute each incomplete task autonomously. Use when the user wants to run tasks from a project or feature prompt.
 user-invocable: true
-allowed-tools: Read, Glob, Agent
+allowed-tools: Read, Bash, Glob, Grep, Agent
 argument-hint: [prompt-file]
 ---
 
@@ -16,6 +16,7 @@ You are a lightweight orchestrator. Your job is to dispatch sub-agents to execut
 
 - **DO read**: the task list file (to know what to run next)
 - **DO read**: the prompt file (only to find the paths to the task list and notes file)
+- **DO run**: `git rev-parse HEAD` to record pre-task SHAs for the review gate
 - **DO NOT read**: the notes file, source code, or any other project files
 - **DO NOT load**: full file contents into your context for any reason
 - If you need information to make a decision, spawn a sub-agent to research it and return a concise summary (1-3 sentences)
@@ -32,15 +33,20 @@ You are a lightweight orchestrator. Your job is to dispatch sub-agents to execut
 
 3. **Read the task list** — Parse the task list to identify incomplete tasks (`- [ ]`). Skip blocked (`- [?]`) and completed (`- [x]`) tasks.
 
-4. **Execute tasks sequentially** — For each incomplete task, spawn an Opus sub-agent using the Agent tool with `model: "opus"`. The sub-agent does ALL the heavy reading and work.
+4. **Detect project stack** — Before executing any tasks, determine the project's tech stack so the review gate (if enabled) can select the right code-review variant. Spawn a quick research sub-agent (model: "haiku") to check for `package.json`, framework imports, and file extensions, then return one of: `react`, `node`, or `generic`. Cache the result — do not re-detect per task.
 
-5. **Between tasks** — After each sub-agent completes:
+5. **Tag the pre-task state** — Before each task sub-agent runs, record the current git commit SHA: run `git rev-parse HEAD` and store it as `pre_task_sha`. This is the baseline for the review gate's diff.
+
+6. **Execute tasks sequentially** — For each incomplete task, spawn an Opus sub-agent using the Agent tool with `model: "opus"`. The sub-agent does ALL the heavy reading and work.
+
+7. **Between tasks** — After each sub-agent completes:
    - Re-read the task list only (the sub-agent may have updated it)
-   - Report progress to the user
    - If a task was marked `[?]` (blocked), stop and ask the user for input
    - If the sub-agent reports a build/test failure it couldn't resolve, try the **fix-build escalation** (see below) before giving up
+   - If the review gate is enabled, run the **review gate** (see below) before reporting progress
+   - Report progress to the user
 
-6. **Continue until done** — Keep dispatching until all tasks are complete, one is blocked, or a failure occurs.
+8. **Continue until done** — Keep dispatching until all tasks are complete, one is blocked, or a failure occurs.
 
 ## Fix-build escalation
 
@@ -77,6 +83,86 @@ Run this command:
 - In your final response, clearly state:
   1. Whether the command now passes or still fails
   2. A one-line summary of what you fixed (or what error remains)
+```
+
+## Review gate
+
+The review gate runs a code-review sub-agent against each task's changes, then fixes any significant findings before moving on. This catches bugs, security issues, and quality problems early — when the diff is small and fixes are low-risk.
+
+### When it runs
+
+The review gate is **enabled by default**. The user can disable it by saying "skip reviews", "no reviews", or similar. If disabled, skip this section entirely.
+
+### How it works
+
+1. **Diff the task's changes** — Run `git diff <pre_task_sha>` (no `...HEAD` — this diffs the working tree + staged changes against the saved commit). If there's no diff (task made no code changes), skip the review.
+
+2. **Spawn a review sub-agent** — Use the review sub-agent prompt template below. Use `model: "opus"`. Select the code-review variant based on the stack detected in step 4:
+   - `react` → use the `code-review-react` checklist
+   - `node` → use the `code-review-node` checklist
+   - `generic` → use the base `code-review` checklist
+
+3. **Evaluate findings** — Parse the review sub-agent's response:
+   - **P0 or P1 findings** → spawn a review-fix sub-agent to address them (see template below)
+   - **P2 only or no findings** → log any P2s in the notes file and continue to the next task
+
+4. **Review-fix loop** — After the fix sub-agent completes, re-run the review (spawn a new review sub-agent diffing against the same `pre_task_sha`). Repeat up to **2 iterations** (review → fix → re-review → fix → final review). If P0/P1 findings persist after 2 fix rounds, log the remaining issues in the notes file and continue — do not block progress indefinitely.
+
+### Review sub-agent prompt template
+
+```
+You are reviewing code changes made by a task sub-agent in an agent-framework project.
+
+## Diff to review
+Run this command to see the changes:
+git diff <pre_task_sha>
+
+## Task that was executed
+<the specific task description>
+
+## Project stack
+<react | node | generic>
+
+## Instructions
+- Review ONLY the diff above. Do not review pre-existing code.
+- Use the <react | node | generic> code-review checklist (see the corresponding code-review skill for the full checklist).
+- Apply confidence scoring: discard anything below 70. Only P0/P1/P2 findings.
+- Read the full files around changed code to understand context — don't review the diff in isolation.
+- In your final response, output findings in this exact format:
+
+### Findings
+
+| # | Sev | Category | File:Line | Finding | Suggested fix | Confidence |
+|---|-----|----------|-----------|---------|---------------|------------|
+
+If no issues found, respond with exactly: NO_ISSUES_FOUND
+
+### Summary
+- P0: N | P1: N | P2: N
+```
+
+### Review-fix sub-agent prompt template
+
+```
+You are fixing code review findings in an agent-framework project. A review sub-agent identified issues in code that was just written by a task sub-agent.
+
+Read these files for project context:
+- Prompt file (project spec): <prompt file path>
+- Task list: <task list path>
+- Notes & context: <notes file path>
+
+## Review findings to fix
+<paste the findings table from the review sub-agent — only P0 and P1 rows>
+
+## Rules
+- Fix ALL P0 and P1 findings listed above.
+- Read the files referenced in the findings to understand full context before making changes.
+- Make minimal, targeted fixes. Do not refactor unrelated code.
+- Do not introduce new functionality — only fix the identified issues.
+- After fixing, run the project's build/test command if one is evident from the project context. If the build fails, fix that too.
+- In your final response, state:
+  1. Which findings you fixed and how (one line each)
+  2. Whether the build still passes
 ```
 
 ## Sub-agent prompt template
@@ -122,6 +208,14 @@ When running in parallel, use separate worktrees (`isolation: "worktree"`) for e
 
 After each task completes, output a brief status update:
 
+```
+[2/14] Completed: "Create data model for X"
+  Summary: <sub-agent's result summary>
+  Review: No issues found (or: Fixed 1 P0, 1 P1 in 1 round)
+  Next: "Build X service layer"
+```
+
+If the review gate is disabled:
 ```
 [2/14] Completed: "Create data model for X"
   Summary: <sub-agent's result summary>
