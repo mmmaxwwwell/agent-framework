@@ -112,9 +112,46 @@ For each phase, the user has two options:
 - Phases: Setup → Foundational → User Stories (P1-P3) → Polish.
 
 **Implement (Phase 7):**
-- Executes tasks with TDD approach — tests before implementation.
-- Runs phase by phase, marking tasks complete as it goes.
-- Checks extension hooks pre/post execution.
+- For autonomous implementation, use the task runner script (see below).
+- Spec-kit's built-in `/speckit.implement` runs in a single context and will hit limits on larger projects.
+
+---
+
+## Autonomous implementation with run-tasks.sh
+
+Once `tasks.md` exists, the user can run implementation autonomously using the task runner script bundled with this skill at `.claude/skills/spec-kit/run-tasks.sh`.
+
+**How to launch it:** Determine the absolute path to `run-tasks.sh` within this skill's directory (it lives alongside this `SKILL.md`). Then run it from the target project root:
+
+```bash
+cd <project-root>
+/path/to/agent-framework/.claude/skills/spec-kit/run-tasks.sh                          # auto-detect
+/path/to/agent-framework/.claude/skills/spec-kit/run-tasks.sh specs/001-my-feature     # specific spec
+/path/to/agent-framework/.claude/skills/spec-kit/run-tasks.sh specs/001-my-feature 50  # max 50 runs
+```
+
+The script must be run from the project root (where `.specify/` and `specs/` live). Run it in tmux/screen so it survives terminal disconnects.
+
+### How it works
+
+Each iteration spawns a fresh `claude` process (full context budget, no degradation across tasks):
+
+1. Reads all spec-kit artifacts — constitution, spec, plan, data-model, contracts, research, tasks
+2. Finds the first unchecked task whose phase/dependency prerequisites are all complete
+3. Executes that ONE task, following TDD (test tasks fail before implementation)
+4. Runs the project's build/test commands (from `CLAUDE.md` or `package.json`)
+5. Marks the task `- [x]` and commits with the task ID (e.g., `feat(T008): implement HTTP server`)
+6. Loop repeats until all tasks are done, `BLOCKED.md` is written, or the run limit is hit
+
+**BLOCKED.md** — if the agent hits ambiguity or a build failure it can't fix, it writes `BLOCKED.md` and the script stops. Edit the file with your answer, delete it, re-run.
+
+**Rate limits** — detected from claude CLI streaming output. The script sleeps until the reset time, then resumes automatically.
+
+**No-op detection** — stops after 5 consecutive runs with no task progress (agent is stuck).
+
+### When to suggest it
+
+When the user has completed planning (tasks.md exists) and asks to start or run implementation, tell them the command to run. Resolve the absolute path to the script based on where this skill is installed.
 
 ---
 
