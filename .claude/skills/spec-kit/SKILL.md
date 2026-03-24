@@ -161,6 +161,23 @@ When the user has completed planning (tasks.md exists) and asks to start or run 
 
 ---
 
+## Exhaustive interview mode
+
+For automated/server-driven interview sessions, the interview wrapper prompt at `.claude/skills/spec-kit/interview-wrapper.md` (alongside this file) provides instructions for conducting exhaustive specification interviews. It instructs the agent to:
+
+- Research similar projects on the web for inspiration
+- Ask unlimited questions (no cap at 5) until the spec is comprehensive
+- Suggest features proactively based on research
+- Probe edge cases, error handling, deployment, auth, observability
+- Loop specify → clarify until satisfied
+- Wait for explicit user confirmation before advancing to planning
+- Write `interview-notes.md` as a handoff document for downstream phases
+- Recover context from `transcript.md` and `spec.md` after crashes
+
+The agent-runner server reads this file and passes it via `-p` to the Claude interview session.
+
+---
+
 ## Interaction style
 
 - **Be a guide, not a lecturer.** The user may not know SDD — explain just enough for each step, then do it.
