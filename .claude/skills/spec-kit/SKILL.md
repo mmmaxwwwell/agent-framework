@@ -1,6 +1,6 @@
 ---
 name: spec-kit
-description: Initialize and drive a spec-kit (Specification-Driven Development) project using the `specify` CLI. Handles install, init, and walks the user through the full SDD workflow — constitution, specify, clarify, plan, tasks, implement. Use when the user wants to start or continue a spec-kit project.
+description: Initialize and drive a spec-kit (Specification-Driven Development) project using the `specify` CLI. Handles install, init, and walks the user through the full SDD workflow — constitution, specify, clarify, plan, tasks, implement. Enforces end-to-end integration testing with real server implementations, structured agent-readable test output, and a fix-validate loop after every feature. Use when the user wants to start or continue a spec-kit project.
 user-invocable: true
 allowed-tools: Bash, Read, Write, Edit, Glob, Grep, Agent, WebFetch
 argument-hint: [project-name]
@@ -95,6 +95,7 @@ For each phase, the user has two options:
 - Focus the user on *what* and *why*, not *how*.
 - The spec creates a branch and directory structure under `specs/`.
 - Specs get automatic numbering.
+- **MANDATORY**: Every spec MUST include a **Testing** section with functional requirements for integration tests. See "Integration Testing Requirements" below — these requirements must be woven into the spec, not added as an afterthought.
 
 **Clarify (Phase 3):**
 - Scans for ambiguities across 11 categories.
@@ -105,11 +106,13 @@ For each phase, the user has two options:
 - Generates `plan.md` plus supporting docs (data models, API contracts, test scenarios).
 - Runs a research phase first, then a design phase.
 - Checks constitutional compliance.
+- **MANDATORY**: The plan MUST include a test infrastructure phase (Phase 1 or early) that builds structured test output before any feature work. The plan MUST describe the fix-validate loop strategy. See "Integration Testing Requirements" below.
 
 **Tasks (Phase 6):**
 - Generates `tasks.md` with dependency-ordered, phased tasks.
 - Tasks marked `[P]` can be parallelized.
 - Phases: Setup → Foundational → User Stories (P1-P3) → Polish.
+- **MANDATORY**: Task list MUST follow the fix-validate loop pattern. See "Integration Testing Requirements" below for the required task structure.
 
 **Implement (Phase 7):**
 - For autonomous implementation, use the task runner script (see below).
@@ -175,6 +178,125 @@ For automated/server-driven interview sessions, the interview wrapper prompt at 
 - Recover context from `transcript.md` and `spec.md` after crashes
 
 The agent-runner server reads this file and passes it via `-p` to the Claude interview session.
+
+---
+
+## Integration Testing Requirements
+
+Every spec-kit project MUST include comprehensive integration tests that validate all user flows end-to-end. This is non-negotiable — without working tests, the autonomous fix-validate loop that powers implementation is blind.
+
+### Philosophy: real servers, real processes, no mocks at system boundaries
+
+Tests MUST exercise the real system wherever possible. The hierarchy of preference:
+
+1. **Real server implementations** — spin up the actual server, hit real endpoints, verify real responses. For protocols like SSH, use a real SSH server (e.g., Node.js `ssh2` library with test keypairs) rather than mocking the protocol.
+2. **Real processes** — if the feature spawns child processes, test with real child processes. If it reads files, use real temp directories with real files.
+3. **Mock only what requires human interaction** — biometric prompts, hardware tokens, manual UI actions. Everything else should be real.
+4. **Never mock internal boundaries** — don't mock the database, don't mock service-to-service calls within the same process. Integration tests exist precisely to catch the bugs that unit tests with mocks miss.
+
+### Structured test output for agent-readable failure logs
+
+The fix-validate loop depends on **structured, machine-readable test output**. Without it, the implementing agent can't diagnose failures efficiently. Every project MUST implement:
+
+1. **Test log directory**: `test-logs/<type>/<timestamp>/` (gitignored)
+2. **`summary.json`** per run: `{ pass: number, fail: number, skip: number, duration: number, failures: string[] }`
+3. **`failures/<test-name>.log`** per failing test: assertion details (expected vs actual), full stack trace, and relevant context (server logs, captured stderr, request/response bodies)
+4. **Passing tests**: one-line summary only (name + duration) — don't clutter output
+5. **Custom test reporter**: use the test runner's reporter API (Node.js native test runner custom reporter, JUnit RunListener, pytest plugin, etc.) to produce this format
+
+Example `summary.json`:
+```json
+{
+  "pass": 42,
+  "fail": 2,
+  "skip": 1,
+  "duration": 12340,
+  "failures": [
+    "session-lifecycle: start → blocked → resume",
+    "ssh-bridge: sign request timeout"
+  ]
+}
+```
+
+Example failure log (`failures/ssh-bridge-sign-request-timeout.log`):
+```
+TEST: ssh-bridge: sign request timeout
+FILE: tests/integration/ssh-agent-bridge.test.ts:142
+
+ASSERTION: Expected session state to be "failed" after 60s timeout
+  Expected: "failed"
+  Actual:   "running"
+
+STACK:
+  at Object.<anonymous> (tests/integration/ssh-agent-bridge.test.ts:158:5)
+  at async TestContext.run (node:internal/test_runner:123:9)
+
+CONTEXT:
+  Server log: [14:23:01] SSH bridge socket created at /tmp/test-abc123/agent.sock
+  Server log: [14:23:01] Sign request forwarded, waiting for client response
+  Server log: [14:24:01] Timeout — no client response after 60000ms
+  Request: { requestId: "req-1", messageType: 13, data: "AAAA..." }
+```
+
+### What the spec MUST include
+
+When writing a feature spec (Phase 2), inject these requirements:
+
+- **Testing section** with functional requirements for every user flow:
+  - Unit tests for every service, model, and utility
+  - Integration tests for every multi-component workflow
+  - Contract tests for every API endpoint and protocol
+  - End-to-end tests for every user-facing flow
+- **Test infrastructure requirements**:
+  - Custom test reporter producing structured output
+  - Test fixtures (template data files, test keypairs, test servers)
+  - Test helpers (real protocol servers, mock-only-what-needs-human-interaction)
+- **For each user story**, an "Independent Test" field describing how to verify the story works end-to-end without human interaction
+
+### What the plan MUST include
+
+When generating the implementation plan (Phase 5):
+
+- **Phase 1 MUST be Test Infrastructure** — build the reporter, fixtures, and test helpers before any feature work. Without structured test output, the fix-validate loop can't function.
+- **Smoke test phase** early — confirm the most basic thing works (server boots, app loads) before diving into test suites
+- **Fix-validate loop strategy** section describing:
+  1. Run tests
+  2. Read `test-logs/` for structured failures
+  3. Fix code (tests are the spec — fix code, not tests)
+  4. Re-run until green
+  5. Move to next phase
+- **Real server test infrastructure** — plan for spinning up real servers (HTTP, WebSocket, SSH, etc.) in tests, not mocking protocols
+
+### What the task list MUST include
+
+When generating tasks (Phase 6):
+
+- **Test infrastructure tasks FIRST** (Phase 1):
+  - Custom test reporter
+  - Test fixture templates
+  - Test keypair generators (if crypto/auth involved)
+  - Real protocol test servers (SSH, SMTP, etc. — whatever the project needs)
+  - `.gitignore` entry for `test-logs/`
+- **Each feature phase follows the pattern**:
+  1. Write tests for the feature (they should fail — TDD)
+  2. Implement the feature
+  3. Run tests, read `test-logs/`, fix until green
+  4. Phase checkpoint: all tests for this phase pass
+- **End-to-end validation phase** near the end — actually exercise the real flows after all unit/integration tests pass
+- **Approach note at the top of tasks.md**: `Approach: Fix-validate loop. Each phase: run tests → read test-logs/ failures → fix code → re-run until green.`
+
+### What the run-tasks agent MUST do
+
+The implementation agent (spawned by `run-tasks.sh`) enforces the fix-validate loop on every task:
+
+1. After implementing a task, run the project's test command
+2. If tests fail, read `test-logs/` for structured failure output
+3. Fix the code (not the tests)
+4. Re-run tests
+5. Repeat until green or 3 attempts exhausted (then BLOCKED.md)
+6. Only mark the task complete when tests pass
+
+This is already described in the run-tasks.sh prompt's Step 4, but the key addition is: **the agent MUST read `test-logs/` rather than parsing raw test runner output**. The structured logs are the primary feedback mechanism.
 
 ---
 

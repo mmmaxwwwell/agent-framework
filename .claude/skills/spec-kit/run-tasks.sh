@@ -190,15 +190,19 @@ If the next task is blocked by incomplete prerequisites → say "BLOCKED: waitin
 - If the constitution exists, ensure your implementation complies with all principles
 - If something is unclear or you need a design decision, write the question to \`BLOCKED.md\` and STOP immediately
 
-## Step 4: Verify your work
+## Step 4: Verify your work (fix-validate loop)
 
-After implementing, run the project's build and test commands to verify:
-- Check CLAUDE.md for the exact commands (typically \`npm run build\` and \`npm test\` or similar)
-- If no CLAUDE.md, check package.json scripts or the equivalent for the project's tech stack
-- Fix any errors before proceeding
-- If you cannot fix a build/test failure after 3 attempts, write the issue to \`BLOCKED.md\` and stop
+After implementing, run the fix-validate loop:
 
-For early tasks (e.g., Phase 1 Setup), the build/test commands may not exist yet — that's fine, verify what you can.
+1. Run the project's build and test commands:
+   - Check CLAUDE.md for the exact commands (typically \`npm run build\` and \`npm test\` or similar)
+   - If no CLAUDE.md, check package.json scripts or the equivalent for the project's tech stack
+2. **If tests fail, read \`test-logs/\` for structured failure output** — look for \`summary.json\` to see which tests failed, then read the individual failure logs in \`test-logs/<type>/<timestamp>/failures/\` for assertion details, stack traces, and context. These structured logs are far more useful than raw test runner output.
+3. Fix the code — **tests are the spec**. When tests fail, fix your implementation, not the tests. Exception: if a test is genuinely wrong (tests behavior the spec doesn't require), fix the test with a comment explaining why.
+4. Re-run tests and repeat until green.
+5. If you cannot fix a build/test failure after 3 attempts, write the issue to \`BLOCKED.md\` and stop.
+
+For early tasks (e.g., Phase 1 Setup), the build/test commands and test-logs infrastructure may not exist yet — that's fine, verify what you can.
 
 ## Step 5: Self-review
 
