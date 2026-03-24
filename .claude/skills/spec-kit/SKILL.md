@@ -136,12 +136,18 @@ The script must be run from the project root (where `.specify/` and `specs/` liv
 
 Each iteration spawns a fresh `claude` process (full context budget, no degradation across tasks):
 
-1. Reads all spec-kit artifacts — constitution, spec, plan, data-model, contracts, research, tasks
+1. Reads the task list and learnings, then consults a manifest of available reference files and loads only the ones relevant to the current task
 2. Finds the first unchecked task whose phase/dependency prerequisites are all complete
 3. Executes that ONE task, following TDD (test tasks fail before implementation)
 4. Runs the project's build/test commands (from `CLAUDE.md` or `package.json`)
-5. Marks the task `- [x]` and commits with the task ID (e.g., `feat(T008): implement HTTP server`)
-6. Loop repeats until all tasks are done, `BLOCKED.md` is written, or the run limit is hit
+5. Self-reviews the diff for debug code, security issues, and pattern consistency
+6. Records discoveries and decisions in `learnings.md` (persists across runs)
+7. Marks the task `- [x]` and commits with the task ID (e.g., `feat(T008): implement HTTP server`)
+8. Loop repeats until all tasks are done, `BLOCKED.md` is written, or the run limit is hit
+
+**Automatic code review** — When the last implementation task completes, the agent appends a `REVIEW` task. The runner detects this, switches to a review-specific prompt that embeds the appropriate code-review skill (React, Node, or general), diffs all changes from the feature branch, and writes findings to `REVIEW.md` in the spec directory. The review is read-only — it reports issues but does not fix them.
+
+**learnings.md** — a shared memory file in the spec directory that accumulates across runs. Each agent reads it for context and appends gotchas, decisions, and patterns it discovered. This prevents repeated mistakes and keeps later agents consistent with earlier decisions.
 
 **BLOCKED.md** — if the agent hits ambiguity or a build failure it can't fix, it writes `BLOCKED.md` and the script stops. Edit the file with your answer, delete it, re-run.
 

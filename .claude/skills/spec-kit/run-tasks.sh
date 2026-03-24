@@ -21,6 +21,8 @@
 
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKILLS_DIR="$(dirname "$SCRIPT_DIR")"
 BLOCKED_FILE="BLOCKED.md"
 SPEC_DIR="${1:-}"
 MAX_RUNS="${2:-100}"
@@ -79,7 +81,22 @@ if [ -z "$SPEC_DIR" ]; then
 fi
 
 TASK_FILE="$SPEC_DIR/tasks.md"
+LEARNINGS_FILE="$SPEC_DIR/learnings.md"
 CONSTITUTION=".specify/memory/constitution.md"
+
+# Initialize learnings file if it doesn't exist
+if [ ! -f "$LEARNINGS_FILE" ]; then
+  cat > "$LEARNINGS_FILE" <<'INIT'
+# Learnings
+
+Discoveries, gotchas, and decisions recorded by the implementation agent across runs.
+Each entry should include a timestamp and the task ID that produced the learning.
+
+---
+
+INIT
+  log "Created learnings file: $LEARNINGS_FILE"
+fi
 
 if [ ! -f "$TASK_FILE" ]; then
   echo "Error: Task file not found: $TASK_FILE"
@@ -98,23 +115,41 @@ if [ -f "$BLOCKED_FILE" ]; then
   exit 2
 fi
 
-# --- Build the context file list ---
-# Order matters: constitution first (governance), then spec (what), then plan (how),
-# then supporting docs, then tasks (what to do now)
-CONTEXT_FILES=""
+# --- Build context file lists ---
+# ALWAYS_FILES: small, always needed — read unconditionally
+# REFERENCE_FILES: larger docs — agent reads the manifest and picks what it needs
+ALWAYS_FILES=""
+REFERENCE_FILES=""
+
+# Always load: tasks (what to do), learnings (cross-run memory), CLAUDE.md (build commands)
+# These are added directly in build_prompt since they use variables
+
+# Reference files: agent selects from these based on task needs
 if [ -f "$CONSTITUTION" ]; then
-  CONTEXT_FILES="$CONSTITUTION"
+  REFERENCE_FILES="$CONSTITUTION"
 fi
 for f in spec.md plan.md data-model.md research.md quickstart.md; do
   if [ -f "$SPEC_DIR/$f" ]; then
-    CONTEXT_FILES="$CONTEXT_FILES $SPEC_DIR/$f"
+    REFERENCE_FILES="$REFERENCE_FILES $SPEC_DIR/$f"
   fi
 done
 if [ -d "$SPEC_DIR/contracts" ]; then
   for f in "$SPEC_DIR/contracts/"*.md; do
-    [ -f "$f" ] && CONTEXT_FILES="$CONTEXT_FILES $f"
+    [ -f "$f" ] && REFERENCE_FILES="$REFERENCE_FILES $f"
   done
 fi
+
+# --- Generate file manifest (one-line summaries for intelligent context selection) ---
+build_manifest() {
+  for f in $REFERENCE_FILES; do
+    # Extract first heading or first non-empty line as summary, plus line count for size hint
+    local lines summary
+    lines=$(wc -l < "$f" 2>/dev/null || echo "?")
+    summary=$(grep -m1 '^#' "$f" 2>/dev/null | sed 's/^#\+\s*//' || head -1 "$f" 2>/dev/null)
+    [ -z "$summary" ] && summary="(no heading)"
+    echo "- \`$f\` (${lines} lines) — $summary"
+  done
+}
 
 # --- Log setup ---
 LOG_DIR="logs"
@@ -142,37 +177,52 @@ count_blocked()   { count_tasks '^\- \[?\]'; }
 
 # --- Build the prompt for each claude invocation ---
 build_prompt() {
-  cat <<'PROMPT'
+  cat <<PROMPT
 You are an implementation agent for a spec-kit project. Your job is to execute exactly ONE task from the task list, then stop.
 
-## Step 1: Read all context
+## Step 1: Read the task list and find your task
 
-Read these files IN ORDER to understand the project:
+Read these files first — they are small and always needed:
+- \`$TASK_FILE\` — the task list (find the next unchecked task)
+- \`CLAUDE.md\` (if it exists) — build/test commands and project conventions
 PROMPT
 
-  # List context files
-  for f in $CONTEXT_FILES; do
-    echo "- \`$f\`"
-  done
+  if [ -f "$LEARNINGS_FILE" ]; then
+    echo "- \`$LEARNINGS_FILE\` — discoveries from previous runs (read this to avoid repeating mistakes)"
+  fi
 
-  cat <<PROMPT
+  cat <<'PROMPT'
 
-Then read the task list:
-- \`$TASK_FILE\`
+Scan the task file, find the FIRST unchecked task (`- [ ]`) that is ready (see Step 2), and note what it requires.
 
-Also read \`CLAUDE.md\` if it exists — it contains build/test commands and project conventions.
+## Step 1b: Load only the context you need
 
-## Step 2: Understand the task structure
+Below is a manifest of available reference files with summaries. **Do NOT read all of them.** Based on your specific task, select and read ONLY the files relevant to what you need to implement:
+
+PROMPT
+
+  # Emit the manifest
+  build_manifest
+
+  cat <<'PROMPT'
+
+**Selection guide:**
+- Setup/config tasks → usually just `CLAUDE.md` is enough
+- Tasks referencing data models or schemas → read `data-model.md`
+- Tasks implementing API endpoints → read the relevant contract file
+- Tasks requiring architectural context → read `constitution.md` and/or `plan.md`
+- Tasks referencing feature behavior → read `spec.md`
+- When in doubt, read `plan.md` — it's the most useful general reference
+
+## Step 2: Find the next task
 
 The task file is organized into PHASES. Each phase has a checkpoint that must pass before the next phase begins. Within a phase, tasks are ordered by dependency:
 - Tasks marked \`[P]\` can run in parallel (they touch different files)
 - Tasks WITHOUT \`[P]\` must run in order
-- Test tasks come BEFORE their corresponding implementation tasks (TDD — constitution principle VII)
+- Test tasks come BEFORE their corresponding implementation tasks (TDD)
 - The Dependencies section at the bottom of tasks.md defines phase ordering
 
-## Step 3: Find the next task
-
-Scan the task file and find the FIRST unchecked task (\`- [ ]\`) that is READY to execute:
+Find the FIRST unchecked task (\`- [ ]\`) that is READY to execute:
 
 1. All tasks in previous phases must be complete (\`- [x]\`) or skipped (\`- [~]\`)
 2. All non-\`[P]\` tasks earlier in the current phase must be complete
@@ -181,7 +231,7 @@ Scan the task file and find the FIRST unchecked task (\`- [ ]\`) that is READY t
 If there are no unchecked tasks → say "ALL TASKS COMPLETE" and stop.
 If the next task is blocked by incomplete prerequisites → say "BLOCKED: waiting on [task IDs]" and stop.
 
-## Step 4: Execute the task
+## Step 3: Execute the task
 
 - Read any source files referenced in the task description
 - Implement exactly what the task describes — follow the spec, plan, contracts, and data-model
@@ -189,22 +239,56 @@ If the next task is blocked by incomplete prerequisites → say "BLOCKED: waitin
 - If the constitution exists, ensure your implementation complies with all principles
 - If something is unclear or you need a design decision, write the question to \`BLOCKED.md\` and STOP immediately
 
-## Step 5: Verify your work
+## Step 4: Verify your work
 
 After implementing, run the project's build and test commands to verify:
 - Check CLAUDE.md for the exact commands (typically \`npm run build\` and \`npm test\` or similar)
 - If no CLAUDE.md, check package.json scripts or the equivalent for the project's tech stack
 - Fix any errors before proceeding
-- If you cannot fix a build/test failure, write the issue to \`BLOCKED.md\` and stop
+- If you cannot fix a build/test failure after 3 attempts, write the issue to \`BLOCKED.md\` and stop
 
 For early tasks (e.g., Phase 1 Setup), the build/test commands may not exist yet — that's fine, verify what you can.
 
-## Step 6: Mark complete and commit
+## Step 5: Self-review
+
+Before marking complete, review your own changes:
+1. Run \`git diff\` to see everything you changed
+2. Check for:
+   - Leftover debug code, console.logs, TODOs
+   - Missing error handling at system boundaries (user input, external APIs)
+   - Inconsistencies with patterns established in the existing codebase
+   - Security issues (injection, XSS, hardcoded secrets)
+3. Fix anything you find before proceeding
+
+## Step 6: Record learnings
+
+Append any useful discoveries to \`$LEARNINGS_FILE\`. This file persists across runs — future agents will read it. Record things like:
+- Gotchas or surprises about the codebase, libraries, or APIs
+- Non-obvious decisions you made and WHY (so future tasks stay consistent)
+- Build/test quirks (e.g., "must run X before Y", "env var Z is required")
+- Patterns you established that later tasks should follow (e.g., "error types go in src/errors.ts")
+
+Format each entry as:
+\`\`\`
+### [TASK_ID] — Brief title
+<what you learned>
+\`\`\`
+
+Do NOT record obvious things. Only record what would save the next agent time or prevent it from making a mistake.
+
+## Step 7: Mark complete and commit
 
 1. In \`$TASK_FILE\`, change the task's \`- [ ]\` to \`- [x]\`
 2. If you're at a phase checkpoint, note whether the checkpoint criteria are met
-3. Commit all changes with a conventional commit message (\`feat:\`, \`test:\`, \`fix:\`, \`refactor:\`, \`docs:\`)
+3. Commit all changes (including learnings.md updates) with a conventional commit message (\`feat:\`, \`test:\`, \`fix:\`, \`refactor:\`, \`docs:\`)
    - Include the task ID in the commit message, e.g.: \`feat(T008): implement HTTP server entry point\`
+4. **If this was the LAST unchecked task** (no \`- [ ]\` remaining after marking it), append a review task to \`$TASK_FILE\`:
+   \`\`\`
+   ## Phase: Review
+
+   - [ ] REVIEW — Run code review on all changes from this feature branch
+   \`\`\`
+   This triggers an automated code review on the next runner iteration.
 
 ## Rules
 
@@ -216,7 +300,64 @@ For early tasks (e.g., Phase 1 Setup), the build/test commands may not exist yet
 - If you need user input, write to BLOCKED.md and stop immediately
 - Prefer minimal changes that satisfy the task description
 - If a task is unnecessary (already done, obsolete), mark it \`- [~]\` with a reason and move to the next task
+- ALWAYS update \`$LEARNINGS_FILE\` if you discovered anything non-obvious
 PROMPT
+}
+
+# --- Detect if the next task is a REVIEW task ---
+next_task_is_review() {
+  grep -q '^\- \[ \] REVIEW' "$TASK_FILE" 2>/dev/null
+}
+
+# --- Build the review prompt (embeds code-review skill inline) ---
+build_review_prompt() {
+  # Determine the base SHA — the commit before the first spec-kit task commit
+  local base_sha
+  base_sha=$(git log --all --oneline --grep='feat(T0\|test(T0\|fix(T0\|refactor(T0\|docs(T0' --reverse --format='%H' 2>/dev/null | head -1)
+  if [ -n "$base_sha" ]; then
+    base_sha="${base_sha}~1"
+  else
+    base_sha=$(git merge-base HEAD "$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || echo main)" 2>/dev/null || echo "HEAD~20")
+  fi
+
+  # Pick the most specific review skill based on project files
+  local review_skill="$SKILLS_DIR/code-review/SKILL.md"
+  if [ -f "package.json" ]; then
+    if grep -q '"react"' package.json 2>/dev/null; then
+      review_skill="$SKILLS_DIR/code-review-react/SKILL.md"
+    elif [ -f "tsconfig.json" ] || [ -f "server.js" ] || [ -f "index.ts" ] || [ -f "src/index.ts" ]; then
+      review_skill="$SKILLS_DIR/code-review-node/SKILL.md"
+    fi
+  fi
+
+  cat <<PROMPT
+You are a code review agent. All implementation tasks for this feature are complete. Your job is to review the full set of changes.
+
+## Base commit
+
+Use this as the base for your diff:
+\`\`\`
+$base_sha
+\`\`\`
+
+Run: \`git diff ${base_sha}...HEAD\`
+
+## Review instructions
+
+Follow the code review skill instructions below exactly. After completing the review, write the review report to \`$SPEC_DIR/REVIEW.md\`.
+
+Then mark the REVIEW task complete in \`$TASK_FILE\` (change \`- [ ] REVIEW\` to \`- [x] REVIEW\`) and commit with message: \`docs: code review for $(basename "$SPEC_DIR")\`
+
+---
+
+PROMPT
+
+  # Embed the review skill content (skip YAML frontmatter between first two --- lines)
+  if [ -f "$review_skill" ]; then
+    awk 'BEGIN{skip=0} /^---$/{skip++; next} skip>=2{print}' "$review_skill"
+  else
+    echo "No review skill found at $review_skill — perform a general code review covering correctness, security, performance, and error handling."
+  fi
 }
 
 log "=== Spec-Kit Task Runner Started ==="
@@ -250,7 +391,12 @@ while [ $RUN_NUM -lt "$MAX_RUNS" ]; do
   FIFO=$(mktemp -u)
   mkfifo "$FIFO"
 
-  PROMPT_TEXT=$(build_prompt)
+  if next_task_is_review; then
+    log "📋 Next task is REVIEW — switching to code review prompt"
+    PROMPT_TEXT=$(build_review_prompt)
+  else
+    PROMPT_TEXT=$(build_prompt)
+  fi
 
   claude --dangerously-skip-permissions --model opus --verbose --output-format stream-json \
     -p "$PROMPT_TEXT" \
@@ -319,6 +465,16 @@ while [ $RUN_NUM -lt "$MAX_RUNS" ]; do
   ' "$LOG_FILE" "$RATE_LIMIT_FILE" < "$FIFO"
 
   EXIT_CODE=$?
+  # Kill the claude process if it's still running (node may exit before claude finishes)
+  if [ -n "$CLAUDE_PID" ] && kill -0 "$CLAUDE_PID" 2>/dev/null; then
+    kill -TERM "$CLAUDE_PID" 2>/dev/null
+    # Give it a moment to exit gracefully, then force-kill
+    for i in 1 2 3 4 5; do
+      kill -0 "$CLAUDE_PID" 2>/dev/null || break
+      sleep 1
+    done
+    kill -9 "$CLAUDE_PID" 2>/dev/null || true
+  fi
   wait "$CLAUDE_PID" 2>/dev/null || true
   CLAUDE_PID=""
   rm -f "$FIFO"
