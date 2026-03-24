@@ -40,14 +40,36 @@ MAX_BACKOFF=1800
 STDERR_FILE=$(mktemp)
 RATE_LIMIT_FILE=$(mktemp)
 CLAUDE_PID=""
+HEARTBEAT_PID=""
+HEARTBEAT_INTERVAL=30
+
+start_heartbeat() {
+  (
+    while true; do
+      sleep "$HEARTBEAT_INTERVAL"
+      echo "[HEARTBEAT $(date '+%H:%M:%S')] +$(( $(date +%s) - RUN_START ))s" | tee -a "$LOG_FILE"
+    done
+  ) &
+  HEARTBEAT_PID=$!
+}
+
+stop_heartbeat() {
+  if [ -n "$HEARTBEAT_PID" ] && kill -0 "$HEARTBEAT_PID" 2>/dev/null; then
+    kill "$HEARTBEAT_PID" 2>/dev/null
+    wait "$HEARTBEAT_PID" 2>/dev/null || true
+  fi
+  HEARTBEAT_PID=""
+}
 
 cleanup() {
+  stop_heartbeat
   rm -f "$STDERR_FILE" "$RATE_LIMIT_FILE" 2>/dev/null
 }
 
 terminate() {
   echo ""
   echo "Interrupted."
+  stop_heartbeat
   if [ -n "$CLAUDE_PID" ] && kill -0 "$CLAUDE_PID" 2>/dev/null; then
     kill -TERM -- -"$CLAUDE_PID" 2>/dev/null || kill -TERM "$CLAUDE_PID" 2>/dev/null
     wait "$CLAUDE_PID" 2>/dev/null
@@ -473,6 +495,8 @@ INIT
     log "--- Run $RUN_NUM/$MAX_RUNS [$(basename "$SPEC_DIR")] (remaining: $REMAINING, completed: $COMPLETED, blocked: $BLOCKED) ---"
 
     RUN_START=$(date +%s)
+    export RUN_START
+    start_heartbeat
 
     > "$STDERR_FILE"
     > "$RATE_LIMIT_FILE"
@@ -553,6 +577,7 @@ INIT
     ' "$LOG_FILE" "$RATE_LIMIT_FILE" < "$FIFO"
 
     EXIT_CODE=$?
+    stop_heartbeat
     # Kill the claude process if it's still running (node may exit before claude finishes)
     if [ -n "$CLAUDE_PID" ] && kill -0 "$CLAUDE_PID" 2>/dev/null; then
       kill -TERM "$CLAUDE_PID" 2>/dev/null
