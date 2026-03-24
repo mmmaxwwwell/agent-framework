@@ -142,11 +142,13 @@ Each iteration spawns a fresh `claude` process (full context budget, no degradat
 1. Reads the task list and learnings, then consults a manifest of available reference files and loads only the ones relevant to the current task
 2. Finds the first unchecked task whose phase/dependency prerequisites are all complete
 3. Executes that ONE task, following TDD (test tasks fail before implementation)
-4. Runs the project's build/test commands (from `CLAUDE.md` or `package.json`)
+4. At phase boundaries, runs the project's build/test commands — if validation fails, writes failure state to `specs/<feature>/validate/<phase>/` and appends a phase-fix task to `tasks.md` (see "fix-validate loop" below)
 5. Self-reviews the diff for debug code, security issues, and pattern consistency
 6. Records discoveries and decisions in `learnings.md` (persists across runs)
 7. Marks the task `- [x]` and commits with the task ID (e.g., `feat(T008): implement HTTP server`)
 8. Loop repeats until all tasks are done, `BLOCKED.md` is written, or the run limit is hit
+
+**Fix-validate loop** — validation runs at phase boundaries, not per-task. When the last task in a phase completes, the agent runs the project's test suite. If it fails, the agent writes structured failure state to `validate/<phase>/<N>.md` and appends a phase-fix task (`phase3-fix1`, `phase3-fix2`, ...) to the task list. The next runner iteration picks up the fix task with fresh context and the full failure history on disk. After 10 failed fixes, the agent writes `BLOCKED.md` and the runner stops.
 
 **Automatic code review** — When the last implementation task completes, the agent appends a `REVIEW` task. The runner detects this, switches to a review-specific prompt that embeds the appropriate code-review skill (React, Node, or general), diffs all changes from the feature branch, and writes findings to `REVIEW.md` in the spec directory. The review is read-only — it reports issues but does not fix them.
 
@@ -285,18 +287,24 @@ When generating tasks (Phase 6):
 - **End-to-end validation phase** near the end — actually exercise the real flows after all unit/integration tests pass
 - **Approach note at the top of tasks.md**: `Approach: Fix-validate loop. Each phase: run tests → read test-logs/ failures → fix code → re-run until green.`
 
-### What the run-tasks agent MUST do
+### How the fix-validate loop works at runtime
 
-The implementation agent (spawned by `run-tasks.sh`) enforces the fix-validate loop on every task:
+The loop operates at **phase boundaries**, not per-task. It's a **disk-based state machine** driven by the task runner:
 
-1. After implementing a task, run the project's test command
-2. If tests fail, read `test-logs/` for structured failure output
-3. Fix the code (not the tests)
-4. Re-run tests
-5. Repeat until green or 3 attempts exhausted (then BLOCKED.md)
-6. Only mark the task complete when tests pass
+1. Agents implement tasks T007, T008, T009 (all in Phase 3). Each agent marks its task done and commits.
+2. The agent completing the **last task in Phase 3** runs the project's test suite.
+3. Validation fails → agent writes failure state to `specs/<feature>/validate/phase3/1.md` (command, exit code, structured test output from `test-logs/`, list of tasks completed in this phase)
+4. Agent appends `- [ ] phase3-fix1 Fix phase validation failure: read validate/phase3/ for failure history` to `tasks.md` at the end of Phase 3
+5. **Next runner iteration** picks up `phase3-fix1` with fresh context — reads the full failure history from `validate/phase3/`, reads `test-logs/`, diagnoses and fixes across all files touched by the phase
+6. The fix agent re-runs validation. If it still fails → writes `validate/phase3/2.md`, appends `phase3-fix2`
+7. After 10 failed fix attempts → writes `BLOCKED.md` and the runner stops
 
-This is already described in the run-tasks.sh prompt's Step 4, but the key addition is: **the agent MUST read `test-logs/` rather than parsing raw test runner output**. The structured logs are the primary feedback mechanism.
+Key properties:
+- **Validation is per-phase, not per-task** — this avoids wasting runs on intermediate states and lets all tasks in a phase land before checking correctness
+- **Each fix gets a fresh agent** with full context budget — no degradation from prior attempts
+- **Failure history accumulates on disk** in `validate/<phase>/` — nothing is lost between runs
+- **Tests are the spec** — fix the code, not the tests (unless a test is genuinely wrong)
+- **Structured test output** (`test-logs/summary.json` + `test-logs/<type>/<timestamp>/failures/`) is the primary feedback mechanism — agents read these rather than parsing raw test runner output
 
 ---
 
