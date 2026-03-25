@@ -40,6 +40,7 @@
 - **Enterprise Infrastructure section**: minimal — only document logging and error handling decisions
 - **Edge Cases & Failure Modes**: include for data loss, corrupt state, concurrent access (if the tool uses file locks or a database). Skip network/auth/rate-limit categories.
 - **Testing section**: unit tests for core logic, integration tests for data persistence and CLI behavior. Skip contract/e2e/security test requirements.
+- **UI_FLOW.md**: include if the project has a UI (desktop app, TUI with multiple screens). Skip for pure CLIs with no interactive UI.
 
 ## Plan phase overrides
 

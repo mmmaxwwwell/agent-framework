@@ -273,6 +273,27 @@ If you're starting a new session after a crash or restart:
 
 ---
 
+## Downstream agent effectiveness
+
+The spec you produce is the primary input for all downstream agents (plan, tasks, implement, review). Decisions and context captured here prevent agents from guessing, second-guessing, or writing BLOCKED.md for things you could have resolved upfront.
+
+### Auto-unblocking context
+Implementing agents will attempt to resolve blockers autonomously before writing BLOCKED.md (see "Auto-Unblocking" in SKILL.md). They consult `interview-notes.md` and `research.md` as constraint documents — if a candidate solution conflicts with a user preference documented there, agents skip it. This means:
+- **Document user pushbacks explicitly** — if the user says "no Docker" or "I don't want Express", record it with the reason. Otherwise an implementing agent may try the rejected approach when auto-unblocking.
+- **Document rejected alternatives** — not just what was chosen, but what was considered and rejected. This prevents implementing agents from re-evaluating decisions you already made.
+- **Document "why"** — rationale lets agents judge edge cases. "Use SQLite" is less useful than "Use SQLite because this is a single-user local tool and the user doesn't want to run a database server."
+
+### External process boundary testing
+If the project spawns external processes (CLI tools, agents, workers), probe for the process interface: what flags, what stdin/stdout format, what exit codes. The spec must include functional requirements for stub-process integration tests (see "External Process Boundary Testing" in SKILL.md). Ask: "Does this project spawn any external tools or child processes?"
+
+### Specification structure
+Every requirement gets a unique `FR-xxx` ID. Every spec includes a Success Criteria section with `SC-xxx` IDs mapped to requirements. Every user story gets an "Independent Test" field. This traceability is non-negotiable across all presets (including POC) — it costs nothing and lets implementing agents cross-reference when they hit ambiguity. See "Specification Structure & Traceability" in SKILL.md.
+
+### UI_FLOW.md
+If the project has a UI, the spec MUST include a functional requirement that `UI_FLOW.md` exists and that e2e tests cover every flow documented in it. Probe for: screens, navigation, state machines, field validations, real-time connections. See "UI_FLOW.md" in SKILL.md.
+
+---
+
 ## Rules
 
 - Ask ONE question at a time when the topic is complex. Group related simple questions.

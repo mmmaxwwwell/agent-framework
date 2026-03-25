@@ -131,6 +131,30 @@ The generated plan MUST include all sections required by SKILL.md:
 
 ---
 
+## Downstream agent effectiveness
+
+The plan you produce is the primary input for task generation and implementation. Decisions and rationale captured here prevent implementing agents from guessing, over-engineering, or writing BLOCKED.md.
+
+### Auto-unblocking context
+Implementing agents consult `research.md` and `interview-notes.md` before attempting to resolve blockers autonomously (see "Auto-Unblocking" in SKILL.md). This means `research.md` must document:
+- **Every rejected alternative with rationale** — so agents don't re-try approaches you already evaluated
+- **User preferences and pushbacks** from the interview — agents filter candidate solutions against these
+- **Constraint reasoning** — not just "we chose X" but "we chose X because the user said Y and the constitution requires Z"
+
+### Complexity tracking
+Any design decision that introduces abstraction beyond the simplest approach MUST either confirm it doesn't violate constitution principles, or add a row to the Complexity Tracking table. Don't gate this behind "violations only" — proactively evaluate every abstraction, interface, and indirection layer.
+
+### External process boundary testing
+If the project spawns external processes, the plan MUST include tasks for stub-process creation and integration tests that exercise the spawn → stdin → stdout → exit lifecycle. See "External Process Boundary Testing" in SKILL.md.
+
+### UI_FLOW.md
+If the project has a UI, the plan MUST include: creation of `UI_FLOW.md` as an early task, incremental updates as each phase adds screens/routes, and a late-phase task to verify all flows have e2e tests. See "UI_FLOW.md" in SKILL.md.
+
+### Specification traceability
+Every task generated from this plan must reference the FR/SC it implements. The plan should group work by user story or functional requirement to make this mapping natural. See "Specification Structure & Traceability" in SKILL.md.
+
+---
+
 ## Rules
 
 - Present decisions conversationally, not as a wall of text. One topic at a time.

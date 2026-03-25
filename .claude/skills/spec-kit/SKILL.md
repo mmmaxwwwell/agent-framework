@@ -25,7 +25,7 @@ Before doing anything else, determine the project's quality preset. This control
 
 1. Read the preset file from `presets/<preset>.md` (relative to this SKILL.md)
 2. The preset file lists overrides for each phase: what to skip, what to default, what to still ask about
-3. **The preset overrides this SKILL.md's MANDATORY tags** — if the preset says "skip", skip it even if SKILL.md says MANDATORY
+3. **The preset overrides this SKILL.md's MANDATORY tags** — if the preset says "skip", skip it even if SKILL.md says MANDATORY. There is no ambiguity: preset wins. The MANDATORY tags in SKILL.md describe the enterprise default; presets explicitly narrow that scope. When you see a MANDATORY tag and the active preset says to skip it, skip it without hesitation.
 4. **This SKILL.md remains your knowledge base** — you understand all the enterprise patterns. If the user asks about something the preset skipped (e.g., "should I add logging?"), reference the relevant section here and advise. Frame it as "when you're ready to harden this" rather than blocking current progress.
 5. Record the chosen preset in `interview-notes.md` so downstream phases (plan, tasks, implement) know which preset is active
 

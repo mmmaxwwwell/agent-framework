@@ -42,6 +42,7 @@
 - **No Enterprise Infrastructure section** — omit entirely
 - **Edge Cases & Failure Modes**: include a lightweight version — one-liner per major flow describing the expected behavior on failure. Skip the full 11-category enumeration. Agents need *something* to reference when they hit an edge case during implementation, otherwise they guess or write BLOCKED.md.
 - **Testing section**: minimal — list what the happy-path tests should cover, skip contract/e2e/security test requirements
+- **UI_FLOW.md**: skip — too much overhead for a POC. If the project has a UI, just document screens in the spec.
 - **No security warnings** for skipped items — the user chose POC, don't lecture
 
 ## Plan phase overrides

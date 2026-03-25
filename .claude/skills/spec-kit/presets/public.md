@@ -43,6 +43,7 @@
 - **Enterprise Infrastructure section**: include, but only for: logging, error handling, config, security (headers + input validation + scanning), rate limiting, graceful shutdown, health check, CI/CD. Skip observability, process architecture.
 - **Edge Cases & Failure Modes**: include — public-facing apps encounter hostile input. Focus on: invalid input, injection attempts, timeout, crash recovery, resource exhaustion, duplicate operations.
 - **Testing section**: full — unit, integration, and contract tests. Skip e2e unless the project has a UI. Include input validation and security header tests.
+- **UI_FLOW.md**: include if the project has a UI — required for public-facing apps with screens/routes.
 - **Security warnings**: yes — if the user tries to skip input validation or security headers, warn about specific attack vectors.
 
 ## Plan phase overrides

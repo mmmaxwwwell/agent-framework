@@ -798,8 +798,21 @@ Run: `git diff {base_sha}...HEAD`
 
 ## Review instructions
 
-Follow the code review skill instructions below. Write the review to `{spec_dir}/REVIEW.md`.
-Then mark the REVIEW task complete in `{task_file}` and commit with: `docs: code review for {Path(spec_dir).name}`
+Follow the code review skill instructions below. Your review is a 4-step process:
+
+### Step 1: Auto-implement necessary fixes
+Review the diff and **fix directly in the code**: bugs, security vulnerabilities, correctness issues, broken error handling, missing input validation, and anything that would cause runtime failures or data loss. Commit each fix.
+
+### Step 2: Write REVIEW-TODO.md
+Write `{spec_dir}/REVIEW-TODO.md` with optional improvements that are helpful but not necessary: refactoring suggestions, performance optimizations, better naming, additional test coverage, documentation gaps, code style. Each item includes: file, line range, what to improve, and why.
+
+### Step 3: Write REVIEW.md
+Write `{spec_dir}/REVIEW.md` with a summary of all findings: what was auto-fixed (with commit refs), what was deferred to REVIEW-TODO.md, and overall assessment.
+
+### Step 4: Fix-validate loop
+After applying fixes, run the project's test suite. If tests fail (your review fixes broke something), enter the fix-validate loop: read `test-logs/` (if available) or test output, diagnose, fix, re-run. Tests MUST pass before marking the review complete. After 10 failed attempts, write `BLOCKED.md`.
+
+When all steps are done and tests pass, mark the REVIEW task complete in `{task_file}` and commit with: `docs: code review for {Path(spec_dir).name}`
 
 ---
 
