@@ -92,17 +92,20 @@ TASK_RE = re.compile(
 PARALLEL_RE = re.compile(r'\[P\]')
 PHASE_HEADING_RE = re.compile(r'^##\s+Phase\s*(?::?\s*\d*\s*[-–—:]?\s*)?(.+)$', re.IGNORECASE)
 DEPENDENCY_SECTION_RE = re.compile(r'^##\s+(?:Phase\s+)?Dependencies', re.IGNORECASE)
-DEP_ARROW_RE = re.compile(r'Phase\s+(\d+|[A-Za-z][\w-]*)\s*(?:──?▶|->|→)\s*Phase\s+(\d+|[A-Za-z][\w-]*)')
+# Phase reference: "Phase 2b (Retro Wiring)" → captures "2b"
+_PHASE_REF_RE = re.compile(r'Phase\s+(\d+[a-zA-Z]?|[A-Za-z][\w-]*)(?:\s*\([^)]*\))?')
+_ARROW_RE = re.compile(r'\s*(?:──?▶|->|→)\s*')
 
 
 
 def slugify_phase(name: str) -> str:
-    """Convert phase heading to a slug like 'phase1', 'phase2-core'."""
-    # Try to extract phase number
-    m = re.match(r'(?:Phase\s*)?(\d+)', name, re.IGNORECASE)
+    """Convert phase heading to a slug like 'phase1', 'phase2b-core'."""
+    # Try to extract phase number (including letter suffixes like 2b)
+    m = re.match(r'(?:Phase\s*)?(\d+[a-zA-Z]?)', name, re.IGNORECASE)
     if m:
+        phase_id = m.group(1).lower()  # e.g. "2b"
         rest = name[m.end():].strip().strip(':').strip('-').strip('—').strip()
-        slug = f"phase{m.group(1)}"
+        slug = f"phase{phase_id}"
         if rest:
             rest_slug = re.sub(r'[^a-z0-9]+', '-', rest.lower()).strip('-')[:20]
             slug += f"-{rest_slug}"
@@ -111,9 +114,9 @@ def slugify_phase(name: str) -> str:
 
 
 def _extract_phase_number(slug: str) -> Optional[str]:
-    """Extract the numeric part from a phase slug, e.g. 'phase2-core' -> '2'."""
-    m = re.match(r'phase[- ]?(\d+)', slug, re.IGNORECASE)
-    return m.group(1) if m else None
+    """Extract the numeric part from a phase slug, e.g. 'phase2-core' -> '2', 'phase2b-foo' -> '2b'."""
+    m = re.match(r'phase[- ]?(\d+[a-zA-Z]?)', slug, re.IGNORECASE)
+    return m.group(1).lower() if m else None
 
 
 def parse_task_file(path: Path) -> tuple[list[Phase], dict[str, list[str]]]:
@@ -133,11 +136,24 @@ def parse_task_file(path: Path) -> tuple[list[Phase], dict[str, list[str]]]:
 
         # Parse dependency arrows in dep section
         if in_dep_section:
-            if line.startswith('##'):
+            # Exit dep section only on a same-level or higher heading (## but not ###)
+            if re.match(r'^##(?!#)\s', line):
                 in_dep_section = False
             else:
-                for m in DEP_ARROW_RE.finditer(line):
-                    raw_deps.append((m.group(1), m.group(2)))
+                # Split line on arrows to get segments, then extract phase refs
+                # Handles: Phase 1 ──▶ Phase 2 (foo) ──▶ Phase 3
+                # Handles: Phase 6 + Phase 7 + Phase 8 ──▶ Phase 9
+                segments = _ARROW_RE.split(line)
+                if len(segments) >= 2:
+                    for j in range(len(segments) - 1):
+                        # Source segment may have "+" joined phases
+                        src_ids = _PHASE_REF_RE.findall(segments[j])
+                        dst_ids = _PHASE_REF_RE.findall(segments[j + 1])
+                        # Each dst is the first phase ref in the next segment
+                        if dst_ids:
+                            dst = dst_ids[0]
+                            for src in src_ids:
+                                raw_deps.append((src, dst))
                 continue
 
         # Phase heading
