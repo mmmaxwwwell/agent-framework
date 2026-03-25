@@ -60,15 +60,30 @@ Before doing anything else, determine the project's quality preset. This control
 
 ---
 
+## Nix-first dependency management
+
+**At the start of every project, check if Nix is available** (`which nix`). If it is, Nix flakes are the **default** for all dependency and environment management. This is a cross-cutting concern that affects every phase:
+
+- **Environment isolation**: `flake.nix` with `devShells.default` provides all tools (runtimes, CLIs, databases, linters, formatters). `nix develop` is the entry point.
+- **Reproducibility**: `flake.lock` is committed — every developer and CI runner gets identical toolchains. No "works on my machine."
+- **direnv integration**: `.envrc` with `use flake` auto-activates the dev shell on `cd`. Add `.direnv/` to `.gitignore`.
+- **Backing services**: Prefer Nix-native solutions (`process-compose`, `devenv`) over Docker Compose. Only use Docker for services with no Nix package.
+- **Tool installation**: New tools go in `flake.nix`, not global installs or language-specific version managers (`nvm`, `pyenv`, etc.).
+- **Admin process parity**: Migrations, seeds, and scripts run inside `nix develop` — same tools, same versions as the app.
+
+When Nix is available, the plan MUST include `flake.nix` creation as a Phase 1 (Setup) task. The flake should use `nixpkgs` for packages and declare all project inputs. Interview notes MUST record "Nix available: yes" so downstream phases know to generate Nix-based infrastructure.
+
+If Nix is NOT available, fall back to Docker/devcontainers and language-native tooling. Do not block on Nix — it's a strong default, not a hard requirement.
+
+---
+
 ## Step 0: Ensure spec-kit is installed
 
 1. Check if `specify` is available: run `which specify || specify --version 2>/dev/null`.
 2. **If not installed**, install it pinned to **v0.4.1**:
-   ```bash
-   uv tool install specify-cli --from "git+https://github.com/github/spec-kit.git@v0.4.1"
-   ```
-   If `uv` is not available, tell the user they need to install `uv` first (`pip install uv` or `curl -LsSf https://astral.sh/uv/install.sh | sh`).
-3. **If already installed**, verify the version: `specify --version`. If it's not `0.4.1`, reinstall: `uv tool install --force specify-cli --from "git+https://github.com/github/spec-kit.git@v0.4.1"`
+   - **Preferred (Nix available)**: `nix profile install --impure --expr '(builtins.getFlake "github:github/spec-kit/v0.4.1").packages.${builtins.currentSystem}.default or (import (builtins.fetchGit { url = "https://github.com/github/spec-kit.git"; ref = "v0.4.1"; }) {})'` — if spec-kit doesn't publish a flake, fall back to `uv` below.
+   - **Fallback**: `uv tool install specify-cli --from "git+https://github.com/github/spec-kit.git@v0.4.1"`. If `uv` is not available, tell the user they need to install `uv` first (`pip install uv` or `curl -LsSf https://astral.sh/uv/install.sh | sh`).
+3. **If already installed**, verify the version: `specify --version`. If it's not `0.4.1`, reinstall using the same method as step 2 (with `--force` for `uv`).
 4. Verify: `specify --version` (should show `v0.4.1`)
 
 ---
@@ -161,7 +176,7 @@ For each phase, the user has two options:
 - Phases: Setup → Foundational → User Stories (P1-P3) → Polish.
 - **MANDATORY**: Task list MUST follow the fix-validate loop pattern. See "Integration Testing Requirements" below for the required task structure.
 - **MANDATORY**: Setup/init tasks MUST be idempotent. Tasks depending on external services (emulators, databases, dev servers) MUST include a readiness-check task or step before proceeding. See "Idempotency & Readiness Checks" below.
-- **MANDATORY**: Foundational phase tasks MUST include: logging infrastructure, error hierarchy, config module, graceful shutdown, health endpoints, CI/CD pipeline setup, security scanning integration, and database seed script (if applicable). These are infrastructure — they come before feature work.
+- **MANDATORY**: Foundational phase tasks MUST include: `flake.nix` with dev shell (if Nix available), logging infrastructure, error hierarchy, config module, graceful shutdown, health endpoints, CI/CD pipeline setup, security scanning integration, and database seed script (if applicable). These are infrastructure — they come before feature work.
 - **MANDATORY**: Every task MUST reference the user story or functional requirement it implements (e.g., `[Story 3]` or `[FR-015]`). See "Specification Structure & Traceability" below.
 - **If the project has a UI**: The first UI phase MUST include a task to create `UI_FLOW.md`. Each subsequent UI phase MUST include a task to update `UI_FLOW.md` with the screens/routes/flows added in that phase. A late-phase task MUST verify all UI_FLOW.md flows have corresponding e2e tests. See "UI_FLOW.md" section below.
 
@@ -271,7 +286,7 @@ Tests MUST exercise the real system wherever possible. The hierarchy of preferen
 2. **Real processes** — if the feature spawns child processes, test with real child processes. If it reads files, use real temp directories with real files.
 3. **Mock only what requires human interaction** — biometric prompts, hardware tokens, manual UI actions. Everything else should be real.
 4. **Never mock internal boundaries** — don't mock the database, don't mock service-to-service calls within the same process. Integration tests exist precisely to catch the bugs that unit tests with mocks miss.
-5. **Dev/prod parity** — use the same backing services in development, testing, and production. Never use SQLite in dev when production runs PostgreSQL. Never use an in-memory cache in tests when production uses Redis. Differences between environments are where bugs hide — code that passes tests in dev fails in production because the backing service behaves differently. Modern tooling (Docker, Nix, devcontainers) makes running production-equivalent services locally trivial.
+5. **Dev/prod parity** — use the same backing services in development, testing, and production. Never use SQLite in dev when production runs PostgreSQL. Never use an in-memory cache in tests when production uses Redis. Differences between environments are where bugs hide — code that passes tests in dev fails in production because the backing service behaves differently. Nix flakes make running production-equivalent services locally trivial and reproducible — pin exact versions in `flake.nix` so every developer and CI runner uses identical toolchains. When Nix is available, prefer it over Docker for dev environment parity.
 
 ### External process boundary testing
 
@@ -689,7 +704,7 @@ When an agent encounters a blocker, it MUST evaluate the situation before giving
 Common scenarios that agents MUST handle without writing BLOCKED.md:
 
 - **Emulator not installed**: Install and configure it (e.g., `sdkmanager`, Android emulator setup). Create the readiness script if it doesn't exist.
-- **Missing CLI tool**: Install via the project's package manager, `uv tool install`, `npm install -g`, or the project's Nix flake.
+- **Missing CLI tool**: If the project has a `flake.nix`, add the tool there and re-enter `nix develop`. Otherwise, install via `uv tool install`, `npm install -g`, or the system package manager.
 - **Database not running**: Start it, create the test database, run migrations.
 - **Port conflict**: Find an available port, update the config.
 - **Missing test fixtures**: Generate them (keypairs, template files, mock data).
@@ -1368,6 +1383,7 @@ Every project MUST ship with first-class developer experience out of the box. A 
 
 The project MUST have a single entry point that starts everything needed for development:
 
+- **If Nix is available**: `nix develop` enters the dev shell with all tools. From there, `npm run dev` (or `just dev`, `make dev`, etc.) starts the dev server, watches for changes, and starts all backing services. For projects using `devenv` or `process-compose` via Nix, `nix develop --command process-compose` (or equivalent) can start everything in one step.
 - **`npm run dev`** (or equivalent: `make dev`, `just dev`, `cargo run`, etc.) — starts the dev server, watches for changes, and starts all backing services (database, cache, queue, emulators)
 - If backing services need setup first (migrations, seeding), the dev command handles it automatically (idempotent — safe to re-run)
 - The command MUST print a clear summary on startup: what's running, what ports, and how to access it
@@ -1411,8 +1427,14 @@ The project MUST make environment setup frictionless:
 
 - **`.env.example`** — committed to git, contains every env var the project uses with placeholder values and comments explaining each one. Secrets get placeholder values like `your-api-key-here`. The dev command MUST check for `.env` and, if missing, copy `.env.example` to `.env` and tell the developer to fill in secrets.
 - **`.env`** — gitignored, never committed. Created from `.env.example` by the developer (or automatically by the dev command on first run).
-- **Environment isolation** — if the project uses Nix, include a `flake.nix` (or `shell.nix`) that provides all tools. If using devcontainers, include `.devcontainer/`. If using Docker Compose for backing services, include `docker-compose.yml` (or `compose.yml`). The goal: `nix develop` or `docker compose up` gives you everything.
-- **direnv integration** (optional but recommended for Nix projects) — include `.envrc` with `use flake` (or `use nix`) so environment activates automatically on `cd`. Add `.direnv/` to `.gitignore`.
+- **Environment isolation** — Nix flakes are the default. Check if `nix` is available on the system (`which nix`). If it is:
+  - **Always** include a `flake.nix` that provides all tools, runtimes, and backing services via `devShells.default`. Use `nix develop` as the environment entry point.
+  - **Always** include `.envrc` with `use flake` for automatic environment activation on `cd`. Add `.direnv/` to `.gitignore`.
+  - **Dependency management**: All project dependencies (language runtimes, CLI tools, database engines, linters, formatters) go in `flake.nix`, not in global installs or language-specific version managers. The flake is the single source of truth for "what tools does this project need."
+  - **Backing services**: Prefer `process-compose` or `devenv` (both Nix-native) over Docker Compose for databases, caches, queues. Only use Docker for services that have no Nix package.
+  - **Lockfile**: `flake.lock` is committed to git — this pins exact versions for reproducibility.
+  - If the project also needs to support non-Nix users (e.g., open-source project), include a `Dockerfile` or `devcontainer.json` as a fallback, but the Nix path is primary.
+- **If Nix is NOT available**: Fall back to devcontainers (`.devcontainer/`) or Docker Compose (`compose.yml`). Recommend Nix to the user as the preferred approach.
 
 ### Code generation
 
@@ -1448,7 +1470,8 @@ The project's `CLAUDE.md` MUST include a "Development" section with:
 
 ### Quick start
 \`\`\`bash
-npm run dev  # starts everything — server, database, watch mode
+nix develop   # enter dev shell (if using Nix — provides all tools)
+npm run dev   # starts everything — server, database, watch mode
 \`\`\`
 
 ### Available scripts
@@ -1459,8 +1482,9 @@ npm run dev  # starts everything — server, database, watch mode
 (full table from the project's actual scripts)
 
 ### Environment setup
+- `nix develop` to enter the dev shell (all tools provided by `flake.nix`)
+- If not using Nix: install tools listed in `package.json` engines
 - Copy `.env.example` to `.env` and fill in secrets
-- Required tools: (list from flake.nix or package.json engines)
 ```
 
 This ensures agents always know how to work with the project without guessing.
@@ -1477,7 +1501,7 @@ This ensures agents always know how to work with the project without guessing.
 
 ### What the spec MUST include
 
-- A functional requirement that `npm run dev` (or equivalent) boots the entire development environment
+- A functional requirement that `nix develop` (when Nix is available) provides all project tools, and `npm run dev` (or equivalent) boots the entire development environment
 - A functional requirement that all scripts in the inventory exist and work
 - A functional requirement that `.env.example` documents all environment variables
 - A functional requirement that debugging configurations are included and documented
@@ -1485,10 +1509,10 @@ This ensures agents always know how to work with the project without guessing.
 ### Preset behavior
 
 - **POC**: `dev` script only — just start the thing. `.env.example` if env vars are used. Skip everything else.
-- **Local / Public / Enterprise**: Full first-class DX. Complete script inventory, `.env.example`, environment isolation (Nix/devcontainer/Docker Compose as appropriate), codegen pipeline if applicable, VS Code debugging configs (+ JetBrains for enterprise), `clean:all`, CLAUDE.md development section. The only differences:
+- **Local / Public / Enterprise**: Full first-class DX. Complete script inventory, `.env.example`, Nix flake for environment isolation (with `flake.nix`, `.envrc`, direnv), codegen pipeline if applicable, VS Code debugging configs (+ JetBrains for enterprise), `clean:all`, CLAUDE.md development section. The only differences:
   - **Local**: skip HTTPS dev certs, skip proxy config (unless the project has separate frontend/backend). Skip JetBrains configs unless user asks.
   - **Public**: include HTTPS dev certs if OAuth/service workers require it. Include proxy config if separate frontend/backend.
-  - **Enterprise**: include everything — HTTPS dev certs, proxy, JetBrains configs, full environment isolation.
+  - **Enterprise**: include everything — HTTPS dev certs, proxy, JetBrains configs, full environment isolation via Nix flake.
 
 ---
 

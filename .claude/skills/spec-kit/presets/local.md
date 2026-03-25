@@ -23,7 +23,7 @@
 - Migration: auto-create schema on first run if using a database. Simple version check + auto-migrate.
 - CI/CD: none (recommend GitHub Actions lint + test if user asks)
 - Branching: direct-to-main — no feature branches, no PRs. Solo developer workflow.
-- DX tooling: first-class. Full script inventory (`dev`, `test`, `test:unit`, `test:integration`, `lint`, `lint:fix`, `typecheck`, `build`, `clean`, `clean:all`, `check`, plus `db:*` and `codegen` if applicable). `.env.example`. VS Code `launch.json` with debugger configs. Environment isolation (Nix/devcontainer if the user uses them). CLAUDE.md development section. Skip HTTPS dev certs and proxy config unless the project has separate frontend/backend.
+- DX tooling: first-class. Full script inventory (`dev`, `test`, `test:unit`, `test:integration`, `lint`, `lint:fix`, `typecheck`, `build`, `clean`, `clean:all`, `check`, plus `db:*` and `codegen` if applicable). `.env.example`. VS Code `launch.json` with debugger configs. Environment isolation via Nix flake (if `nix` is available — `flake.nix`, `.envrc` with `use flake`, `.direnv/` gitignored); otherwise devcontainer. CLAUDE.md development section. Skip HTTPS dev certs and proxy config unless the project has separate frontend/backend.
 
 **Still ask about**:
 - Core functionality, user workflows, data model
