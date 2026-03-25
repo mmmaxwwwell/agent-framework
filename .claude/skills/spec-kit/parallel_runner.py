@@ -92,7 +92,7 @@ PARALLEL_RE = re.compile(r'\[P\]')
 PHASE_HEADING_RE = re.compile(r'^##\s+Phase\s*(?::?\s*\d*\s*[-–—:]?\s*)?(.+)$', re.IGNORECASE)
 DEPENDENCY_SECTION_RE = re.compile(r'^##\s+(?:Phase\s+)?Dependencies', re.IGNORECASE)
 DEP_ARROW_RE = re.compile(r'Phase\s+(\d+|[A-Za-z][\w-]*)\s*(?:──?▶|->|→)\s*Phase\s+(\d+|[A-Za-z][\w-]*)')
-REVIEW_RE = re.compile(r'^- \[ \] REVIEW')
+
 
 
 def slugify_phase(name: str) -> str:
@@ -223,10 +223,15 @@ def parse_task_file(path: Path) -> tuple[list[Phase], dict[str, list[str]]]:
 # ── Scheduler ──────────────────────────────────────────────────────────
 
 class Scheduler:
-    """Determines which tasks are ready to run given current state."""
+    """Determines which tasks are ready to run given current state.
+
+    Phase lifecycle: tasks done → validate → review → re-validate → complete.
+    A phase blocks downstream until the full lifecycle is done.
+    """
 
     def __init__(self, phases: list[Phase], phase_deps: dict[str, list[str]],
-                 validated_phases: Optional[set[str]] = None):
+                 validated_phases: Optional[set[str]] = None,
+                 phase_states: Optional[dict[str, PhaseValidationState]] = None):
         self.phases = phases
         self.phase_deps = phase_deps
         self.phase_map = {p.slug: p for p in phases}
@@ -234,8 +239,13 @@ class Scheduler:
         for p in phases:
             for t in p.tasks:
                 self.task_map[t.id] = t
-        # Phases that have passed validation (or were grandfathered in).
+        # Full lifecycle state per phase.
+        self.phase_states: dict[str, PhaseValidationState] = phase_states or {}
+        # Legacy compat: fully completed phases.
         self.validated_phases: set[str] = validated_phases or set()
+
+    def _get_state(self, slug: str) -> PhaseValidationState:
+        return self.phase_states.get(slug, PhaseValidationState())
 
     def phase_tasks_complete(self, slug: str) -> bool:
         """All tasks in a phase are done (ignoring validation)."""
@@ -245,14 +255,32 @@ class Scheduler:
         return all(t.status in (TaskStatus.COMPLETE, TaskStatus.SKIPPED) for t in phase.tasks)
 
     def phase_complete(self, slug: str) -> bool:
-        """A phase is complete when all tasks are done AND it has been validated."""
+        """A phase is complete when fully validated+reviewed+re-validated."""
         if not self.phase_tasks_complete(slug):
             return False
-        return slug in self.validated_phases
+        state = self._get_state(slug)
+        return state.complete or slug in self.validated_phases
 
     def phase_needs_validation(self, slug: str) -> bool:
-        """Phase tasks are all done but validation hasn't run yet."""
-        return self.phase_tasks_complete(slug) and slug not in self.validated_phases
+        """Phase tasks are all done but initial validation hasn't passed yet."""
+        if not self.phase_tasks_complete(slug):
+            return False
+        state = self._get_state(slug)
+        return not state.validated and slug not in self.validated_phases
+
+    def phase_needs_review(self, slug: str) -> bool:
+        """Phase needs a code review cycle."""
+        if not self.phase_tasks_complete(slug):
+            return False
+        state = self._get_state(slug)
+        return state.needs_review
+
+    def phase_needs_review_validation(self, slug: str) -> bool:
+        """Phase needs re-validation after review applied fixes."""
+        if not self.phase_tasks_complete(slug):
+            return False
+        state = self._get_state(slug)
+        return state.needs_review_validation
 
     def phase_deps_met(self, slug: str) -> bool:
         deps = self.phase_deps.get(slug, [])
@@ -299,7 +327,7 @@ class Scheduler:
         return ready
 
     def all_complete(self) -> bool:
-        """All tasks done AND all phases validated."""
+        """All tasks done AND all phases fully validated+reviewed."""
         tasks_done = all(
             t.status in (TaskStatus.COMPLETE, TaskStatus.SKIPPED)
             for p in self.phases
@@ -307,7 +335,7 @@ class Scheduler:
         )
         if not tasks_done:
             return False
-        return all(p.slug in self.validated_phases for p in self.phases)
+        return all(self.phase_complete(p.slug) for p in self.phases)
 
     def remaining_count(self) -> int:
         return sum(
@@ -328,35 +356,143 @@ class Scheduler:
         )
 
     def phases_needing_validation(self) -> list[Phase]:
-        """Return phases whose tasks are all complete but that haven't been validated."""
+        """Return phases whose tasks are all complete but initial validation hasn't passed."""
         return [p for p in self.phases if self.phase_needs_validation(p.slug)]
 
+    def phases_needing_review(self) -> list[Phase]:
+        """Return phases that passed validation but haven't been reviewed yet."""
+        return [p for p in self.phases if self.phase_needs_review(p.slug)]
 
-def scan_validated_phases(spec_dir: str) -> set[str]:
-    """Scan validate/ directory for phases that have a PASS record.
+    def phases_needing_review_validation(self) -> list[Phase]:
+        """Return phases that have been reviewed but need post-review validation."""
+        return [p for p in self.phases if self.phase_needs_review_validation(p.slug)]
 
-    A phase is considered validated if any .md file in validate/<phase>/
-    contains 'PASS' in the first heading.
+
+@dataclass
+class PhaseValidationState:
+    """Tracks the full validation lifecycle for a phase.
+
+    Pipeline: tasks done → validate → (review → re-validate)* → clean → complete.
+    The review/validate cycle repeats until review reports no findings.
     """
-    validated = set()
+    validated: bool = False         # Tests passed after implementation
+    review_cycle: int = 0           # How many review cycles have completed
+    review_clean: bool = False      # Latest review found nothing to fix
+    review_validated: bool = False   # Tests passed after latest review fixes
+
+    @property
+    def complete(self) -> bool:
+        """Phase is complete when validated AND review cycle is clean AND re-validated."""
+        return self.validated and self.review_clean and self.review_validated
+
+    @property
+    def needs_review(self) -> bool:
+        """Needs review when validated but not yet clean (or re-validated after fixes)."""
+        if not self.validated:
+            return False
+        if self.review_clean:
+            return False  # Already clean
+        # Needs review if: never reviewed, or last review had fixes and re-validation passed
+        if self.review_cycle == 0:
+            return True  # Never reviewed
+        return self.review_validated  # Last review had fixes, re-validation passed, review again
+
+    @property
+    def needs_review_validation(self) -> bool:
+        """Needs re-validation after review applied fixes (not clean)."""
+        if not self.validated:
+            return False
+        if self.review_clean:
+            return False
+        if self.review_cycle == 0:
+            return False  # No review done yet
+        # Review was done but wasn't clean — need to re-validate after fixes
+        return not self.review_validated
+
+
+def scan_phase_validation_states(spec_dir: str) -> dict[str, PhaseValidationState]:
+    """Scan validate/ directory for the full validation lifecycle of each phase.
+
+    Reads numbered validation files, review markers, and post-review validation
+    to determine where each phase is in the review/validate cycle:
+      tasks done → validate → (review → re-validate)* → clean → complete
+
+    File conventions in validate/<phase>/:
+      N.md              — validation attempt N (heading contains PASS or FAIL)
+      review-N.md       — review cycle N (heading: REVIEW-CLEAN or REVIEW-FIXES)
+    """
+    states: dict[str, PhaseValidationState] = {}
     validate_dir = Path(spec_dir) / "validate"
     if not validate_dir.is_dir():
-        return validated
+        return states
     for phase_dir in validate_dir.iterdir():
         if not phase_dir.is_dir():
             continue
-        for md_file in sorted(phase_dir.glob("*.md")):
+        slug = phase_dir.name
+        state = PhaseValidationState()
+
+        # Collect all files with their types and timestamps
+        review_files = sorted(phase_dir.glob("review-*.md"))
+        validation_files = sorted(
+            f for f in phase_dir.glob("*.md")
+            if not f.name.startswith("review-")
+        )
+
+        # Check if any validation has passed (initial validation)
+        for md_file in validation_files:
             try:
                 text = md_file.read_text()
-                # Check first heading for PASS
                 for line in text.splitlines():
                     if line.startswith('#'):
                         if 'PASS' in line.upper():
-                            validated.add(phase_dir.name)
+                            state.validated = True
                         break
             except OSError:
                 continue
-    return validated
+
+        # Count review cycles and check if latest was clean
+        state.review_cycle = len(review_files)
+        if review_files:
+            latest_review = review_files[-1]
+            try:
+                text = latest_review.read_text()
+                for line in text.splitlines():
+                    if line.startswith('#'):
+                        if 'REVIEW-CLEAN' in line.upper():
+                            state.review_clean = True
+                            # Clean review means re-validation is automatic (no fixes to break)
+                            state.review_validated = True
+                        break
+            except OSError:
+                pass
+
+            # If latest review had fixes, check for a post-review validation PASS
+            if not state.review_clean:
+                latest_review_mtime = latest_review.stat().st_mtime
+                for md_file in validation_files:
+                    try:
+                        if md_file.stat().st_mtime <= latest_review_mtime:
+                            continue
+                        text = md_file.read_text()
+                        for line in text.splitlines():
+                            if line.startswith('#'):
+                                if 'PASS' in line.upper():
+                                    state.review_validated = True
+                                break
+                    except OSError:
+                        continue
+
+        states[slug] = state
+    return states
+
+
+def scan_validated_phases(spec_dir: str) -> set[str]:
+    """Return phases that have completed the full validation lifecycle.
+
+    A phase is complete when: validated → review clean → re-validated.
+    """
+    states = scan_phase_validation_states(spec_dir)
+    return {slug for slug, state in states.items() if state.complete}
 
 
 # ── ASCII dependency graph renderer ───────────────────────────────────
@@ -834,7 +970,6 @@ Append any useful discoveries to `{learnings_file}`.
 
 1. In `{task_file}`, change task {task.id}'s `- [ ]` to `- [x]`
 2. Commit all changes with a conventional commit message including the task ID (e.g., `feat({task.id}): ...`)
-3. If this was the LAST unchecked task, append a REVIEW phase
 
 ## Rules
 
@@ -851,30 +986,83 @@ Append any useful discoveries to `{learnings_file}`.
     return prompt
 
 
-def build_review_prompt(spec_dir: str, task_file: str, skills_dir: str) -> str:
-    """Build the review prompt (mirrors original run-tasks.sh logic)."""
-    # Find base SHA
-    try:
-        result = subprocess.run(
-            ["git", "log", "--all", "--oneline",
-             "--grep=feat(T0\\|test(T0\\|fix(T0\\|refactor(T0\\|docs(T0",
-             "--reverse", "--format=%H"],
-            capture_output=True, text=True, timeout=10
-        )
-        commits = result.stdout.strip().split("\n")
-        if commits and commits[0]:
-            base_sha = commits[0] + "~1"
-        else:
-            raise ValueError("no commits")
-    except Exception:
+def build_review_prompt(spec_dir: str, task_file: str, skills_dir: str,
+                        phase: Optional[Phase] = None,
+                        review_cycle: int = 1) -> str:
+    """Build a per-phase code review prompt.
+
+    The review agent reviews the diff for a specific phase, fixes issues,
+    and writes a review record indicating REVIEW-CLEAN (no fixes needed)
+    or REVIEW-FIXES (fixes applied, needs re-validation).
+
+    The runner uses this signal to decide whether to re-validate and
+    potentially review again (review/validate cycle).
+    """
+    # Determine diff scope
+    if phase:
+        # Find commits for this phase's tasks
+        task_ids = [t.id for t in phase.tasks]
+        grep_pattern = "\\|".join(rf"\({tid}\)" for tid in task_ids)
         try:
             result = subprocess.run(
-                ["git", "merge-base", "HEAD", "main"],
+                ["git", "log", "--all", "--oneline",
+                 f"--grep={grep_pattern}",
+                 "--reverse", "--format=%H"],
                 capture_output=True, text=True, timeout=10
             )
-            base_sha = result.stdout.strip() or "HEAD~20"
+            commits = [c for c in result.stdout.strip().split("\n") if c]
+            if commits:
+                base_sha = commits[0] + "~1"
+            else:
+                raise ValueError("no phase commits found")
         except Exception:
-            base_sha = "HEAD~20"
+            # Fallback: use merge-base
+            try:
+                result = subprocess.run(
+                    ["git", "merge-base", "HEAD", "main"],
+                    capture_output=True, text=True, timeout=10
+                )
+                base_sha = result.stdout.strip() or "HEAD~20"
+            except Exception:
+                base_sha = "HEAD~20"
+        phase_name = phase.name
+        phase_slug = phase.slug
+    else:
+        # Legacy: whole-feature review
+        try:
+            result = subprocess.run(
+                ["git", "log", "--all", "--oneline",
+                 "--grep=feat(T0\\|test(T0\\|fix(T0\\|refactor(T0\\|docs(T0",
+                 "--reverse", "--format=%H"],
+                capture_output=True, text=True, timeout=10
+            )
+            commits = result.stdout.strip().split("\n")
+            if commits and commits[0]:
+                base_sha = commits[0] + "~1"
+            else:
+                raise ValueError("no commits")
+        except Exception:
+            try:
+                result = subprocess.run(
+                    ["git", "merge-base", "HEAD", "main"],
+                    capture_output=True, text=True, timeout=10
+                )
+                base_sha = result.stdout.strip() or "HEAD~20"
+            except Exception:
+                base_sha = "HEAD~20"
+        phase_name = "all"
+        phase_slug = "all"
+
+    # Read prior review findings for context (if this is cycle 2+)
+    prior_reviews = ""
+    if review_cycle > 1:
+        review_dir = Path(spec_dir) / "validate" / phase_slug
+        if review_dir.exists():
+            for rf in sorted(review_dir.glob("review-*.md")):
+                try:
+                    prior_reviews += f"\n### {rf.name}\n{rf.read_text()}\n"
+                except OSError:
+                    pass
 
     # Pick review skill
     review_skill = Path(skills_dir) / "code-review" / "SKILL.md"
@@ -896,32 +1084,76 @@ def build_review_prompt(spec_dir: str, task_file: str, skills_dir: str) -> str:
         else:
             skill_content = text
 
-    return f"""You are a code review agent. All implementation tasks for this feature are complete.
+    validate_dir = f"{spec_dir}/validate/{phase_slug}"
+    review_file = f"{validate_dir}/review-{review_cycle}.md"
 
-## Base commit
+    prior_section = ""
+    if prior_reviews:
+        prior_section = f"""
+## Prior review findings
+
+These are findings from previous review cycles. Check if your prior fixes were applied correctly and look for any NEW issues — do not re-report issues that were already fixed.
+
+{prior_reviews}
+"""
+
+    return f"""You are a code review agent for **{phase_name}** ({phase_slug}). This is review cycle #{review_cycle}.
+
+## Diff scope
 ```
-{base_sha}
+git diff {base_sha}...HEAD
 ```
 
-Run: `git diff {base_sha}...HEAD`
-
+Run that command to see the changes for this phase.
+{prior_section}
 ## Review instructions
 
-Follow the code review skill instructions below. Your review is a 4-step process:
+Follow the code review skill instructions below. Your review is a 3-step process:
 
-### Step 1: Auto-implement necessary fixes
-Review the diff and **fix directly in the code**: bugs, security vulnerabilities, correctness issues, broken error handling, missing input validation, and anything that would cause runtime failures or data loss. Commit each fix.
+### Step 1: Review and fix
+Review the diff and **fix directly in the code** any issues that MUST be fixed: bugs, security vulnerabilities, correctness issues, broken error handling, missing input validation, and anything that would cause runtime failures or data loss. Commit each fix with a conventional commit message.
 
-### Step 2: Write REVIEW-TODO.md
-Write `{spec_dir}/REVIEW-TODO.md` with optional improvements that are helpful but not necessary: refactoring suggestions, performance optimizations, better naming, additional test coverage, documentation gaps, code style. Each item includes: file, line range, what to improve, and why.
+**Only fix things that are clearly wrong.** Do not refactor, rename, reorganize, or improve code style. Do not add tests beyond what the task specified. Do not add comments or documentation. The bar is: "would this cause a bug, security issue, or data loss in production?"
 
-### Step 3: Write REVIEW.md
-Write `{spec_dir}/REVIEW.md` with a summary of all findings: what was auto-fixed (with commit refs), what was deferred to REVIEW-TODO.md, and overall assessment.
+### Step 2: Write review record
 
-### Step 4: Fix-validate loop
-After applying fixes, run the project's test suite. If tests fail (your review fixes broke something), enter the fix-validate loop: read `test-logs/` (if available) or test output, diagnose, fix, re-run. Tests MUST pass before marking the review complete. After 10 failed attempts, write `BLOCKED.md`.
+Write `{review_file}` with one of two outcomes:
 
-When all steps are done and tests pass, mark the REVIEW task complete in `{task_file}` and commit with: `docs: code review for {Path(spec_dir).name}`
+**If you made fixes:**
+```markdown
+# Phase {phase_slug} — Review #{review_cycle}: REVIEW-FIXES
+
+**Date**: (timestamp)
+**Fixes applied**:
+- (list each fix: file, what was wrong, what you changed, commit SHA)
+
+**Deferred** (optional improvements, not bugs):
+- (list any nice-to-haves you noticed but did NOT fix)
+```
+
+**If you found nothing worth fixing:**
+```markdown
+# Phase {phase_slug} — Review #{review_cycle}: REVIEW-CLEAN
+
+**Date**: (timestamp)
+**Assessment**: Code is clean. No bugs, security issues, or correctness problems found.
+
+**Deferred** (optional improvements, not bugs):
+- (list any nice-to-haves, or "None")
+```
+
+### Step 3: Commit and exit
+
+Commit the review record: `docs: code review #{review_cycle} for {phase_slug}`
+
+**Do NOT run tests yourself.** The runner handles validation after your review. Do NOT mark any tasks in `{task_file}`. Do NOT write REVIEW.md or REVIEW-TODO.md — the review record IS the output.
+
+## Rules
+
+- Fix only bugs, security issues, and correctness problems — not style
+- Do NOT read ROUTER.md or load any skills
+- Do NOT use the Skill tool
+- The heading of `{review_file}` MUST contain either `REVIEW-CLEAN` or `REVIEW-FIXES` — the runner parses this
 
 ---
 
@@ -1677,7 +1909,9 @@ class Runner:
 
         # Parse tasks
         phases, phase_deps = parse_task_file(task_file)
-        scheduler = Scheduler(phases, phase_deps)
+        phase_states = scan_phase_validation_states(spec_dir)
+        validated_phases = {s for s, st in phase_states.items() if st.complete}
+        scheduler = Scheduler(phases, phase_deps, validated_phases, phase_states)
 
         if scheduler.all_complete():
             self.log(f"Skipping {spec_dir} — all tasks complete")
@@ -1706,8 +1940,10 @@ class Runner:
 
         # Scan for already-validated phases (from prior runs)
         validated_phases = scan_validated_phases(spec_dir)
-        # Track which phases currently have a validation agent running
+        # Track which phases currently have a validation/review/re-validation agent running
         validating_phases: set[str] = set()
+        reviewing_phases: set[str] = set()
+        revalidating_phases: set[str] = set()
 
         # Setup TUI for this feature
         if not self.headless:
@@ -1726,9 +1962,10 @@ class Runner:
         while not self._shutdown.is_set() and total_runs < self.max_runs:
             # Re-parse task file to pick up changes from agents
             phases, phase_deps = parse_task_file(task_file)
-            # Re-scan validated phases (a validation agent may have written a PASS)
-            validated_phases = scan_validated_phases(spec_dir)
-            scheduler = Scheduler(phases, phase_deps, validated_phases)
+            # Re-scan phase validation states (validation/review/re-validation lifecycle)
+            phase_states = scan_phase_validation_states(spec_dir)
+            validated_phases = {s for s, st in phase_states.items() if st.complete}
+            scheduler = Scheduler(phases, phase_deps, validated_phases, phase_states)
 
             if self.tui:
                 self.tui.phases = phases
@@ -1777,16 +2014,10 @@ class Runner:
                 if task.id in running_ids:
                     continue
 
-                # Check if it's a REVIEW task
-                is_review = task.id == "REVIEW" or "REVIEW" in task.description
-
-                if is_review:
-                    prompt = build_review_prompt(spec_dir, str(task_file), str(self.skills_dir))
-                else:
-                    prompt = build_prompt(
-                        str(task_file), spec_dir, str(learnings_file),
-                        str(constitution), reference_files, task
-                    )
+                prompt = build_prompt(
+                    str(task_file), spec_dir, str(learnings_file),
+                    str(constitution), reference_files, task
+                )
 
                 self.agent_counter += 1
                 agent_id = self.agent_counter
@@ -1872,8 +2103,147 @@ class Runner:
                 spawned += 1
                 total_runs += 1
 
-            # Clean up validating_phases for phases that are now validated
-            validating_phases -= validated_phases
+            # Clean up validating_phases for phases that have moved past initial validation
+            for slug, state in phase_states.items():
+                if state.validated and slug in validating_phases:
+                    validating_phases.discard(slug)
+
+            # ── Phase-boundary code review ─────────────────────────────
+            # After validation passes, spawn a review agent for the phase.
+            # Review/validate cycles repeat until review reports CLEAN.
+            # Cap at 5 cycles to prevent infinite loops.
+            MAX_REVIEW_CYCLES = 5
+            for phase in scheduler.phases_needing_review():
+                if phase.slug in reviewing_phases:
+                    continue
+                if available_slots <= 0:
+                    break
+
+                phase_vdir = Path(spec_dir) / "validate" / phase.slug
+                phase_vdir.mkdir(parents=True, exist_ok=True)
+
+                state = phase_states.get(phase.slug, PhaseValidationState())
+                cycle = state.review_cycle + 1
+
+                if cycle > MAX_REVIEW_CYCLES:
+                    self.log(f"Review cycle cap ({MAX_REVIEW_CYCLES}) reached for {phase.name} — treating as clean")
+                    # Write a synthetic REVIEW-CLEAN to break the loop
+                    review_file = phase_vdir / f"review-{cycle}.md"
+                    review_file.write_text(
+                        f"# Phase {phase.slug} — Review #{cycle}: REVIEW-CLEAN\n\n"
+                        f"**Date**: {datetime.now().isoformat()}\n"
+                        f"**Assessment**: Review cycle cap reached. Prior cycles addressed all critical issues.\n"
+                    )
+                    continue
+
+                prompt = build_review_prompt(
+                    spec_dir, str(task_file), str(self.skills_dir),
+                    phase=phase, review_cycle=cycle
+                )
+
+                review_task_id = f"REVIEW-{phase.slug}-{cycle}"
+                review_task = Task(
+                    id=review_task_id,
+                    description=f"Code review #{cycle}: {phase.name}",
+                    phase=phase.slug,
+                    parallel=False,
+                    status=TaskStatus.RUNNING,
+                    line_num=0,
+                )
+
+                self.agent_counter += 1
+                agent_id = self.agent_counter
+
+                log_path = self.log_dir / f"agent-{agent_id}-{review_task_id}-{self.timestamp}.jsonl"
+                stderr_path = self.log_dir / f"agent-{agent_id}-{review_task_id}-{self.timestamp}.stderr"
+
+                self.log(f"Spawning review Agent {agent_id} (cycle {cycle}) for {phase.name}")
+
+                proc = spawn_agent(review_task, prompt, log_path, stderr_path)
+
+                slot = AgentSlot(
+                    agent_id=agent_id,
+                    task=review_task,
+                    process=proc,
+                    pid=proc.pid,
+                    start_time=time.time(),
+                    log_file=log_path,
+                    status="running",
+                )
+
+                with self._lock:
+                    self.agents.append(slot)
+
+                reviewing_phases.add(phase.slug)
+                available_slots -= 1
+                spawned += 1
+                total_runs += 1
+
+            # Clean up reviewing_phases — remove phases that no longer need review
+            # (either clean, or waiting for re-validation, or fully complete)
+            reviewing_phases -= {
+                slug for slug in reviewing_phases
+                if not scheduler.phase_needs_review(slug)
+            }
+
+            # ── Post-review validation ─────────────────────────────────
+            # After review applied fixes (REVIEW-FIXES), re-validate.
+            for phase in scheduler.phases_needing_review_validation():
+                if phase.slug in revalidating_phases:
+                    continue
+                if available_slots <= 0:
+                    break
+
+                phase_vdir = Path(spec_dir) / "validate" / phase.slug
+                phase_vdir.mkdir(parents=True, exist_ok=True)
+
+                prompt = build_validation_prompt(
+                    spec_dir, str(task_file), phase, str(learnings_file)
+                )
+
+                reval_task_id = f"REVALIDATE-{phase.slug}"
+                reval_task = Task(
+                    id=reval_task_id,
+                    description=f"Post-review validation: {phase.name}",
+                    phase=phase.slug,
+                    parallel=False,
+                    status=TaskStatus.RUNNING,
+                    line_num=0,
+                )
+
+                self.agent_counter += 1
+                agent_id = self.agent_counter
+
+                log_path = self.log_dir / f"agent-{agent_id}-{reval_task_id}-{self.timestamp}.jsonl"
+                stderr_path = self.log_dir / f"agent-{agent_id}-{reval_task_id}-{self.timestamp}.stderr"
+
+                self.log(f"Spawning post-review validation Agent {agent_id} for {phase.name}")
+
+                proc = spawn_agent(reval_task, prompt, log_path, stderr_path)
+
+                slot = AgentSlot(
+                    agent_id=agent_id,
+                    task=reval_task,
+                    process=proc,
+                    pid=proc.pid,
+                    start_time=time.time(),
+                    log_file=log_path,
+                    status="running",
+                )
+
+                with self._lock:
+                    self.agents.append(slot)
+
+                revalidating_phases.add(phase.slug)
+                available_slots -= 1
+                spawned += 1
+                total_runs += 1
+
+            # Clean up revalidating_phases
+            revalidating_phases -= {
+                slug for slug in revalidating_phases
+                if not scheduler.phase_needs_review_validation(slug)
+            }
 
             # Update TUI
             if self.tui:

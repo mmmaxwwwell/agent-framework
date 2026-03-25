@@ -1,6 +1,6 @@
 ---
 name: spec-kit
-description: Initialize and drive a spec-kit (Specification-Driven Development) project using the `specify` CLI. Handles install, init, and walks the user through the full SDD workflow — constitution, specify, clarify, plan, tasks, implement. Enforces end-to-end integration testing with real server implementations, structured agent-readable test output, and a fix-validate loop after every feature. Use when the user wants to start or continue a spec-kit project.
+description: Initialize and drive a spec-kit (Specification-Driven Development) project using the `specify` CLI. Handles install, init, and walks the user through the full SDD workflow — constitution, specify, clarify, plan, tasks, implement. Enforces end-to-end integration testing with real server implementations, structured agent-readable test output, a fix-validate loop after every phase, and per-phase code review with review/validate cycling until clean. Use when the user wants to start or continue a spec-kit project.
 user-invocable: true
 allowed-tools: Bash, Read, Write, Edit, Glob, Grep, Agent, WebFetch
 argument-hint: [project-name]

@@ -91,14 +91,30 @@ Implementing agents MUST know this format to read failure logs during the fix-va
 
 When running the fix-validate loop, agents read `test-logs/` for the latest run, diagnose from `summary.json` → `failures/*.log`, fix code, and re-run. For full details on the test output specification and the testing philosophy (real servers, no mocks at system boundaries, stub process pattern), see `reference/testing.md`.
 
-### Automatic code review
+### Automatic code review (per-phase)
 
-When the last implementation task completes, the agent appends a `REVIEW` task. The runner detects this, switches to a review-specific prompt that embeds the appropriate code-review skill (React, Node, or general), diffs all changes from the feature branch, and performs a two-tier review:
+Code review runs **after every phase**, not just at the end. It's structurally enforced by the runner — agents cannot skip it.
 
-1. **Auto-implement necessary fixes** — bugs, security vulnerabilities, correctness issues, broken error handling, missing input validation, and anything that would cause runtime failures or data loss. The agent fixes these directly in the code and commits.
-2. **Write `REVIEW-TODO.md`** — optional improvements that are helpful but not necessary: refactoring suggestions, performance optimizations, better naming, additional test coverage, documentation gaps, code style improvements. Each item includes the file, line range, what to improve, and why. This file lives in the spec directory alongside `REVIEW.md`.
-3. **Write `REVIEW.md`** — summary of all findings: what was auto-fixed (with commit refs), what was deferred to `REVIEW-TODO.md`, and overall assessment.
-4. **Fix-validate loop** — after applying fixes, the agent runs the project's test suite. If tests fail (the review fixes broke something), the agent enters the standard fix-validate loop: read `test-logs/`, diagnose, fix, re-run. After 10 failed attempts, write `BLOCKED.md`. Tests MUST pass before the review task is marked complete.
+**Phase lifecycle:** tasks done → validate → (review → re-validate)* → clean → phase complete
+
+After all tasks in a phase pass validation, the runner spawns a **review agent** that:
+
+1. **Reviews the phase's diff** using the appropriate code-review skill (React, Node, or general — auto-detected from `package.json`)
+2. **Auto-fixes bugs** — security vulnerabilities, correctness issues, broken error handling, missing input validation, anything that would cause runtime failures or data loss. Commits each fix.
+3. **Writes a review record** to `validate/<phase>/review-N.md` with one of two outcomes:
+   - **`REVIEW-CLEAN`** — no bugs found, code is clean. Phase is complete.
+   - **`REVIEW-FIXES`** — fixes were applied. Runner spawns a validation agent to re-run tests.
+
+**If the review applied fixes** (REVIEW-FIXES):
+1. The runner re-validates (runs build/test commands via a validation agent)
+2. If validation fails → standard fix-validate loop (fix task appended, fix agent runs, re-validate)
+3. If validation passes → runner spawns **another review cycle** to check the fixes
+4. The cycle repeats until a review comes back REVIEW-CLEAN (no more bugs found)
+5. Safety cap: after 5 review cycles, the runner treats the phase as clean
+
+**Why per-phase instead of end-of-project?** Issues compound across phases. A bug in Phase 2 may look fine in isolation but cause cascading failures when Phase 3 builds on it. Catching issues early means fix agents have simpler context and fewer moving parts.
+
+Review records accumulate in `validate/<phase>/review-1.md`, `review-2.md`, etc. Each review cycle gets the full history of prior findings to avoid re-reporting fixed issues.
 
 ### learnings.md
 
