@@ -2196,7 +2196,7 @@ class Runner:
             # After validation passes, spawn a review agent for the phase.
             # Review/validate cycles repeat until review reports CLEAN.
             # Cap at 5 cycles to prevent infinite loops.
-            MAX_REVIEW_CYCLES = 5
+            MAX_REVIEW_CYCLES = 2
             for phase in scheduler.phases_needing_review():
                 if phase.slug in reviewing_phases:
                     continue
