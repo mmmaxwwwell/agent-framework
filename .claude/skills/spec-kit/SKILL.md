@@ -45,6 +45,8 @@ reference/           # Enterprise knowledge base — loaded on demand by phase f
 presets/             # Quality presets — loaded once per project
   poc.md             # Proof of concept
   local.md           # Single-user local tool
+  library.md         # Published package (npm, PyPI, crates.io)
+  extension.md       # Browser / IDE extension
   public.md          # Single-user public-facing
   enterprise.md      # Multi-user production
 ```
@@ -57,6 +59,8 @@ Before doing anything else, determine the project's quality preset. This control
 |--------|----------|-----------|---------------|
 | **poc** | Throwaway prototype, speed over everything | 3-5 | None — console.log, hardcoded config, no auth/tests/CI |
 | **local** | Single-user local tool (CLI, desktop, dev tooling) | 5-10 | Enterprise-grade — full test infra, CI/CD, structured logging, comprehensive errors. Scoped: no auth/CORS/rate-limiting/observability. |
+| **library** | Published package (npm, PyPI, crates.io) | 8-12 | Enterprise-grade — full test infra across target environments, CI/CD with publish pipeline, strict semver. Scoped: no server, no deployment, no auth. |
+| **extension** | Browser extension, VS Code extension, IDE plugin | 8-12 | Enterprise-grade — full test infra with host platform harness, CI/CD with store publish, permission audit. Scoped: platform sandbox constraints. |
 | **public** | Single-user but internet-exposed | 8-12 | Enterprise-grade — full security hardening, CI/CD, structured logging. Scoped: no multi-user auth, no observability infra. |
 | **enterprise** | Multi-user, production, team-maintained | Exhaustive | Full — everything in the reference files |
 
