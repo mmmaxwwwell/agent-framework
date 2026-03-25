@@ -76,7 +76,7 @@ The project's `CLAUDE.md` MUST include a "Development" section with:
 ## Development
 
 ### Quick start
-1. `nix develop` (or `npm install` if not using Nix)
+1. `nix develop` (or `npm install --ignore-scripts && npm rebuild` if not using Nix)
 2. `npm run dev`
 
 ### Available scripts

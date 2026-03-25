@@ -174,11 +174,12 @@ Common scenarios that agents MUST handle without writing BLOCKED.md:
 
 - **Emulator not installed**: Add it to `flake.nix` devShell and re-enter `nix develop`. Create the readiness script if it doesn't exist.
 - **Missing CLI tool**: Add the tool to `flake.nix` devShell and re-enter `nix develop`. **NEVER use `npm install -g`, `uv tool install`, `pip install`, or system package managers** — these mutate the host outside the project and are blocked by the sandbox.
+- **Any `npm install` / `pnpm install` / `yarn add`**: Always pass `--ignore-scripts`. Then `npm rebuild <pkg>` only for packages that need native compilation (e.g. `esbuild`, `sharp`, `better-sqlite3`).
 - **Database not running**: Start it using project-local scripts or `nix develop` process-compose. Create the test database, run migrations.
 - **Port conflict**: Find an available port, update the config.
 - **Missing test fixtures**: Generate them (keypairs, template files, mock data).
 - **Dependency version mismatch**: Update the lockfile or `flake.nix` pins, resolve the conflict.
-- **Missing project dependency**: Add to `package.json` / `pyproject.toml` / `flake.nix` and install project-locally (`npm install`, `pip install -e .` in a venv). Never install globally.
+- **Missing project dependency**: Add to `package.json` / `pyproject.toml` / `flake.nix` and install project-locally (`npm install --ignore-scripts`, `pip install --only-binary :all:` in a venv). Then `npm rebuild <pkg>` only for packages needing native compilation. Never install globally.
 
 ### BLOCKED.md format
 

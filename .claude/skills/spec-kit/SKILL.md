@@ -112,6 +112,8 @@ Implementation agents (Phase 7) run inside a **bubblewrap (bwrap) sandbox**. The
 Even without the sandbox, agents MUST use project-scoped installs:
 - **NEVER** use `nix profile install`, `npm install -g`, `uv tool install`, `pip install` (global), or `curl | sh`
 - **ALWAYS** add tools to the project's `flake.nix` devShell
+- **ALWAYS** use `--ignore-scripts` for npm/pnpm/yarn installs (e.g. `npm install --ignore-scripts`). Then run `npm rebuild <pkg>` only for packages that need native compilation (e.g. `esbuild`, `sharp`, `better-sqlite3`). This blocks postinstall-based supply chain attacks.
+- **For pip**: prefer installing from wheels (`pip install --only-binary :all:`) when available, which skips `setup.py` execution. Fall back to source builds only when no wheel exists.
 - The sandbox enforces this at the OS level — global install paths are not writable
 
 ## .gitignore management
