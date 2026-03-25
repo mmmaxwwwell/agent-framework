@@ -20,6 +20,13 @@ Read `interview-notes.md` for the `preset:` line. Then read the corresponding pr
    - Research the tech stack: best practices, library comparisons, performance benchmarks
    - Look at the spec's enterprise infrastructure decisions from the interview
    - Identify every decision point that affects architecture
+   - **DX friction analysis** — for every tool, library, and service in the stack, evaluate:
+     - **What is it?** Core purpose, maturity, maintenance status
+     - **How is it installed?** Nix package available? npm/pip/cargo package? Binary download? Does it need a daemon or just a CLI?
+     - **What's the lowest-friction DX path?** How to wire it so `nix develop` (or `npm install`) gives a fully working environment with zero manual steps. Prefer tools that are a single `flake.nix` entry over tools that need config files, signup, env vars, or manual downloads.
+     - **Build/run overhead** — does it add seconds to the dev loop? Does it need a background process? Does it have a watch mode?
+     - **CI parity** — can the same tool run identically in CI and local dev?
+   - Use this analysis to choose between competing tools. When two tools solve the same problem, prefer the one with lower install/setup friction unless the higher-friction tool is dramatically better at its job. Document the trade-off in `research.md`.
 
 4. **Walk through every decision** — Present each architecture and technology decision to the user one at a time (or in logical groups). For each decision:
    - State what needs to be decided
@@ -44,9 +51,10 @@ Present these in order. Skip items marked N/A in the spec.
 
 ### Technology stack
 - **Language/runtime version** — Confirm or adjust what was decided in the interview
-- **Package manager** — npm, yarn, pnpm, uv, cargo, etc.
-- **Build tooling** — Compiler, bundler, dev server
-- **Framework** (if any) — Present alternatives with trade-offs
+- **Package manager** — npm, yarn, pnpm, uv, cargo, etc. Prefer the one with fastest install, best lockfile, and Nix integration.
+- **Build tooling** — Compiler, bundler, dev server. Evaluate startup time, watch mode quality, and whether it's a single `flake.nix` entry.
+- **Framework** (if any) — Present alternatives with trade-offs. Include DX friction: how many config files, how fast is cold start, does it have a good dev server with HMR?
+- **DX friction summary** — After evaluating all tools, present a brief "setup cost" summary: what `flake.nix` provides, what needs config files, what needs env vars or tokens. Goal: `git clone && nix develop && npm run dev` works with zero manual steps beyond filling in `.env`.
 
 ### Data layer
 - **Storage backend** — Database, filesystem, in-memory, hybrid
@@ -78,7 +86,7 @@ Present these in order. Skip items marked N/A in the spec.
 
 ### CI/CD
 - **Pipeline structure** — Confirm stages from interview
-- **Security scanning tools** — Confirm tier selection
+- **Security scanning tools** — Confirm tier selection. For each tool, note: does it need a token (and how to get one), or is it zero-config? Prefer zero-config tools. Document token setup instructions for the README (per `reference/cicd.md` CI credential section).
 - **Quality gates** — What blocks merges
 - **Agentic CI feedback** — How agents access CI logs, auto-push policy
 - **SBOM format** — CycloneDX or SPDX
