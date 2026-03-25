@@ -2138,8 +2138,28 @@ class Runner:
                 consecutive_noop += 1
                 if consecutive_noop >= max_consecutive_noop:
                     self.log(f"Stopped — {max_consecutive_noop} iterations with no progress")
+                    # Diagnose why we're stuck
+                    pending = scheduler.remaining_count()
+                    completed = scheduler.completed_count()
+                    blocked = scheduler.blocked_count()
+                    unvalidated = [
+                        p.slug for p in phases
+                        if scheduler.phase_tasks_complete(p.slug)
+                        and not scheduler.phase_complete(p.slug)
+                    ]
+                    self.log(f"  State: {completed} complete, {pending} pending, {blocked} blocked")
+                    if unvalidated:
+                        self.log(f"  Unvalidated phases (tasks done but validation missing): {', '.join(unvalidated)}")
+                    unmet = [
+                        f"{p.slug} (needs: {', '.join(d for d in phase_deps.get(p.slug, []) if not scheduler.phase_complete(d))})"
+                        for p in phases
+                        if not scheduler.phase_deps_met(p.slug)
+                        and any(t.status == TaskStatus.PENDING for t in p.tasks)
+                    ]
+                    if unmet:
+                        self.log(f"  Blocked by unmet deps: {', '.join(unmet)}")
                     break
-                self.log(f"No tasks ready (noop {consecutive_noop}/{max_consecutive_noop}). Waiting...")
+                self.log(f"No tasks ready ({consecutive_noop}/{max_consecutive_noop} before exit). Waiting...")
                 time.sleep(5)
                 continue
             else:
