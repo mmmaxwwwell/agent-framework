@@ -1219,6 +1219,7 @@ def _build_sandbox_cmd(project_dir: Path, inner_cmd: list[str]) -> list[str]:
       - /tmp                (tmpfs) — scratch
       - ~/.gitconfig        (ro)  — author name/email for commits
       - /etc/resolv.conf    (ro)  — DNS resolution
+      - /etc/hosts          (ro)  — localhost resolution (needed by test servers)
       - /etc/ssl/certs      (ro)  — TLS certificate bundle
       - /etc/static         (ro)  — NixOS resolv.conf / hosts symlink targets
       - ANTHROPIC_API_KEY   (env) — sole credential, passed as env var
@@ -1266,8 +1267,9 @@ def _build_sandbox_cmd(project_dir: Path, inner_cmd: list[str]) -> list[str]:
     # defense in depth.  The proxy is advisory (blocks hostname-based
     # connections from tools that DO honor *_PROXY env vars like curl,
     # pip, npm).
-    if Path("/etc/resolv.conf").exists():
-        cmd += ["--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf"]
+    for etc_file in ["/etc/resolv.conf", "/etc/hosts"]:
+        if Path(etc_file).exists():
+            cmd += ["--ro-bind", etc_file, etc_file]
     if Path("/etc/static").is_dir():
         cmd += ["--ro-bind", "/etc/static", "/etc/static"]
 

@@ -20,7 +20,7 @@
 - Rate limiting: basic per-IP rate limit on all endpoints (prevent abuse from bots/crawlers)
 - Graceful shutdown: yes, 30s timeout
 - Health checks: `/health` endpoint only (no `/ready` — single instance, no load balancer)
-- Security scanning: Tier 1 only (free tools — Trivy, Semgrep, Gitleaks, ecosystem audit)
+- Security scanning: Tier 1 + Snyk (free for public repos — Trivy, Semgrep, Gitleaks, Snyk, ecosystem audit)
 - CI/CD: GitHub Actions with lint + test + security scan. No deployment pipeline (user deploys manually or asks later).
 - Migration: structured migrations with a library. Seed script for dev bootstrapping.
 
