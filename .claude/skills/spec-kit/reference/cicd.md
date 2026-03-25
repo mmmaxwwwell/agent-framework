@@ -95,6 +95,55 @@ If the project is public (or will be), add Snyk to the CI pipeline. Snyk's Open 
 - Private repos without a Snyk paid plan — use Trivy + ecosystem audit only
 - PoC preset — skip all security scanning
 
+## CI credential setup documentation
+
+The project README MUST include a **CI Setup** section documenting every secret/token the pipeline requires. Contributors and maintainers need to know how to configure the pipeline — a workflow that references `${{ secrets.SNYK_TOKEN }}` without explaining where to get it is broken documentation.
+
+### What to document
+
+For each CI tool that requires authentication, the README must include:
+
+| Info | Example |
+|------|---------|
+| Secret name | `SNYK_TOKEN` |
+| Where to get it | "Sign in at snyk.io with your GitHub account → Account Settings → API Token" |
+| Where to store it | "GitHub repo → Settings → Secrets and variables → Actions → New repository secret" |
+| Required scopes/permissions | "Read-only, no org admin needed" |
+| Free tier eligibility | "Free for public repos (Snyk Open Source plan)" |
+
+### Common CI secrets reference
+
+Include this table (filtered to the tools actually used in the project):
+
+| Secret | Tool | How to obtain |
+|--------|------|---------------|
+| `SNYK_TOKEN` | Snyk | snyk.io → Account Settings → API Token (free with GitHub SSO) |
+| `SONAR_TOKEN` | SonarCloud | sonarcloud.io → My Account → Security → Generate Token (free for public repos) |
+| `FOSSA_API_KEY` | FOSSA | fossa.com → Account Settings → API Tokens (free tier: 5 projects) |
+| `CODECOV_TOKEN` | Codecov | codecov.io → repo settings (free for public repos, not required for public repos using GitHub Actions) |
+| *(none needed)* | Trivy, Semgrep OSS, Gitleaks, TruffleHog, CodeQL, OSV-Scanner, OpenSSF Scorecard, Grype, Checkov | These tools require no authentication tokens |
+
+### README template
+
+The implementing agent MUST add a section like this to the project README:
+
+```markdown
+## CI Setup
+
+The GitHub Actions pipeline runs automatically on PRs and pushes to main. Most tools require no setup, but some need API tokens:
+
+| Secret | Required | How to get it |
+|--------|----------|---------------|
+| `SNYK_TOKEN` | For Snyk scans | [snyk.io](https://snyk.io) → sign in with GitHub → Account Settings → API Token |
+| `SONAR_TOKEN` | For SonarCloud | [sonarcloud.io](https://sonarcloud.io) → My Account → Security → Generate Token |
+
+**To add secrets**: Go to your GitHub repo → Settings → Secrets and variables → Actions → New repository secret.
+
+Without these tokens, the corresponding scan steps will be skipped (they use `continue-on-error: true`).
+```
+
+Adjust the table to match the actual tools used in the project. Omit rows for tools that need no tokens.
+
 ## Artifact generation
 
 Every CI run MUST produce:
