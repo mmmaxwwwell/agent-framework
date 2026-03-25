@@ -38,6 +38,12 @@ Probe every one of these areas. Mark each as covered, deferred (with reason), or
 - API design (if applicable)
 - Real-time requirements (WebSocket, SSE, polling)
 
+### Process architecture & statefulness
+- **Stateless processes**: Should the app follow share-nothing architecture where processes are stateless and all persistent state lives in backing services (databases, caches, queues)? This is the 12-factor default and enables horizontal scaling, but some apps (embedded systems, desktop tools, single-user apps) are legitimately stateful.
+- **Session state**: If the app has user sessions, where does session state live? Recommend external stores (Redis, database) over in-memory/sticky sessions. Warn: "In-memory sessions break horizontal scaling — if you add a second server instance, users get logged out when their request hits the other instance."
+- **Concurrency model**: How does the app handle concurrent work? Recommend the process model (scale out via multiple processes, each handling a different workload type — web, worker, scheduler) over internal threading for most server apps. Ask: "Do you need horizontal scaling, or is single-process sufficient for your scale?"
+- **Backing service attachment**: All external services (databases, caches, queues, SMTP, blob storage) must be swappable via config. Ask: "Are there any backing services that are tightly coupled to the app?" If yes, recommend decoupling.
+
 ### Edge cases & failure modes
 For every major flow, ask: "What should happen when this fails?" Probe specifically for:
 - Timeout, crash/restart, concurrent access, invalid input

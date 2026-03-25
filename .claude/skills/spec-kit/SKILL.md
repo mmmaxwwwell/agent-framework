@@ -233,6 +233,7 @@ Tests MUST exercise the real system wherever possible. The hierarchy of preferen
 2. **Real processes** — if the feature spawns child processes, test with real child processes. If it reads files, use real temp directories with real files.
 3. **Mock only what requires human interaction** — biometric prompts, hardware tokens, manual UI actions. Everything else should be real.
 4. **Never mock internal boundaries** — don't mock the database, don't mock service-to-service calls within the same process. Integration tests exist precisely to catch the bugs that unit tests with mocks miss.
+5. **Dev/prod parity** — use the same backing services in development, testing, and production. Never use SQLite in dev when production runs PostgreSQL. Never use an in-memory cache in tests when production uses Redis. Differences between environments are where bugs hide — code that passes tests in dev fails in production because the backing service behaves differently. Modern tooling (Docker, Nix, devcontainers) makes running production-equivalent services locally trivial.
 
 ### External process boundary testing
 
@@ -951,6 +952,10 @@ All configuration MUST be loaded and validated in one place (e.g., `src/config.t
 3. Exports a typed/validated config object
 4. Is the ONLY place that reads config sources — no direct `process.env` / `os.environ` access elsewhere
 
+### Backing services as attached resources
+
+All backing services (databases, caches, message queues, SMTP servers, external APIs, blob storage) MUST be treated as attached resources, swappable via configuration. Application code MUST make no distinction between local and third-party services — a local PostgreSQL and Amazon RDS are accessed the same way, differing only in config values. No hardcoded connection strings, hostnames, or service URLs anywhere in the codebase. This enables swapping a backing service without code changes — only config changes.
+
 ### Fail-fast validation
 
 On startup, validate all configuration before doing anything else. If a required value is missing or invalid, the process MUST exit immediately with a clear error message listing every invalid/missing config key and what's expected. Not halfway through handling the first request.
@@ -1222,6 +1227,14 @@ When a new API version is introduced:
 
 The compatibility promise is defined during the interview (see `interview-wrapper.md`). If deferred, document "no backward compatibility policy — all clients assumed internal and updated simultaneously."
 
+### Admin process parity
+
+Migrations, seeds, maintenance scripts, and any one-off admin tasks MUST run in the same environment as the application — same runtime, same dependencies, same config, same release. Never run a migration from a developer laptop against a production database using different dependency versions. Admin processes MUST:
+- Be shipped with the application code (not maintained in separate repos or ad-hoc scripts)
+- Use the same dependency isolation as the app (same Nix flake, same virtualenv, same container)
+- Run against the same config sources as the app (same env vars, same config files)
+- Be invocable via named scripts in the project's task runner (e.g., `npm run migrate`, `npm run seed`)
+
 ### Configuration versioning
 
 When config file formats change between versions:
@@ -1247,6 +1260,15 @@ The standard pipeline structure, in order:
 6. **Contract test** — API compliance (if applicable)
 7. **E2E test** — full user flow tests (if applicable)
 8. **Deploy** — staging/production deployment (if applicable)
+
+### Build, release, run separation
+
+The pipeline MUST enforce strict separation between three stages:
+- **Build**: Convert source code into an executable artifact (compile, bundle, fetch dependencies). Deterministic and reproducible from a specific commit.
+- **Release**: Combine the build artifact with environment-specific config. Every release gets a unique identifier (git SHA, timestamp, or semantic version). Releases are immutable — any change creates a new release.
+- **Run**: Execute the release in the target environment. The run stage should have minimal complexity and no code changes.
+
+This separation means: no runtime code modifications, reliable rollbacks to any previous release, and clear audit trail of what's deployed where.
 
 ### Pipeline as code
 
