@@ -1122,6 +1122,12 @@ Run the build/test commands. Capture all output.
 
 **Code coverage is mandatory.** The test command MUST collect coverage (e.g. `c8` for Node native runner, `--coverage` for Jest/Vitest, `--cov` for pytest). If the project's test command does not include coverage flags, fix the test script in `package.json`/`CLAUDE.md`/equivalent to add them before running. Coverage output must appear in the terminal so it's visible in logs.
 
+**Fix missing tools before reporting failure.** If a build/test command fails because a tool is not installed (e.g. `eslint: command not found`, `tsc: not found`, missing npm packages), fix it:
+- Missing npm devDependency → `npm install --ignore-scripts` (then `npm rebuild <pkg>` only if native compilation needed)
+- Missing Python package → `uv add --dev <pkg>` or `uv sync --dev`
+- Missing system tool → add to `flake.nix` devShell
+- Then re-run the command. Only report a failure if the command fails AFTER dependencies are installed.
+
 **Important**: For early phases, the build/test infrastructure may not exist yet or may only cover a subset. Run what's available. If literally nothing can be validated yet, note this and pass.
 
 ### If tests FAIL — stop here
