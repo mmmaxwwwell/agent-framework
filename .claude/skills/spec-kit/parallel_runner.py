@@ -335,21 +335,45 @@ DIM = "\033[2m"
 
 
 def render_dependency_graph(phases: list[Phase], phase_deps: dict[str, list[str]],
-                             agents: list[AgentSlot], width: int) -> list[str]:
-    """Render an ASCII art dependency diagram showing phase/task status."""
-    lines = []
-    lines.append(f"{BOLD}{'─' * width}{RESET}")
-    lines.append(f"{BOLD} TASK DEPENDENCY GRAPH{RESET}")
-    lines.append(f"{BOLD}{'─' * width}{RESET}")
+                             agents: list[AgentSlot], width: int,
+                             max_height: int = 0) -> list[str]:
+    """Render an ASCII art dependency diagram showing phase/task status.
 
-    # Legend
+    If max_height > 0, the output is capped to that many lines. A sticky header
+    (title + legend + running agents + summary) is always shown. The task list
+    scrolls to keep running/active tasks visible.
+    """
+    running_ids = {a.task.id for a in agents}
+
+    # ── Build header (always visible) ────────────────────────────────────
+    header: list[str] = []
+    header.append(f"{BOLD}{'─' * width}{RESET}")
+
+    # Summary counts
+    total_tasks = sum(len(p.tasks) for p in phases)
+    done_tasks = sum(1 for p in phases for t in p.tasks
+                     if t.status in (TaskStatus.COMPLETE, TaskStatus.SKIPPED))
+    running_tasks = sum(1 for p in phases for t in p.tasks if t.id in running_ids)
+    failed_tasks = sum(1 for p in phases for t in p.tasks if t.status == TaskStatus.FAILED)
+    blocked_tasks = sum(1 for p in phases for t in p.tasks if t.status == TaskStatus.BLOCKED)
+
+    summary_parts = [f"{BOLD}TASKS{RESET} {done_tasks}/{total_tasks}"]
+    if running_tasks:
+        summary_parts.append(f"{STATUS_COLORS[TaskStatus.RUNNING]}◉ {running_tasks} running{RESET}")
+    if failed_tasks:
+        summary_parts.append(f"{STATUS_COLORS[TaskStatus.FAILED]}✗ {failed_tasks} failed{RESET}")
+    if blocked_tasks:
+        summary_parts.append(f"{STATUS_COLORS[TaskStatus.BLOCKED]}⊗ {blocked_tasks} blocked{RESET}")
+    header.append(" " + "  ".join(summary_parts))
+
+    # Legend (compact)
     legend_parts = []
-    for s in [TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.COMPLETE, TaskStatus.SKIPPED, TaskStatus.BLOCKED, TaskStatus.FAILED]:
+    for s in [TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.COMPLETE,
+              TaskStatus.SKIPPED, TaskStatus.BLOCKED, TaskStatus.FAILED]:
         legend_parts.append(f"{STATUS_COLORS[s]}{STATUS_SYMBOLS[s]} {s.value}{RESET}")
-    lines.append(" ".join(legend_parts))
-    lines.append("")
+    header.append(" " + " ".join(legend_parts))
 
-    # Running agents summary
+    # Running agents
     if agents:
         agent_strs = []
         for a in agents:
@@ -357,15 +381,16 @@ def render_dependency_graph(phases: list[Phase], phase_deps: dict[str, list[str]
             agent_strs.append(
                 f"{STATUS_COLORS[TaskStatus.RUNNING]}Agent {a.agent_id}: {a.task.id} ({elapsed}s){RESET}"
             )
-        lines.append(f" Running: {' │ '.join(agent_strs)}")
-        lines.append("")
+        header.append(f" Running: {' │ '.join(agent_strs)}")
 
-    # Phase diagram
-    running_ids = {a.task.id for a in agents}
-    slug_to_idx = {p.slug: i for i, p in enumerate(phases)}
+    header.append(f"{BOLD}{'─' * width}{RESET}")
+
+    # ── Build full task list ─────────────────────────────────────────────
+    task_lines: list[str] = []
+    # Track which line indices correspond to running/active tasks
+    active_line_indices: list[int] = []
 
     for i, phase in enumerate(phases):
-        # Phase header with dep arrows
         dep_str = ""
         if phase.dependencies:
             dep_names = []
@@ -375,7 +400,6 @@ def render_dependency_graph(phases: list[Phase], phase_deps: dict[str, list[str]
                     dep_names.append(dp.name[:15])
             dep_str = f" {DIM}← {', '.join(dep_names)}{RESET}"
 
-        # Phase status
         done = sum(1 for t in phase.tasks if t.status in (TaskStatus.COMPLETE, TaskStatus.SKIPPED))
         total = len(phase.tasks)
         running = sum(1 for t in phase.tasks if t.id in running_ids)
@@ -387,15 +411,16 @@ def render_dependency_graph(phases: list[Phase], phase_deps: dict[str, list[str]
             phase_color = STATUS_COLORS[TaskStatus.RUNNING]
             phase_sym = "◉"
         elif done > 0:
-            phase_color = "\033[33m"  # yellow - in progress
+            phase_color = "\033[33m"
             phase_sym = "◐"
         else:
             phase_color = STATUS_COLORS[TaskStatus.PENDING]
             phase_sym = "○"
 
-        lines.append(f" {phase_color}{phase_sym} {phase.name} [{done}/{total}]{RESET}{dep_str}")
+        task_lines.append(f" {phase_color}{phase_sym} {phase.name} [{done}/{total}]{RESET}{dep_str}")
+        if running > 0:
+            active_line_indices.append(len(task_lines) - 1)
 
-        # Task list (compact)
         for task in phase.tasks:
             effective_status = task.status
             if task.id in running_ids:
@@ -404,14 +429,50 @@ def render_dependency_graph(phases: list[Phase], phase_deps: dict[str, list[str]
             sym = STATUS_SYMBOLS[effective_status]
             p_marker = " [P]" if task.parallel else "    "
             desc = task.description[:width - 20]
-            lines.append(f"   {color}{sym}{RESET}{p_marker} {DIM}{task.id}{RESET} {desc}")
+            task_lines.append(f"   {color}{sym}{RESET}{p_marker} {DIM}{task.id}{RESET} {desc}")
+            if effective_status == TaskStatus.RUNNING:
+                active_line_indices.append(len(task_lines) - 1)
 
-        # Draw connector to next phase
         if i < len(phases) - 1:
-            lines.append(f"   {DIM}│{RESET}")
+            task_lines.append(f"   {DIM}│{RESET}")
 
-    lines.append(f"{BOLD}{'─' * width}{RESET}")
-    return lines
+    # ── Apply height cap with scrolling ──────────────────────────────────
+    footer = [f"{BOLD}{'─' * width}{RESET}"]
+    total_fixed = len(header) + len(footer)
+
+    if max_height <= 0 or total_fixed + len(task_lines) <= max_height:
+        return header + task_lines + footer
+
+    available = max_height - total_fixed - 1  # -1 for the "... N more" indicator
+    if available < 3:
+        available = 3
+
+    # Scroll to keep active tasks visible: center the first active line
+    if active_line_indices:
+        center_line = active_line_indices[0]
+        scroll_start = max(0, center_line - available // 3)
+    else:
+        # No active tasks — show the end (most recently completed)
+        scroll_start = max(0, len(task_lines) - available)
+
+    scroll_end = min(scroll_start + available, len(task_lines))
+    # Adjust start if we hit the bottom
+    if scroll_end == len(task_lines):
+        scroll_start = max(0, scroll_end - available)
+
+    visible_lines = task_lines[scroll_start:scroll_end]
+    hidden = len(task_lines) - len(visible_lines)
+    if hidden > 0:
+        above = scroll_start
+        below = len(task_lines) - scroll_end
+        scroll_hint_parts = []
+        if above > 0:
+            scroll_hint_parts.append(f"↑{above} above")
+        if below > 0:
+            scroll_hint_parts.append(f"↓{below} below")
+        visible_lines.append(f" {DIM}… {', '.join(scroll_hint_parts)}{RESET}")
+
+    return header + visible_lines + footer
 
 
 # ── TUI renderer ──────────────────────────────────────────────────────
@@ -419,9 +480,10 @@ def render_dependency_graph(phases: list[Phase], phase_deps: dict[str, list[str]
 class TUI:
     """Terminal UI with top graph pane and bottom agent output panes."""
 
-    def __init__(self, phases: list[Phase], phase_deps: dict[str, list[str]]):
+    def __init__(self, phases: list[Phase], phase_deps: dict[str, list[str]], layout: str = "vertical"):
         self.phases = phases
         self.phase_deps = phase_deps
+        self.layout = layout
         self.agents: list[AgentSlot] = []
         self.lock = threading.Lock()
         self._stop = threading.Event()
@@ -463,99 +525,104 @@ class TUI:
         # Clear screen and move cursor to top
         output = "\033[2J\033[H"
 
-        # Top section: dependency graph
-        graph_lines = render_dependency_graph(self.phases, self.phase_deps, agents, cols)
+        # Budget: give graph ~40% of terminal height, agents get the rest
+        graph_budget = max(rows * 2 // 5, 8)
+        graph_lines = render_dependency_graph(
+            self.phases, self.phase_deps, agents, cols, max_height=graph_budget
+        )
         graph_height = len(graph_lines)
 
         for line in graph_lines:
             output += line + "\n"
 
-        # Bottom section: agent output panes in a grid layout
+        # Bottom section: agent output panes
         if not agents:
             output += f"\n {DIM}No agents running. Waiting for ready tasks...{RESET}\n"
         else:
             remaining_rows = max(rows - graph_height - 2, 8)
             num_agents = len(agents)
 
-            # Determine grid dimensions (cols x rows of panes)
-            # Heuristic: try to keep panes roughly square-ish in character space
-            # (terminals are ~2:1 char aspect ratio, so cols >> rows)
-            if num_agents <= 2:
-                grid_cols = num_agents
-                grid_rows = 1
-            elif num_agents <= 4:
-                grid_cols = 2
-                grid_rows = math.ceil(num_agents / 2)
-            elif num_agents <= 6:
-                grid_cols = 3
-                grid_rows = math.ceil(num_agents / 3)
-            elif num_agents <= 9:
-                grid_cols = 3
-                grid_rows = math.ceil(num_agents / 3)
+            if self.layout == "vertical":
+                # ── Vertical (stacked) layout ────────────────────────────
+                pane_width = cols
+                hsep_height = 1
+                usable_height = remaining_rows - (num_agents - 1) * hsep_height
+                pane_height = max(usable_height // num_agents, 4)
+
+                for idx, agent in enumerate(agents):
+                    pane_lines = self._build_pane(agent, pane_width, pane_height)
+                    for pl in pane_lines:
+                        output += pl + "\n"
+                    if idx < num_agents - 1:
+                        output += f"{DIM}{'─' * pane_width}{RESET}\n"
             else:
-                grid_cols = 4
-                grid_rows = math.ceil(num_agents / 4)
+                # ── Grid layout ──────────────────────────────────────────
+                if num_agents <= 2:
+                    grid_cols = num_agents
+                elif num_agents <= 4:
+                    grid_cols = 2
+                elif num_agents <= 9:
+                    grid_cols = 3
+                else:
+                    grid_cols = 4
+                grid_rows = math.ceil(num_agents / grid_cols)
 
-            # Pane dimensions
-            vsep_width = 1   # │ between columns
-            hsep_height = 1  # ─ between rows
-            usable_width = cols - (grid_cols - 1) * vsep_width
-            pane_width = max(usable_width // grid_cols, 20)
-            usable_height = remaining_rows - (grid_rows - 1) * hsep_height
-            pane_height = max(usable_height // grid_rows, 5)
+                vsep_width = 1
+                hsep_height = 1
+                usable_width = cols - (grid_cols - 1) * vsep_width
+                pane_width = max(usable_width // grid_cols, 20)
+                usable_height = remaining_rows - (grid_rows - 1) * hsep_height
+                pane_height = max(usable_height // grid_rows, 5)
 
-            # Build pane content for each agent
-            def build_pane(agent: AgentSlot) -> list[str]:
-                pane_lines = []
-                elapsed = int(time.time() - agent.start_time) if agent.start_time else 0
-                header = f"Agent {agent.agent_id}: {agent.task.id} ({agent.status}, {elapsed}s)"
-                pane_lines.append(f"{BOLD}{header[:pane_width]}{RESET}")
-                pane_lines.append("─" * pane_width)
+                pane_contents = [self._build_pane(a, pane_width, pane_height) for a in agents]
 
-                tail = agent.output_lines[-(pane_height - 3):]
-                for oline in tail:
-                    visible = re.sub(r'\033\[[0-9;]*m', '', oline)
-                    if len(visible) > pane_width:
-                        pane_lines.append(oline[:pane_width + (len(oline) - len(visible))])
-                    else:
-                        pad = pane_width - len(visible)
-                        pane_lines.append(oline + " " * pad)
+                for gr in range(grid_rows):
+                    start_idx = gr * grid_cols
+                    end_idx = min(start_idx + grid_cols, num_agents)
+                    row_panes = pane_contents[start_idx:end_idx]
 
-                while len(pane_lines) < pane_height:
-                    pane_lines.append(" " * pane_width)
-                return pane_lines[:pane_height]
+                    while len(row_panes) < grid_cols:
+                        row_panes.append([" " * pane_width] * pane_height)
 
-            pane_contents = [build_pane(a) for a in agents]
+                    for line_idx in range(pane_height):
+                        row_parts = []
+                        for pane in row_panes:
+                            if line_idx < len(pane):
+                                row_parts.append(pane[line_idx])
+                            else:
+                                row_parts.append(" " * pane_width)
+                        output += f"{DIM}│{RESET}".join(row_parts) + "\n"
 
-            # Arrange into grid rows, render each grid row
-            for gr in range(grid_rows):
-                start_idx = gr * grid_cols
-                end_idx = min(start_idx + grid_cols, num_agents)
-                row_panes = pane_contents[start_idx:end_idx]
-
-                # Pad row to grid_cols with empty panes (for incomplete last row)
-                while len(row_panes) < grid_cols:
-                    row_panes.append([" " * pane_width] * pane_height)
-
-                # Render this grid row: panes side by side
-                for line_idx in range(pane_height):
-                    row_parts = []
-                    for pane in row_panes:
-                        if line_idx < len(pane):
-                            row_parts.append(pane[line_idx])
-                        else:
-                            row_parts.append(" " * pane_width)
-                    output += f"{DIM}│{RESET}".join(row_parts) + "\n"
-
-                # Horizontal separator between grid rows
-                if gr < grid_rows - 1:
-                    sep_line = f"{DIM}┼{RESET}".join(
-                        [f"{DIM}{'─' * pane_width}{RESET}"] * grid_cols
-                    )
-                    output += sep_line + "\n"
+                    if gr < grid_rows - 1:
+                        sep_line = f"{DIM}┼{RESET}".join(
+                            [f"{DIM}{'─' * pane_width}{RESET}"] * grid_cols
+                        )
+                        output += sep_line + "\n"
 
         sys.stdout.write(output)
         sys.stdout.flush()
+
+    @staticmethod
+    def _build_pane(agent: AgentSlot, pane_width: int, pane_height: int) -> list[str]:
+        """Build rendered lines for a single agent pane."""
+        pane_lines = []
+        elapsed = int(time.time() - agent.start_time) if agent.start_time else 0
+        header = f"Agent {agent.agent_id}: {agent.task.id} ({agent.status}, {elapsed}s)"
+        pane_lines.append(f"{BOLD}{header[:pane_width]}{RESET}")
+        pane_lines.append("─" * pane_width)
+
+        tail = agent.output_lines[-(pane_height - 3):]
+        for oline in tail:
+            visible = re.sub(r'\033\[[0-9;]*m', '', oline)
+            if len(visible) > pane_width:
+                pane_lines.append(oline[:pane_width + (len(oline) - len(visible))])
+            else:
+                pad = pane_width - len(visible)
+                pane_lines.append(oline + " " * pad)
+
+        while len(pane_lines) < pane_height:
+            pane_lines.append(" " * pane_width)
+        return pane_lines[:pane_height]
 
 
 # ── Headless logger ───────────────────────────────────────────────────
@@ -913,11 +980,12 @@ def check_rate_limited(stderr_path: Path) -> bool:
 # ── Main orchestrator ─────────────────────────────────────────────────
 
 class Runner:
-    def __init__(self, spec_dirs: list[str], max_runs: int, headless: bool, max_parallel: int):
+    def __init__(self, spec_dirs: list[str], max_runs: int, headless: bool, max_parallel: int, layout: str = "vertical"):
         self.spec_dirs = spec_dirs
         self.max_runs = max_runs
         self.headless = headless
         self.max_parallel = max_parallel
+        self.layout = layout
         self.script_dir = Path(__file__).parent
         self.skills_dir = self.script_dir.parent
         self.blocked_file = Path("BLOCKED.md")
@@ -1024,7 +1092,7 @@ class Runner:
 
         # Setup TUI for this feature
         if not self.headless:
-            self.tui = TUI(phases, phase_deps)
+            self.tui = TUI(phases, phase_deps, layout=self.layout)
             self.tui.start()
 
         self.log(f"=== Feature: {Path(spec_dir).name} ===")
@@ -1268,6 +1336,8 @@ def main():
                         help="No terminal UI; write all output to log files")
     parser.add_argument("--max-parallel", type=int, default=3,
                         help="Max concurrent agents (default: 3)")
+    parser.add_argument("--layout", choices=["vertical", "grid"], default="vertical",
+                        help="Agent pane layout: vertical (stacked, default) or grid (side-by-side)")
 
     args = parser.parse_args()
 
@@ -1288,6 +1358,7 @@ def main():
         max_runs=args.max_runs,
         headless=args.headless,
         max_parallel=args.max_parallel,
+        layout=args.layout,
     )
     runner.run()
 

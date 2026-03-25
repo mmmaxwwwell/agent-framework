@@ -14,6 +14,7 @@
 # Options:
 #   --headless       No terminal UI; write all output to log files
 #   --max-parallel N Max concurrent agents (default: 3)
+#   --layout MODE    Agent pane layout: vertical (stacked, default) or grid
 #
 # Examples:
 #   ./run-tasks.sh                                          # TUI mode, all features
