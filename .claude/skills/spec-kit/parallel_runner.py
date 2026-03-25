@@ -896,8 +896,15 @@ def build_prompt(task_file: str, spec_dir: str, learnings_file: str,
 
     manifest = "\n".join(manifest_lines)
 
-    prompt = f"""You are an implementation agent for a spec-kit project. Your job is to execute exactly ONE task from the task list, then stop.
+    # Detect nix environment
+    nix_note = ""
+    if (Path.cwd() / "flake.nix").exists():
+        nix_note = """
+**Environment**: This project uses Nix (`flake.nix`). You are running inside `nix develop`, which provides all native dependencies (numpy, node, compilers, etc.). Do NOT work around missing native deps with lazy imports or try/except — they are available. If a native dep is genuinely missing, it's a flake.nix issue, not a code issue.
+"""
 
+    prompt = f"""You are an implementation agent for a spec-kit project. Your job is to execute exactly ONE task from the task list, then stop.
+{nix_note}
 ## Your assigned task
 
 You are assigned task **{task.id}**: {task.description}
@@ -1241,8 +1248,15 @@ def build_validation_prompt(spec_dir: str, task_file: str, phase: Phase,
     existing_attempts = sorted(vdir.glob("*.md")) if vdir.exists() else []
     attempt_num = len(existing_attempts) + 1
 
-    return f"""You are a phase-validation agent. Your ONLY job is to run the project's build and test commands after all tasks in a phase have completed, then report the result.
+    # Detect nix environment
+    nix_note = ""
+    if (Path.cwd() / "flake.nix").exists():
+        nix_note = """
+**Environment**: You are running inside `nix develop`. All native dependencies declared in `flake.nix` are available. If tests fail due to missing native libraries (e.g. `libstdc++.so.6`, shared objects), that is a `flake.nix` issue — report it as an environment problem, not a code bug. Do NOT create fix tasks for environment-only failures.
+"""
 
+    return f"""You are a phase-validation agent. Your ONLY job is to run the project's build and test commands after all tasks in a phase have completed, then report the result.
+{nix_note}
 ## Context
 
 - **Phase**: {phase.name} ({phase_slug})
