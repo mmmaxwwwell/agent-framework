@@ -1,6 +1,6 @@
 # Preset: Single-User Local Tooling
 
-**Goal**: Build reliable local-only software for one user. No network exposure, no auth, but solid enough for daily use.
+**Goal**: Enterprise-grade engineering for software that runs locally. Same rigor as production multi-user systems — comprehensive tests, full CI/CD, structured logging, thorough documentation — but scoped to a single-user, non-networked context. No auth, no CORS, no security headers, no rate limiting.
 
 ## Interview phase overrides
 
@@ -9,18 +9,17 @@
 - CORS policy (not applicable — no web server, or localhost-only)
 - Rate limiting & backpressure (not applicable)
 - Security headers (not applicable — no HTTP server, or localhost-only)
-- Security scanning tiers beyond Tier 1 (skip Tier 2/3 — Tier 1 is included via CI/CD)
+- Security scanning tiers beyond Tier 1 (skip Tier 2/3 — Tier 1 + Tier 1.5 for public repos included via CI/CD)
 - API versioning (none — single consumer)
-- Graceful shutdown (skip for CLIs; include for long-running daemons only if applicable)
-- Health checks (skip for CLIs; `--check` flag for daemons)
-- Observability (skip metrics/tracing — logging is sufficient)
-- Process architecture & statefulness (single process, local state is fine)
+- Observability infrastructure (skip metrics/tracing — structured logging is sufficient for local tools)
 
 **Default without asking** (use these unless the user volunteers a preference):
-- Logging: language-default structured logger at INFO level, stderr output. No correlation IDs.
-- Error handling: simple error hierarchy (AppError → ValidationError, NotFoundError, InternalError). No HTTP status mapping.
-- Configuration: single config file + env var overrides. No secret management (no secrets in a local tool).
-- Migration: auto-create schema on first run if using a database. Simple version check + auto-migrate.
+- Logging: structured JSON logger at INFO level, stderr output. Include correlation IDs if the tool has multi-step operations or pipelines.
+- Error handling: full error hierarchy with clear user-facing messages. No HTTP status mapping, but every error type should have an exit code and a human-readable explanation.
+- Configuration: single config module with env var overrides, fail-fast validation on startup. No secret management (no secrets in a local tool).
+- Migration: structured migrations with a library if using a database. Auto-migrate on startup with version check.
+- Graceful shutdown: include for any long-running process (daemons, watch-mode tools, dev servers). Skip only for pure run-and-exit CLIs. When included, clean up temp files, flush logs, release file locks, close database connections.
+- Health checks: `--check` flag for daemons and long-running tools. Skip for pure CLIs.
 - CI/CD: GitHub Actions pipeline with lint, build, test (unit + integration), and Tier 1 security scanning (Trivy, Semgrep, Gitleaks, ecosystem audit). Add Snyk + SonarCloud if the repo is public. No deployment stage.
 - Branching: direct-to-main — no feature branches, no PRs. Solo developer workflow.
 - DX tooling: first-class. Full script inventory (`dev`, `test`, `test:unit`, `test:integration`, `lint`, `lint:fix`, `typecheck`, `build`, `clean`, `clean:all`, `check`, plus `db:*` and `codegen` if applicable). `.env.example`. VS Code `launch.json` with debugger configs. Environment isolation via Nix flake (if `nix` is available — `flake.nix`, `.envrc` with `use flake`, `.direnv/` gitignored); otherwise devcontainer. CLAUDE.md development section. Skip HTTPS dev certs and proxy config unless the project has separate frontend/backend.
@@ -31,36 +30,37 @@
 - Persistence strategy (SQLite, filesystem, in-memory)
 - CLI UX (flags, subcommands, interactive prompts, output formatting)
 - Platform compatibility (Linux only? macOS? Windows?)
+- Process architecture (single process? spawns child processes? watch mode? daemon?)
 
 **Interview style**: 5-10 questions. Focus on UX, data integrity, and workflows. Propose sensible defaults and confirm.
 
 ## Spec phase overrides
 
-- **FR/SC numbering**: use it — local tools benefit from clear requirements
-- **Enterprise Infrastructure section**: minimal — only document logging and error handling decisions
-- **Edge Cases & Failure Modes**: include for data loss, corrupt state, concurrent access (if the tool uses file locks or a database). Skip network/auth/rate-limit categories.
-- **Testing section**: unit tests for core logic, integration tests for data persistence and CLI behavior. Skip contract/e2e test requirements. Security scanning is handled by CI (Tier 1 tools), not custom security tests.
+- **FR/SC numbering**: required
+- **Enterprise Infrastructure section**: include for: logging, error handling, config, graceful shutdown (if applicable), CI/CD. Skip: auth, CORS, security headers, rate limiting, observability infrastructure.
+- **Edge Cases & Failure Modes**: full coverage for: data loss, corrupt state, concurrent access, file system errors, invalid input, resource exhaustion (disk full, OOM), interrupted operations (Ctrl-C mid-write). Skip network/auth/rate-limit categories.
+- **Testing section**: full — unit tests for core logic, integration tests for data persistence and CLI behavior, edge case tests for failure modes. Security scanning is handled by CI (Tier 1 tools), not custom security tests. Skip contract/e2e unless the tool has an IPC/plugin API or a UI.
 - **UI_FLOW.md**: include if the project has a UI (desktop app, TUI with multiple screens). Skip for pure CLIs with no interactive UI.
 
 ## Plan phase overrides
 
-- **Phase 1 Test Infrastructure**: lightweight — use the test runner's built-in reporter. Skip custom structured reporter and test-logs/ directory unless the project is complex enough to warrant it.
-- **Phase 2 Foundational**: include error hierarchy, config module, CI/CD pipeline (lint + test + Tier 1 security scan), and Gitleaks pre-commit hook. Skip graceful shutdown, health checks.
-- **research.md**: include but keep brief — document key technology choices only
-- **data-model.md**: include — local tools need clear schemas, especially for SQLite/filesystem state
-- **API contract depth**: skip unless the tool has an IPC/plugin API
-- **Complexity Tracking**: include (local tools should stay simple)
-- **Phase Dependencies**: include if >3 phases, otherwise skip
+- **Phase 1 Test Infrastructure**: full — custom structured reporter and test-logs/ directory. The fix-validate loop needs structured output to diagnose failures efficiently, regardless of whether the tool is local or networked.
+- **Phase 2 Foundational**: include error hierarchy, config module, structured logging, CI/CD pipeline (lint + test + Tier 1 security scan), Gitleaks pre-commit hook. Include graceful shutdown for long-running tools. Skip health checks (unless daemon), skip observability infrastructure.
+- **research.md**: full depth — document every decision with rationale and rejected alternatives, same as enterprise. Local tools make just as many architecture decisions; cutting corners here means implementing agents guess.
+- **data-model.md**: full depth — ERDs, field tables, state transitions, cross-entity constraints. Local tools often have complex local state (SQLite, filesystem hierarchies) that's harder to debug than a networked database.
+- **API contract depth**: skip unless the tool has an IPC/plugin API or CLI subcommand interface complex enough to warrant formal contracts
+- **Complexity Tracking**: required — local tools should stay simple; track every abstraction
+- **Phase Dependencies**: required — with dependency graph and parallelization strategy
 
 ## Task phase overrides
 
-- **Fix-validate loop**: use it — local tools benefit from solid tests
-- **`[P]` parallel markers**: include if applicable
-- **FR/Story traceability**: include
-- **learnings.md**: include
-- **Code review**: include — auto-implement necessary fixes, write REVIEW-TODO.md, run fix-validate loop after
-- **Approach note**: `Approach: TDD for core logic. Fix-validate loop per phase. Full CI/CD with Tier 1 security scanning. No auth, no network hardening — local single-user tool.`
+- **Fix-validate loop**: required — per phase, runner-enforced
+- **`[P]` parallel markers**: include where applicable
+- **FR/Story traceability**: required on every task
+- **learnings.md**: required
+- **Code review**: full — auto-implement necessary fixes, write REVIEW-TODO.md, run fix-validate loop after
+- **Approach note**: `Approach: TDD with fix-validate loop per phase. Full CI/CD with Tier 1 security scanning. Enterprise-grade test infrastructure, structured logging, comprehensive error handling. No auth, no network hardening — local single-user tool.`
 
 ## What the agent should still know
 
-The full SKILL.md is loaded. If the user later says "actually this needs to be a web service" or "I want to add multi-user support", the agent can reference the enterprise sections and guide the transition. For now, optimize for a robust local tool with good tests and clear error messages.
+The full SKILL.md is loaded. If the user later says "actually this needs to be a web service" or "I want to add multi-user support", the agent can reference the enterprise/public sections and guide the transition. The principle: **local doesn't mean low quality — it means scoped. The engineering rigor is the same; only the scope of concerns is narrower.**

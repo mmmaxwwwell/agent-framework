@@ -56,7 +56,7 @@ Before doing anything else, determine the project's quality preset. This control
 | Preset | Use when | Questions | Infrastructure |
 |--------|----------|-----------|---------------|
 | **poc** | Throwaway prototype, speed over everything | 3-5 | None — console.log, hardcoded config, no auth/tests/CI |
-| **local** | Single-user local tool (CLI, desktop, dev tooling) | 5-10 | Light — error handling, config, basic tests |
+| **local** | Single-user local tool (CLI, desktop, dev tooling) | 5-10 | Enterprise-grade — full test infra, CI/CD, structured logging, comprehensive errors. Scoped: no auth/CORS/rate-limiting/observability. |
 | **public** | Single-user but internet-exposed | 8-12 | Medium — security headers, input validation, rate limiting, CI |
 | **enterprise** | Multi-user, production, team-maintained | Exhaustive | Full — everything in the reference files |
 
