@@ -140,31 +140,51 @@ For each phase, the user has two options:
 
 ## Autonomous implementation with run-tasks.sh
 
-Once `tasks.md` exists, the user can run implementation autonomously using the task runner script bundled with this skill at `.claude/skills/spec-kit/run-tasks.sh`.
+Once `tasks.md` exists, the user can run implementation autonomously using the task runner bundled with this skill at `.claude/skills/spec-kit/run-tasks.sh`. The runner is a Python script (`parallel_runner.py`) that parses the task list, respects `[P]` parallel markers and phase dependency graphs, and spawns multiple claude agents concurrently where safe.
 
 **How to launch it:** Determine the absolute path to `run-tasks.sh` within this skill's directory (it lives alongside this `SKILL.md`). Then run it from the target project root:
 
 ```bash
 cd <project-root>
-/path/to/agent-framework/.claude/skills/spec-kit/run-tasks.sh                          # auto-detect
-/path/to/agent-framework/.claude/skills/spec-kit/run-tasks.sh specs/001-my-feature     # specific spec
-/path/to/agent-framework/.claude/skills/spec-kit/run-tasks.sh specs/001-my-feature 50  # max 50 runs
+
+# TUI mode (default) — live dependency graph + split agent output panes
+python3 /path/to/agent-framework/.claude/skills/spec-kit/parallel_runner.py                                  # all features
+python3 /path/to/agent-framework/.claude/skills/spec-kit/parallel_runner.py specs/001-my-feature              # specific spec
+python3 /path/to/agent-framework/.claude/skills/spec-kit/parallel_runner.py specs/001-my-feature 50           # max 50 runs
+python3 /path/to/agent-framework/.claude/skills/spec-kit/parallel_runner.py --max-parallel 5 specs/001        # 5 agents
+
+# Headless mode — no stdin/stdout, all output to log files
+python3 /path/to/agent-framework/.claude/skills/spec-kit/parallel_runner.py --headless                        # all features
+python3 /path/to/agent-framework/.claude/skills/spec-kit/parallel_runner.py --headless --max-parallel 5       # 5 agents
+
+# Or via the bash wrapper (validates python version, then exec's the above):
+/path/to/agent-framework/.claude/skills/spec-kit/run-tasks.sh [same args]
 ```
 
-The script must be run from the project root (where `.specify/` and `specs/` live). Run it in tmux/screen so it survives terminal disconnects.
+The script requires **Python 3.9+** (stdlib only, no pip dependencies) and the `claude` CLI. Must be run from the project root (where `.specify/` and `specs/` live). Run it in tmux/screen so it survives terminal disconnects.
+
+### Two modes
+
+**TUI mode** (default) — the terminal is split into two sections:
+- **Top**: ASCII dependency graph showing all phases, tasks, their status (○ pending, ◉ running, ● complete, ⊘ skipped, ⊗ blocked, ✗ failed), `[P]` markers, and phase dependency arrows
+- **Bottom**: horizontally split panes showing live output from each running agent (e.g. 2 agents = 3 sections: graph + 2 output panes separated by vertical bars)
+
+**Headless mode** (`--headless`) — no terminal I/O at all. Everything is written to `logs/parallel-<timestamp>/`:
+- `runner.log` — main orchestrator log
+- `agent-<N>-<task-id>.jsonl` — raw stream-json output per agent
+- `agent-<N>-<task-id>.stderr` — stderr per agent
+- `status.txt` — periodically updated snapshot of all phases/tasks/agents
 
 ### How it works
 
-Each iteration spawns a fresh `claude` process (full context budget, no degradation across tasks):
+The runner parses `tasks.md` for phases, `[P]` markers, and the Phase Dependencies section. It builds a dependency graph and continuously schedules ready tasks:
 
-1. Reads the task list and learnings, then consults a manifest of available reference files and loads only the ones relevant to the current task
-2. Finds the first unchecked task whose phase/dependency prerequisites are all complete
-3. Executes that ONE task, following TDD (test tasks fail before implementation)
-4. At phase boundaries, runs the project's build/test commands — if validation fails, writes failure state to `specs/<feature>/validate/<phase>/` and appends a phase-fix task to `tasks.md` (see "fix-validate loop" below)
-5. Self-reviews the diff for debug code, security issues, and pattern consistency
-6. Records discoveries and decisions in `learnings.md` (persists across runs)
-7. Marks the task `- [x]` and commits with the task ID (e.g., `feat(T008): implement HTTP server`)
-8. Loop repeats until all tasks are done, `BLOCKED.md` is written, or the run limit is hit
+1. **Parallel scheduling**: Tasks marked `[P]` within a phase run concurrently (up to `--max-parallel`, default 3). Sequential tasks (no `[P]`) block subsequent tasks in the same phase. Phase boundaries respect the dependency graph.
+2. Each agent gets a fresh `claude` process with a prompt targeting its specific task (full context budget, no degradation)
+3. The agent reads the task list, learnings, and only the reference files relevant to its task
+4. Executes ONE task, following TDD and the fix-validate loop
+5. Self-reviews, records learnings, marks complete, commits
+6. The runner re-parses `tasks.md` after each agent finishes to pick up changes and schedule the next wave
 
 **Fix-validate loop** — validation runs at phase boundaries, not per-task. When the last task in a phase completes, the agent runs the project's test suite. If it fails, the agent writes structured failure state to `validate/<phase>/<N>.md` and appends a phase-fix task (`phase3-fix1`, `phase3-fix2`, ...) to the task list. The next runner iteration picks up the fix task with fresh context and the full failure history on disk. After 10 failed fixes, the agent writes `BLOCKED.md` and the runner stops.
 
@@ -174,9 +194,9 @@ Each iteration spawns a fresh `claude` process (full context budget, no degradat
 
 **BLOCKED.md and auto-unblocking** — if the agent hits a blocker, it MUST NOT immediately write `BLOCKED.md`. Instead, it must first evaluate whether it can resolve the blocker autonomously. See "Auto-Unblocking" below for the full decision process. Only write `BLOCKED.md` for genuinely human-dependent blockers. When `BLOCKED.md` is written, the script stops. Edit the file with your answer, delete it, re-run.
 
-**Rate limits** — detected from claude CLI streaming output. The script sleeps until the reset time, then resumes automatically.
+**Rate limits** — detected from agent stderr. The runner waits 60s then retries the task.
 
-**No-op detection** — stops after 5 consecutive runs with no task progress (agent is stuck).
+**No-op detection** — stops after 5 consecutive scheduling cycles with no progress (all agents stuck).
 
 ### When to suggest it
 
@@ -213,6 +233,24 @@ Tests MUST exercise the real system wherever possible. The hierarchy of preferen
 2. **Real processes** — if the feature spawns child processes, test with real child processes. If it reads files, use real temp directories with real files.
 3. **Mock only what requires human interaction** — biometric prompts, hardware tokens, manual UI actions. Everything else should be real.
 4. **Never mock internal boundaries** — don't mock the database, don't mock service-to-service calls within the same process. Integration tests exist precisely to catch the bugs that unit tests with mocks miss.
+
+### External process boundary testing
+
+When the system spawns external processes (CLI tools, agents, workers, scripts), integration tests MUST verify the **actual process interface** — not just that the command was constructed correctly, and not just that the internal wiring passes data around. The test must prove that:
+
+1. **The spawned process actually starts and runs** — use a lightweight stub binary/script that accepts the same flags and protocols as the real tool (e.g., a shell script that accepts `--input-format stream-json --output-format stream-json` and echoes back structured responses). This catches flag mismatches, missing arguments, and incorrect stdin/stdout formats that unit tests on the command builder will never find.
+2. **Stdin/stdout protocols are exercised end-to-end** — if the system writes JSON to a process's stdin and reads JSON from its stdout, the integration test must send real messages through the real pipe and verify real responses come back. Testing that "stdin.write was called" is a unit test; testing that "the process received the message and responded correctly" is an integration test.
+3. **The contract between builder and consumer is verified** — if one module builds the command args and another module reads the process output, the integration test must connect them through an actual process spawn. This catches the class of bug where both sides are internally correct but incompatible with each other (e.g., building `--output-format stream-json` args but writing raw text to stdin instead of stream-json format).
+
+**Why this matters**: Unit tests on command builders verify that arguments are constructed correctly in isolation. Unit tests on output parsers verify that output is parsed correctly in isolation. But neither catches the case where the command is constructed with flags the actual external tool doesn't support, or where the stdin format doesn't match what the tool expects. This is the "both sides green, system broken" failure mode — the most dangerous kind of bug because it passes all existing tests while being completely broken in production.
+
+**Stub process pattern**: Create a minimal test harness script (e.g., `tests/fixtures/mock-claude.sh`) that accepts the same CLI flags as the real tool and implements just enough of the protocol to validate the interface. The stub should:
+- Parse and validate the flags it receives (reject unknown flags)
+- Accept input in the expected format (stream-json, text, etc.)
+- Produce output in the expected format
+- Exit with appropriate codes
+
+This is NOT the same as mocking — the stub runs as a real child process with real pipes, exercising the full spawn → stdin → stdout → exit lifecycle.
 
 ### Structured test output for agent-readable failure logs
 
@@ -271,7 +309,9 @@ When writing a feature spec (Phase 2), inject these requirements:
   - Custom test reporter producing structured output
   - Test fixtures (template data files, test keypairs, test servers)
   - Test helpers (real protocol servers, mock-only-what-needs-human-interaction)
+  - Stub processes for every external CLI tool the system spawns (see "External process boundary testing")
 - **For each user story**, an "Independent Test" field describing how to verify the story works end-to-end without human interaction
+- **For each external process interface** (CLI tools spawned as child processes), a functional requirement that integration tests exercise the spawn → stdin → stdout → exit lifecycle through a stub process, not just unit tests on the command builder
 
 ### What the plan MUST include
 
