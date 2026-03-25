@@ -1123,8 +1123,9 @@ Run the build/test commands. Capture all output.
 
 **Code coverage is mandatory.** The test command MUST collect coverage (e.g. `c8` for Node native runner, `--coverage` for Jest/Vitest, `--cov` for pytest). If the project's test command does not include coverage flags, fix the test script in `package.json`/`CLAUDE.md`/equivalent to add them before running. Coverage output must appear in the terminal so it's visible in logs.
 
-**Fix missing tools before reporting failure.** If a build/test command fails because a tool is not installed (e.g. `eslint: command not found`, `tsc: not found`, missing npm packages), fix it:
-- Missing npm devDependency → `npm install --ignore-scripts` (then `npm rebuild <pkg>` only if native compilation needed)
+**Fix missing tools before reporting failure.** If a build/test command fails because a tool is not installed (e.g. `eslint: command not found`, `tsc: not found`, missing npm packages), YOU MUST install it — do not skip it or call it a "pre-existing issue":
+- Missing npm package (referenced in scripts but not in devDependencies) → `npm install --save-dev <package> --ignore-scripts` to add it, then `npm rebuild <pkg>` only if native compilation needed
+- Already in devDependencies but not installed → `npm install --ignore-scripts`
 - Missing Python package → `uv add --dev <pkg>` or `uv sync --dev`
 - Missing system tool (not an npm/pip package) → add it to `flake.nix` devShell and commit the change. The runner detects flake.nix modifications and automatically restarts inside the updated `nix develop` shell.
 - Then re-run the command. Only report a failure if the command fails AFTER dependencies are installed.
