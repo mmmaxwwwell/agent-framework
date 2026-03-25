@@ -1125,7 +1125,7 @@ Run the build/test commands. Capture all output.
 **Fix missing tools before reporting failure.** If a build/test command fails because a tool is not installed (e.g. `eslint: command not found`, `tsc: not found`, missing npm packages), fix it:
 - Missing npm devDependency → `npm install --ignore-scripts` (then `npm rebuild <pkg>` only if native compilation needed)
 - Missing Python package → `uv add --dev <pkg>` or `uv sync --dev`
-- Missing system tool → add to `flake.nix` devShell
+- Missing system tool (not an npm/pip package) → add it to `flake.nix` devShell, commit the change, then write a FAIL record noting the flake.nix was updated and the runner must be restarted inside the new `nix develop` shell to pick up the change
 - Then re-run the command. Only report a failure if the command fails AFTER dependencies are installed.
 
 **Important**: For early phases, the build/test infrastructure may not exist yet or may only cover a subset. Run what's available. If literally nothing can be validated yet, note this and pass.
