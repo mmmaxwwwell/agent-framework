@@ -44,24 +44,32 @@ The runner parses `tasks.md` for phases, `[P]` markers, and the Phase Dependenci
 1. **Parallel scheduling**: Tasks marked `[P]` within a phase run concurrently (up to `--max-parallel`, default 3). Sequential tasks (no `[P]`) block subsequent tasks in the same phase. Phase boundaries respect the dependency graph.
 2. Each agent gets a fresh `claude` process with a prompt targeting its specific task (full context budget, no degradation)
 3. The agent reads the task list, learnings, and only the reference files relevant to its task
-4. Executes ONE task, following TDD and the fix-validate loop
+4. Executes ONE task, following TDD
 5. Self-reviews, records learnings, marks complete, commits
 6. The runner re-parses `tasks.md` after each agent finishes to pick up changes and schedule the next wave
+7. **When all tasks in a phase are complete**, the runner automatically spawns a dedicated **validation agent** (see below)
 
 ### Fix-validate loop
 
-Validation runs at **phase boundaries**, not per-task. It's a **disk-based state machine** driven by the task runner:
+Validation runs at **phase boundaries**, not per-task. It is **enforced by the runner**, not by implementation agents — this ensures validation always happens and can't be skipped.
+
+**How it works:**
 
 1. Agents implement tasks T007, T008, T009 (all in Phase 3). Each agent marks its task done and commits.
-2. The agent completing the **last task in Phase 3** runs the project's test suite.
-3. Validation fails → agent writes failure state to `specs/<feature>/validate/phase3/1.md` (command, exit code, structured test output from `test-logs/`, list of tasks completed in this phase)
-4. Agent appends `- [ ] phase3-fix1 Fix phase validation failure: read validate/phase3/ for failure history` to `tasks.md` at the end of Phase 3
-5. **Next runner iteration** picks up `phase3-fix1` with fresh context — reads the full failure history from `validate/phase3/`, reads `test-logs/`, diagnoses and fixes across all files touched by the phase
-6. The fix agent re-runs validation. If it still fails → writes `validate/phase3/2.md`, appends `phase3-fix2`
-7. After 10 failed fix attempts → writes `BLOCKED.md` and the runner stops
+2. The runner detects that all Phase 3 tasks are complete and spawns a **validation agent**.
+3. The validation agent runs the project's build/test commands (from `CLAUDE.md` or the phase Checkpoint).
+4. **If validation passes** → the agent writes `specs/<feature>/validate/phase3/1.md` with `PASS`. The runner marks the phase as validated and allows downstream phases to start.
+5. **If validation fails** → the agent writes `specs/<feature>/validate/phase3/1.md` with `FAIL` (command, exit code, structured test output from `test-logs/`) and appends `- [ ] phase3-fix1 Fix phase validation failure: read validate/phase3/ for failure history` to `tasks.md`.
+6. **Next runner iteration** picks up `phase3-fix1` as a normal implementation task with fresh context — reads the full failure history from `validate/phase3/`, reads `test-logs/`, diagnoses and fixes.
+7. After the fix agent completes, the runner spawns another validation agent. If still failing → `validate/phase3/2.md`, appends `phase3-fix2`.
+8. After 10 failed fix attempts → validation agent writes `BLOCKED.md` and the runner stops.
+
+**Why a dedicated validation agent?** Implementation agents used to be responsible for running validation when they were the last task in a phase. In practice, agents skipped this step — especially with parallel tasks where no agent could reliably detect it was "last". Moving validation to a dedicated agent spawned by the runner makes it structural and un-skippable.
 
 Key properties:
+- **Runner-enforced** — validation is triggered by the scheduler, not by agent discretion
 - **Validation is per-phase, not per-task** — avoids wasting runs on intermediate states
+- **Downstream phases are blocked** until the upstream phase passes validation
 - **Each fix gets a fresh agent** with full context budget — no degradation from prior attempts
 - **Failure history accumulates on disk** in `validate/<phase>/` — nothing is lost between runs
 - **Tests are the spec** — fix the code, not the tests (unless a test is genuinely wrong)
@@ -126,7 +134,7 @@ When an agent encounters a blocker, it MUST evaluate the situation before giving
 
    | Category | Auto-resolvable? | Examples |
    |----------|-------------------|---------|
-   | **Tool/dependency installation** | YES | Emulator not installed, CLI tool missing, package not available, SDK not configured |
+   | **Tool/dependency installation** | YES | Emulator not installed, CLI tool missing, package not available, SDK not configured. **Fix by adding to `flake.nix`, never by global install.** |
    | **Environment configuration** | YES | Env var not set, config file missing, port already in use, service not running |
    | **Build/compilation failure** | YES | Missing import, type error, syntax error, incompatible dependency version |
    | **Test infrastructure setup** | YES | Test database not created, test fixtures missing, test keypairs not generated |
@@ -164,12 +172,13 @@ When an agent encounters a blocker, it MUST evaluate the situation before giving
 
 Common scenarios that agents MUST handle without writing BLOCKED.md:
 
-- **Emulator not installed**: Install and configure it (e.g., `sdkmanager`, Android emulator setup). Create the readiness script if it doesn't exist.
-- **Missing CLI tool**: If the project has a `flake.nix`, add the tool there and re-enter `nix develop`. Otherwise, install via `uv tool install`, `npm install -g`, or the system package manager.
-- **Database not running**: Start it, create the test database, run migrations.
+- **Emulator not installed**: Add it to `flake.nix` devShell and re-enter `nix develop`. Create the readiness script if it doesn't exist.
+- **Missing CLI tool**: Add the tool to `flake.nix` devShell and re-enter `nix develop`. **NEVER use `npm install -g`, `uv tool install`, `pip install`, or system package managers** — these mutate the host outside the project and are blocked by the sandbox.
+- **Database not running**: Start it using project-local scripts or `nix develop` process-compose. Create the test database, run migrations.
 - **Port conflict**: Find an available port, update the config.
 - **Missing test fixtures**: Generate them (keypairs, template files, mock data).
-- **Dependency version mismatch**: Update the lockfile, resolve the conflict.
+- **Dependency version mismatch**: Update the lockfile or `flake.nix` pins, resolve the conflict.
+- **Missing project dependency**: Add to `package.json` / `pyproject.toml` / `flake.nix` and install project-locally (`npm install`, `pip install -e .` in a venv). Never install globally.
 
 ### BLOCKED.md format
 

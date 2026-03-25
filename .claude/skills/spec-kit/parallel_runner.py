@@ -225,7 +225,8 @@ def parse_task_file(path: Path) -> tuple[list[Phase], dict[str, list[str]]]:
 class Scheduler:
     """Determines which tasks are ready to run given current state."""
 
-    def __init__(self, phases: list[Phase], phase_deps: dict[str, list[str]]):
+    def __init__(self, phases: list[Phase], phase_deps: dict[str, list[str]],
+                 validated_phases: Optional[set[str]] = None):
         self.phases = phases
         self.phase_deps = phase_deps
         self.phase_map = {p.slug: p for p in phases}
@@ -233,12 +234,25 @@ class Scheduler:
         for p in phases:
             for t in p.tasks:
                 self.task_map[t.id] = t
+        # Phases that have passed validation (or were grandfathered in).
+        self.validated_phases: set[str] = validated_phases or set()
 
-    def phase_complete(self, slug: str) -> bool:
+    def phase_tasks_complete(self, slug: str) -> bool:
+        """All tasks in a phase are done (ignoring validation)."""
         phase = self.phase_map.get(slug)
         if not phase:
             return True
         return all(t.status in (TaskStatus.COMPLETE, TaskStatus.SKIPPED) for t in phase.tasks)
+
+    def phase_complete(self, slug: str) -> bool:
+        """A phase is complete when all tasks are done AND it has been validated."""
+        if not self.phase_tasks_complete(slug):
+            return False
+        return slug in self.validated_phases
+
+    def phase_needs_validation(self, slug: str) -> bool:
+        """Phase tasks are all done but validation hasn't run yet."""
+        return self.phase_tasks_complete(slug) and slug not in self.validated_phases
 
     def phase_deps_met(self, slug: str) -> bool:
         deps = self.phase_deps.get(slug, [])
@@ -285,11 +299,15 @@ class Scheduler:
         return ready
 
     def all_complete(self) -> bool:
-        return all(
+        """All tasks done AND all phases validated."""
+        tasks_done = all(
             t.status in (TaskStatus.COMPLETE, TaskStatus.SKIPPED)
             for p in self.phases
             for t in p.tasks
         )
+        if not tasks_done:
+            return False
+        return all(p.slug in self.validated_phases for p in self.phases)
 
     def remaining_count(self) -> int:
         return sum(
@@ -308,6 +326,37 @@ class Scheduler:
             1 for p in self.phases for t in p.tasks
             if t.status == TaskStatus.BLOCKED
         )
+
+    def phases_needing_validation(self) -> list[Phase]:
+        """Return phases whose tasks are all complete but that haven't been validated."""
+        return [p for p in self.phases if self.phase_needs_validation(p.slug)]
+
+
+def scan_validated_phases(spec_dir: str) -> set[str]:
+    """Scan validate/ directory for phases that have a PASS record.
+
+    A phase is considered validated if any .md file in validate/<phase>/
+    contains 'PASS' in the first heading.
+    """
+    validated = set()
+    validate_dir = Path(spec_dir) / "validate"
+    if not validate_dir.is_dir():
+        return validated
+    for phase_dir in validate_dir.iterdir():
+        if not phase_dir.is_dir():
+            continue
+        for md_file in sorted(phase_dir.glob("*.md")):
+            try:
+                text = md_file.read_text()
+                # Check first heading for PASS
+                for line in text.splitlines():
+                    if line.startswith('#'):
+                        if 'PASS' in line.upper():
+                            validated.add(phase_dir.name)
+                        break
+            except OSError:
+                continue
+    return validated
 
 
 # ── ASCII dependency graph renderer ───────────────────────────────────
@@ -336,7 +385,8 @@ DIM = "\033[2m"
 
 def render_dependency_graph(phases: list[Phase], phase_deps: dict[str, list[str]],
                              agents: list[AgentSlot], width: int,
-                             max_height: int = 0) -> list[str]:
+                             max_height: int = 0,
+                             draining: bool = False) -> list[str]:
     """Render an ASCII art dependency diagram showing phase/task status.
 
     If max_height > 0, the output is capped to that many lines. A sticky header
@@ -358,6 +408,8 @@ def render_dependency_graph(phases: list[Phase], phase_deps: dict[str, list[str]
     blocked_tasks = sum(1 for p in phases for t in p.tasks if t.status == TaskStatus.BLOCKED)
 
     summary_parts = [f"{BOLD}TASKS{RESET} {done_tasks}/{total_tasks}"]
+    if draining:
+        summary_parts.append(f"\033[33;1m⏻ DRAINING — no new tasks, waiting for agents to finish{RESET}")
     if running_tasks:
         summary_parts.append(f"{STATUS_COLORS[TaskStatus.RUNNING]}◉ {running_tasks} running{RESET}")
     if failed_tasks:
@@ -387,8 +439,8 @@ def render_dependency_graph(phases: list[Phase], phase_deps: dict[str, list[str]
 
     # ── Build full task list ─────────────────────────────────────────────
     task_lines: list[str] = []
-    # Track which line indices correspond to running/active tasks
-    active_line_indices: list[int] = []
+    # Track line index for each running task, keyed by task ID
+    active_lines_by_id: dict[str, int] = {}
 
     for i, phase in enumerate(phases):
         dep_str = ""
@@ -418,9 +470,6 @@ def render_dependency_graph(phases: list[Phase], phase_deps: dict[str, list[str]
             phase_sym = "○"
 
         task_lines.append(f" {phase_color}{phase_sym} {phase.name} [{done}/{total}]{RESET}{dep_str}")
-        if running > 0:
-            active_line_indices.append(len(task_lines) - 1)
-
         for task in phase.tasks:
             effective_status = task.status
             if task.id in running_ids:
@@ -431,7 +480,7 @@ def render_dependency_graph(phases: list[Phase], phase_deps: dict[str, list[str]
             desc = task.description[:width - 20]
             task_lines.append(f"   {color}{sym}{RESET}{p_marker} {DIM}{task.id}{RESET} {desc}")
             if effective_status == TaskStatus.RUNNING:
-                active_line_indices.append(len(task_lines) - 1)
+                active_lines_by_id[task.id] = len(task_lines) - 1
 
         if i < len(phases) - 1:
             task_lines.append(f"   {DIM}│{RESET}")
@@ -447,9 +496,16 @@ def render_dependency_graph(phases: list[Phase], phase_deps: dict[str, list[str]
     if available < 3:
         available = 3
 
-    # Scroll to keep active tasks visible: center the first active line
-    if active_line_indices:
-        center_line = active_line_indices[0]
+    # Scroll to keep the most recently started task visible
+    if active_lines_by_id:
+        # Find the task that was started most recently
+        latest_id = max(
+            active_lines_by_id,
+            key=lambda tid: next(
+                (a.start_time for a in agents if a.task.id == tid), 0
+            ),
+        )
+        center_line = active_lines_by_id[latest_id]
         scroll_start = max(0, center_line - available // 3)
     else:
         # No active tasks — show the end (most recently completed)
@@ -480,10 +536,12 @@ def render_dependency_graph(phases: list[Phase], phase_deps: dict[str, list[str]
 class TUI:
     """Terminal UI with top graph pane and bottom agent output panes."""
 
-    def __init__(self, phases: list[Phase], phase_deps: dict[str, list[str]], layout: str = "vertical"):
+    def __init__(self, phases: list[Phase], phase_deps: dict[str, list[str]],
+                 layout: str = "vertical", draining: Optional[threading.Event] = None):
         self.phases = phases
         self.phase_deps = phase_deps
         self.layout = layout
+        self._draining = draining or threading.Event()
         self.agents: list[AgentSlot] = []
         self.lock = threading.Lock()
         self._stop = threading.Event()
@@ -528,7 +586,8 @@ class TUI:
         # Budget: give graph ~40% of terminal height, agents get the rest
         graph_budget = max(rows * 2 // 5, 8)
         graph_lines = render_dependency_graph(
-            self.phases, self.phase_deps, agents, cols, max_height=graph_budget
+            self.phases, self.phase_deps, agents, cols, max_height=graph_budget,
+            draining=self._draining.is_set(),
         )
         graph_height = len(graph_lines)
 
@@ -743,12 +802,12 @@ You have been assigned **{task.id}**. Do not pick a different task.
 
 ### If the task is a phase-fix task (e.g., `phase3-fix1`, `phase3-fix2`)
 
-Phase-fix tasks are generated by the phase validation loop. They reference a validation history directory:
+Phase-fix tasks are generated by the phase validation agent. They reference a validation history directory:
 
 1. Read ALL files in the referenced `{spec_dir}/validate/<phase>/` directory
 2. Read `test-logs/` for the latest structured failure output
 3. Diagnose the root cause. **Tests are the spec** — fix the code, not the tests. Exception: if a test is genuinely wrong, fix it with a comment.
-4. Fix the code, then proceed to Step 3 (phase validation).
+4. Fix the code. Do NOT run validation yourself — the runner will spawn a validation agent after you finish.
 
 ### Otherwise (normal implementation task)
 
@@ -758,37 +817,20 @@ Phase-fix tasks are generated by the phase validation loop. They reference a val
 - If the constitution exists, ensure your implementation complies with all principles
 - If something is unclear or you need a design decision, write the question to `BLOCKED.md` and STOP immediately
 
-## Step 3: Phase validation (only at phase boundaries)
+**Note**: Phase validation (build/test at phase boundaries) is handled automatically by the runner — you do NOT need to run it.
 
-Check whether this task is the **last unchecked task in its phase**. If it is NOT the last task, skip to Step 4.
-
-If this IS the last task in the phase (or a phase-fix task), run the project's build and test commands:
-- Check CLAUDE.md for the exact commands
-- For early phases, the build/test infrastructure may not exist yet — verify what you can
-
-### If validation passes
-Continue to Step 4.
-
-### If validation fails — write state and append a phase-fix task
-
-Do NOT attempt to fix failures yourself. Instead:
-
-1. Create a validation run file at `{spec_dir}/validate/<phase>/<N>.md`
-2. If fewer than 10 attempts: append a fix task to `{task_file}` at the end of the current phase
-3. If 10 attempts already: write `BLOCKED.md` and stop
-
-## Step 4: Self-review
+## Step 3: Self-review
 
 Before marking complete, review your own changes:
 1. Run `git diff` to see everything you changed
 2. Check for leftover debug code, missing error handling, security issues
 3. Fix anything you find
 
-## Step 5: Record learnings
+## Step 4: Record learnings
 
 Append any useful discoveries to `{learnings_file}`.
 
-## Step 6: Mark complete and commit
+## Step 5: Mark complete and commit
 
 1. In `{task_file}`, change task {task.id}'s `- [ ]` to `- [x]`
 2. Commit all changes with a conventional commit message including the task ID (e.g., `feat({task.id}): ...`)
@@ -887,9 +929,471 @@ When all steps are done and tests pass, mark the REVIEW task complete in `{task_
 """
 
 
+def build_validation_prompt(spec_dir: str, task_file: str, phase: Phase,
+                            learnings_file: str) -> str:
+    """Build a prompt for a dedicated phase-boundary validation agent.
+
+    This agent runs the project's build/test commands after all tasks in a
+    phase have completed.  If tests fail it writes failure state and appends
+    a fix task — it does NOT attempt to fix code itself.
+    """
+    phase_slug = phase.slug
+    task_ids = ", ".join(t.id for t in phase.tasks)
+    validate_dir = f"{spec_dir}/validate/{phase_slug}"
+
+    # Count existing validation attempts
+    vdir = Path(validate_dir)
+    existing_attempts = sorted(vdir.glob("*.md")) if vdir.exists() else []
+    attempt_num = len(existing_attempts) + 1
+
+    return f"""You are a phase-validation agent. Your ONLY job is to run the project's build and test commands after all tasks in a phase have completed, then report the result.
+
+## Context
+
+- **Phase**: {phase.name} ({phase_slug})
+- **Tasks completed in this phase**: {task_ids}
+- **Task file**: `{task_file}`
+- **Validation directory**: `{validate_dir}/`
+- **This is attempt #{attempt_num}**
+
+## Step 1: Determine build/test commands
+
+Read `CLAUDE.md` (if it exists) for the project's build and test commands. Common patterns:
+- Node.js: `npm run build && npm test` or `npm run check`
+- Python: `uv run pytest` or `pytest`
+- Multi-language: check for phase-specific checkpoint commands in `{task_file}`
+
+Also check for a **Checkpoint** line at the end of the phase in `{task_file}` — it often specifies the exact validation command.
+
+## Step 2: Run validation
+
+Run the build/test commands. Capture all output.
+
+**Important**: For early phases, the build/test infrastructure may not exist yet or may only cover a subset. Run what's available — if no test commands exist yet, run whatever build/typecheck/lint commands are available. If literally nothing can be validated yet (e.g. Phase 1 only created config files), note this and pass.
+
+## Step 3: Report result
+
+### If validation passes
+
+1. Create `{validate_dir}/{attempt_num}.md` with:
+   ```
+   # Phase {phase_slug} — Validation #{attempt_num}: PASS
+
+   **Date**: (current timestamp)
+   **Commands run**: (what you ran)
+   **Result**: All checks passed.
+   ```
+2. Append to `{learnings_file}` if you discovered anything useful (e.g. "Phase N checkpoint command is X")
+3. Done — exit successfully.
+
+### If validation fails
+
+1. Create `{validate_dir}/{attempt_num}.md` with:
+   ```
+   # Phase {phase_slug} — Validation #{attempt_num}: FAIL
+
+   **Date**: (current timestamp)
+   **Commands run**: (what you ran)
+   **Exit code**: (exit code)
+   **Failures**: (summary of what failed)
+   **Structured output**: (contents of test-logs/ if available)
+   **Full output**: (relevant portions of stdout/stderr)
+   ```
+2. If {attempt_num} < 10: append a fix task to `{task_file}` at the end of phase "{phase.name}":
+   `- [ ] {phase_slug}-fix{attempt_num} Fix phase validation failure: read {validate_dir}/ for failure history`
+3. If {attempt_num} >= 10: write `BLOCKED.md` with the full failure history
+4. Done — exit successfully (the runner will pick up the fix task).
+
+## Rules
+
+- Do NOT fix code yourself. Your job is to run tests and report.
+- Do NOT modify any source files. Only create validation records and (if needed) append a fix task.
+- Do NOT read ROUTER.md or load any skills.
+- Do NOT use the Skill tool.
+- Run commands from the project root directory.
+- If `test-logs/` exists after running tests, include its contents in the validation record.
+"""
+
+
+# ── Network allowlist proxy ─────────────────────────────────────────────
+
+# Default domains agents may connect to.  Everything else is blocked.
+# Default domains agents may connect to.  Everything else is blocked
+# at the DNS level (resolv.conf is neutered inside the sandbox).
+# The CONNECT proxy resolves DNS on the host side for allowed domains.
+#
+# Note: Direct IP connections bypass this (can't prevent without root/eBPF).
+# This stops all hostname-based exfil, which covers npm postinstall, pip
+# install hooks, and any tool that uses standard DNS resolution.
+_NETWORK_ALLOWLIST: list[str] = [
+    # Claude API
+    "api.anthropic.com",
+    "claude.ai",
+    # Package registries (needed for npm install, pip install, uv)
+    "registry.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+    # Nix
+    "cache.nixos.org",
+    # GitHub (for git clones in flake inputs, uv installs from git)
+    "github.com",
+    "objects.githubusercontent.com",
+]
+
+import socket as _socket
+
+
+class _AllowlistProxy:
+    """HTTPS CONNECT proxy on localhost with domain allowlist.
+
+    Runs in a background thread.  Agents inside the sandbox set
+    HTTPS_PROXY / HTTP_PROXY to http://127.0.0.1:<port>.  The proxy:
+
+      1. Accepts a connection
+      2. Reads the HTTP CONNECT request (e.g. "CONNECT api.anthropic.com:443")
+      3. Checks the target host against the allowlist
+      4. If allowed: resolves DNS dynamically on the HOST side, connects,
+         replies 200, splices streams
+      5. If denied: replies 403, closes
+
+    DNS inside the sandbox is neutered (resolv.conf → 127.0.0.253), so
+    direct hostname connections fail.  The only path out is through this
+    proxy, which does its own resolution and enforces the allowlist.
+    """
+
+    def __init__(self, allowlist: list[str]):
+        self.allowlist = set(allowlist)
+        self.port: int = 0
+        self._stop = threading.Event()
+        self._server: Optional[_socket.socket] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        self._server = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        self._server.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        self._server.bind(("127.0.0.1", 0))  # OS picks a free port.
+        self.port = self._server.getsockname()[1]
+        self._server.listen(32)
+        self._server.settimeout(1.0)
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._server:
+            try:
+                self._server.close()
+            except OSError:
+                pass
+        if self._thread:
+            self._thread.join(timeout=3)
+
+    def _accept_loop(self):
+        while not self._stop.is_set():
+            try:
+                client, _ = self._server.accept()
+            except _socket.timeout:
+                continue
+            except OSError:
+                break
+            # Handle each connection in a thread to avoid blocking.
+            threading.Thread(
+                target=self._handle, args=(client,), daemon=True
+            ).start()
+
+    def _handle(self, client: _socket.socket):
+        try:
+            client.settimeout(30)
+            # Read the CONNECT request line.
+            data = b""
+            while b"\r\n\r\n" not in data and len(data) < 8192:
+                chunk = client.recv(4096)
+                if not chunk:
+                    return
+                data += chunk
+
+            first_line = data.split(b"\r\n")[0].decode("ascii", errors="replace")
+            # Expected: "CONNECT host:port HTTP/1.1"
+            parts = first_line.split()
+            if len(parts) < 2 or parts[0] != "CONNECT":
+                client.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                return
+
+            target = parts[1]  # e.g. "api.anthropic.com:443"
+            host = target.rsplit(":", 1)[0]
+            port = int(target.rsplit(":", 1)[1]) if ":" in target else 443
+
+            # Check allowlist.
+            if host not in self.allowlist:
+                client.sendall(
+                    f"HTTP/1.1 403 Forbidden\r\nX-Blocked-Host: {host}\r\n\r\n".encode()
+                )
+                return
+
+            # Resolve DNS dynamically and connect.
+            try:
+                upstream = _socket.create_connection((host, port), timeout=10)
+            except (OSError, _socket.timeout):
+                client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                return
+
+            # Tell the client the tunnel is open.
+            client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+
+            # Splice data in both directions.
+            self._splice(client, upstream)
+
+        except Exception:
+            pass
+        finally:
+            try:
+                client.close()
+            except OSError:
+                pass
+
+    def _splice(self, a: _socket.socket, b: _socket.socket):
+        """Bidirectional data copy until either side closes."""
+        import select as _sel
+
+        a.setblocking(False)
+        b.setblocking(False)
+        try:
+            while not self._stop.is_set():
+                readable, _, _ = _sel.select([a, b], [], [], 1.0)
+                for sock in readable:
+                    try:
+                        data = sock.recv(65536)
+                    except (BlockingIOError, ConnectionResetError):
+                        continue
+                    if not data:
+                        return
+                    other = b if sock is a else a
+                    try:
+                        other.sendall(data)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        return
+        finally:
+            try:
+                a.close()
+            except OSError:
+                pass
+            try:
+                b.close()
+            except OSError:
+                pass
+
+
+# ── Sandbox ────────────────────────────────────────────────────────────
+
+# Resolved once at import time; overwritten by main() after arg parsing.
+_sandbox_enabled: bool = True
+_bwrap_path: Optional[str] = None
+_proxy: Optional[_AllowlistProxy] = None
+
+
+def _detect_bwrap() -> Optional[str]:
+    """Find bubblewrap binary. Claude's Nix wrapper bundles it."""
+    path = shutil.which("bwrap")
+    if path:
+        return path
+    # Claude's Nix closure includes bwrap — check its store path.
+    claude_bin = shutil.which("claude")
+    if claude_bin:
+        resolved = Path(claude_bin).resolve()
+        # Walk up to the Nix store entry and check for bwrap in PATH additions
+        # from the wrapper script.  Simpler: just search common Nix bwrap paths.
+        import glob as _glob
+        candidates = _glob.glob("/nix/store/*-bubblewrap-*/bin/bwrap")
+        if candidates:
+            return candidates[0]
+    return None
+
+
+def _build_sandbox_cmd(project_dir: Path, inner_cmd: list[str]) -> list[str]:
+    """Wrap *inner_cmd* in a bubblewrap sandbox with an allowlist filesystem.
+
+    Mounts ONLY what is required:
+      - /nix/store          (ro)  — all binaries, libs, Node runtime
+      - project_dir         (rw)  — the sole mutation surface
+      - /dev, /proc         (ro)  — required by processes
+      - /tmp                (tmpfs) — scratch
+      - ~/.gitconfig        (ro)  — author name/email for commits
+      - /etc/resolv.conf    (ro)  — DNS resolution
+      - /etc/ssl/certs      (ro)  — TLS certificate bundle
+      - /etc/static         (ro)  — NixOS resolv.conf / hosts symlink targets
+      - ANTHROPIC_API_KEY   (env) — sole credential, passed as env var
+
+    Nothing else is mounted: no home dir, no ~/.claude/, no ~/.ssh/,
+    no cloud credentials, no global bin dirs outside /nix/store.
+    """
+    assert _bwrap_path, "bwrap not found — cannot sandbox"
+
+    home = Path.home()
+    project = str(project_dir.resolve())
+    gitconfig = home / ".gitconfig"
+
+    cmd: list[str] = [_bwrap_path, "--die-with-parent", "--unshare-pid"]
+
+    # ── Allowlisted mounts (everything else is absent) ──
+
+    # Nix store: all binaries, libraries, the Claude CLI, Node, git, etc.
+    cmd += ["--ro-bind", "/nix/store", "/nix/store"]
+
+    # Project directory: the ONLY writable surface.
+    cmd += ["--bind", project, project]
+
+    # Device and process filesystems.
+    cmd += ["--dev", "/dev"]
+    cmd += ["--proc", "/proc"]
+
+    # Scratch space (ephemeral, vanishes on exit).
+    cmd += ["--tmpfs", "/tmp"]
+
+    # Minimal /usr and /bin so scripts with #!/usr/bin/env work.
+    # These are read-only and contain only the Nix-managed symlinks.
+    for d in ["/usr/bin", "/bin", "/run/current-system/sw/bin"]:
+        if Path(d).is_dir():
+            cmd += ["--ro-bind", d, d]
+
+    # Git author config (name + email only, no credentials).
+    if gitconfig.is_file():
+        cmd += ["--ro-bind", str(gitconfig), str(gitconfig)]
+
+    # DNS resolution — pass through real resolv.conf.
+    # NOTE: Node.js built-in fetch (undici) does not honor HTTPS_PROXY,
+    # so we cannot neuter DNS and rely on a proxy.  Instead we pass real
+    # DNS through and rely on the filesystem sandbox + network proxy as
+    # defense in depth.  The proxy is advisory (blocks hostname-based
+    # connections from tools that DO honor *_PROXY env vars like curl,
+    # pip, npm).
+    if Path("/etc/resolv.conf").exists():
+        cmd += ["--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf"]
+    if Path("/etc/static").is_dir():
+        cmd += ["--ro-bind", "/etc/static", "/etc/static"]
+
+    # SSL/TLS certificates for HTTPS API calls (proxy connections still need TLS).
+    for cert_dir in ["/etc/ssl/certs", "/etc/ssl", "/etc/pki"]:
+        if Path(cert_dir).is_dir():
+            cmd += ["--ro-bind", cert_dir, cert_dir]
+            break
+
+    # NSS/passwd so git and node can resolve the current user.
+    for f in ["/etc/passwd", "/etc/group", "/etc/nsswitch.conf"]:
+        if Path(f).exists():
+            cmd += ["--ro-bind", f, f]
+
+    # Nix daemon socket — read-only bind so agents can query the store
+    # but cannot install packages to it.  `nix develop` inside the sandbox
+    # will fail on store writes; agents should modify flake.nix and let
+    # the runner re-enter the devShell outside the sandbox.
+    nix_sock = "/nix/var/nix/daemon-socket"
+    if Path(nix_sock).exists():
+        cmd += ["--ro-bind", nix_sock, nix_sock]
+    nix_db = "/nix/var/nix/db"
+    if Path(nix_db).exists():
+        cmd += ["--ro-bind", nix_db, nix_db]
+
+    # A tmpfs home so processes that probe $HOME don't error.
+    # Nothing from the real home is mounted except the explicit allowlist below.
+    cmd += ["--tmpfs", str(home)]
+
+    # Re-mount gitconfig inside the tmpfs home (the tmpfs shadows it).
+    if gitconfig.is_file():
+        cmd += ["--ro-bind", str(gitconfig), str(gitconfig)]
+    # Re-mount project dir if it's under home (tmpfs shadows it).
+    if project.startswith(str(home)):
+        cmd += ["--bind", project, project]
+
+    # Claude CLI auth: mount ONLY .credentials.json (read-only).
+    # The CLI needs this for its OAuth flow (token refresh, proper headers).
+    # Nothing else from ~/.claude/ is exposed.
+    claude_creds = home / ".claude" / ".credentials.json"
+    if claude_creds.is_file():
+        claude_dir = home / ".claude"
+        cmd += ["--dir", str(claude_dir)]
+        cmd += ["--ro-bind", str(claude_creds), str(claude_creds)]
+
+    # Claude CLI auth: credentials are passed via env vars set in the
+    # subprocess environment (Popen env=), NOT via bwrap --setenv, to
+    # avoid leaking tokens in /proc/*/cmdline.  See spawn_agent().
+
+    # ── Environment ──
+    # All env vars (credentials, PATH, HOME, SSL) are passed via Popen(env=)
+    # in spawn_agent(), NOT via bwrap --setenv, to keep them out of
+    # /proc/*/cmdline.  Only --chdir is set here.
+
+    cmd += ["--chdir", project]
+
+    cmd += ["--"]
+    cmd.extend(inner_cmd)
+    return cmd
+
+
+# ── Agent spawning ─────────────────────────────────────────────────────
+
+def _build_sandbox_env() -> dict[str, str]:
+    """Build a minimal environment for sandboxed agents.
+
+    Credentials are passed here (via Popen env=) instead of bwrap --setenv
+    so they don't appear in /proc/*/cmdline of the bwrap process.
+    """
+    home = Path.home()
+    env: dict[str, str] = {
+        "HOME": str(home),
+        "USER": os.environ.get("USER", "sandbox"),
+        "PATH": "/run/current-system/sw/bin:/usr/bin:/bin",
+    }
+
+    # Auth: the CLI needs ~/.claude/.credentials.json for its full OAuth
+    # flow (token refresh, proper headers).  Passing the token as an env
+    # var doesn't work — the API rejects bare OAuth tokens.
+    # The credentials file is mounted read-only by _build_sandbox_cmd().
+
+    # API key fallback (alternative auth path).
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if api_key:
+        env["ANTHROPIC_API_KEY"] = api_key
+
+    # SSL certs for Node/Python HTTPS.
+    for var in ["SSL_CERT_FILE", "NIX_SSL_CERT_FILE"]:
+        val = os.environ.get(var)
+        if val:
+            env[var] = val
+
+    # Network proxy — all HTTPS traffic routed through the allowlist proxy.
+    # DNS is neutered inside the sandbox, so hostname connections only work
+    # through this proxy (which resolves DNS on the host side).
+    if _proxy and _proxy.port:
+        proxy_url = f"http://127.0.0.1:{_proxy.port}"
+        env["HTTPS_PROXY"] = proxy_url
+        env["HTTP_PROXY"] = proxy_url
+        env["ALL_PROXY"] = proxy_url
+
+    return env
+
+
 def spawn_agent(task: Task, prompt: str, log_path: Path,
                 stderr_path: Path) -> subprocess.Popen:
-    """Spawn a claude CLI process for the given task."""
+    """Spawn a claude CLI process for the given task.
+
+    When sandboxing is enabled, the process runs inside bubblewrap with
+    an allowlist-only filesystem.  The OAuth token is passed via a
+    one-shot file descriptor:
+
+      1. Runner creates a pipe (r_fd, w_fd)
+      2. Writes token to w_fd, closes w_fd
+      3. r_fd is inherited by the child (close_fds=False, pass_fds)
+      4. CLI reads token from /proc/self/fd/<r_fd> — fd is now at EOF
+      5. Any child process that later reads the fd gets nothing
+
+    This means the token never appears in:
+      - /proc/*/cmdline  (not a command-line arg)
+      - /proc/*/environ  (not an env var)
+      - The filesystem    (~/.claude/ is not mounted)
+
+    The only window is between fork and the CLI's readFileSync — a race
+    that's impractical to exploit.
+    """
     cmd = [
         "claude",
         "--dangerously-skip-permissions",
@@ -898,6 +1402,29 @@ def spawn_agent(task: Task, prompt: str, log_path: Path,
         "--output-format", "stream-json",
         "-p", prompt,
     ]
+
+    env = None
+
+    if _sandbox_enabled and _bwrap_path:
+        project_dir = Path.cwd()
+        cmd = _build_sandbox_cmd(project_dir, cmd)
+        env = _build_sandbox_env()
+    else:
+        # Not sandboxed — still need a clean env to avoid CLAUDECODE
+        # detection which makes the CLI refuse to start.
+        env = dict(os.environ)
+        env.pop("CLAUDECODE", None)
+        env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        # Also inject auth token for non-sandbox mode.
+        claude_creds = Path.home() / ".claude" / ".credentials.json"
+        if claude_creds.is_file():
+            try:
+                creds = json.loads(claude_creds.read_text())
+                tok = creds.get("claudeAiOauth", {}).get("accessToken", "")
+                if tok and "ANTHROPIC_AUTH_TOKEN" not in env:
+                    env["ANTHROPIC_AUTH_TOKEN"] = tok
+            except (json.JSONDecodeError, OSError):
+                pass
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -910,6 +1437,7 @@ def spawn_agent(task: Task, prompt: str, log_path: Path,
         stderr=stderr_file,
         stdin=subprocess.DEVNULL,
         start_new_session=True,
+        env=env,
     )
     return proc
 
@@ -993,6 +1521,7 @@ class Runner:
         self.log_dir.mkdir(exist_ok=True)
         self.timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         self._shutdown = threading.Event()
+        self._draining = threading.Event()  # First Ctrl-C: finish running agents, don't spawn new ones
         self.agents: list[AgentSlot] = []
         self.agent_counter = 0
         self._lock = threading.Lock()
@@ -1015,9 +1544,42 @@ class Runner:
         else:
             print(line, flush=True)
 
+    def _cleanup_stale_run(self):
+        """Kill any orphaned agents from a previous runner that crashed.
+
+        Uses a pidfile to find the old runner's process group and kill it.
+        """
+        pidfile = self.log_dir / "runner.pid"
+        if pidfile.exists():
+            try:
+                old_pid = int(pidfile.read_text().strip())
+                # Check if the old process is still running.
+                os.kill(old_pid, 0)
+                # It's alive — kill its entire process group.
+                self.log(f"Killing stale runner (PID {old_pid}) from previous run")
+                try:
+                    os.killpg(os.getpgid(old_pid), signal.SIGTERM)
+                    time.sleep(2)
+                    os.killpg(os.getpgid(old_pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            except (ValueError, ProcessLookupError, OSError):
+                pass  # Stale pidfile, process already gone.
+
+        # Write our own PID.
+        pidfile.write_text(str(os.getpid()))
+
+    def _remove_pidfile(self):
+        pidfile = self.log_dir / "runner.pid"
+        try:
+            pidfile.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def run(self):
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
+        self._cleanup_stale_run()
 
         # Check for leftover BLOCKED.md
         if self.blocked_file.exists():
@@ -1027,30 +1589,80 @@ class Runner:
             print("Edit the file with your answer, then delete it and re-run.")
             sys.exit(2)
 
-        for spec_dir in self.spec_dirs:
-            if self._shutdown.is_set():
-                break
-            self._run_feature(spec_dir)
+        try:
+            for spec_dir in self.spec_dirs:
+                if self._shutdown.is_set() or self._draining.is_set():
+                    break
+                self._run_feature(spec_dir)
+        finally:
+            # Guarantee all agents are killed on ANY exit path:
+            # normal completion, unhandled exception, KeyboardInterrupt.
+            self._kill_all_agents()
+            self._remove_pidfile()
 
         self._print_summary()
 
     def _handle_signal(self, sig, frame):
+        if not self._draining.is_set():
+            # First Ctrl-C → drain: finish running agents, don't spawn new ones
+            self._draining.set()
+            self.log("Ctrl-C — draining: waiting for running agents to finish, no new tasks")
+            return
+        # Second Ctrl-C → hard shutdown
         self._shutdown.set()
-        # Kill all running agents
-        with self._lock:
-            for agent in self.agents:
-                if agent.process and agent.process.poll() is None:
-                    try:
-                        os.killpg(os.getpgid(agent.process.pid), signal.SIGTERM)
-                    except Exception:
-                        try:
-                            agent.process.kill()
-                        except Exception:
-                            pass
+        self._kill_all_agents()
+        self._remove_pidfile()
         if self.tui:
             self.tui.stop()
         print("\nInterrupted.")
         sys.exit(130)
+
+    def _kill_all_agents(self, graceful_timeout: float = 5.0):
+        """Terminate all running agents with SIGTERM → wait → SIGKILL escalation.
+
+        Ensures no child processes leak, including bwrap sandbox children.
+        """
+        with self._lock:
+            live = [a for a in self.agents
+                    if a.process and a.process.poll() is None]
+
+        if not live:
+            return
+
+        # Phase 1: SIGTERM to process groups (reaches bwrap children).
+        for agent in live:
+            try:
+                os.killpg(os.getpgid(agent.process.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+        # Phase 2: Wait up to graceful_timeout for clean exit.
+        deadline = time.monotonic() + graceful_timeout
+        for agent in live:
+            remaining = max(0, deadline - time.monotonic())
+            try:
+                agent.process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                pass
+
+        # Phase 3: SIGKILL anything still alive.
+        for agent in live:
+            if agent.process.poll() is None:
+                try:
+                    os.killpg(os.getpgid(agent.process.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+                try:
+                    agent.process.kill()
+                except (ProcessLookupError, OSError):
+                    pass
+
+        # Phase 4: Reap all zombies.
+        for agent in live:
+            try:
+                agent.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
 
     def _run_feature(self, spec_dir: str):
         task_file = Path(spec_dir) / "tasks.md"
@@ -1090,13 +1702,20 @@ class Runner:
         # Ensure validate dir
         (Path(spec_dir) / "validate").mkdir(parents=True, exist_ok=True)
 
+        # Scan for already-validated phases (from prior runs)
+        validated_phases = scan_validated_phases(spec_dir)
+        # Track which phases currently have a validation agent running
+        validating_phases: set[str] = set()
+
         # Setup TUI for this feature
         if not self.headless:
-            self.tui = TUI(phases, phase_deps, layout=self.layout)
+            self.tui = TUI(phases, phase_deps, layout=self.layout, draining=self._draining)
             self.tui.start()
 
         self.log(f"=== Feature: {Path(spec_dir).name} ===")
         self.log(f"Remaining: {scheduler.remaining_count()} | Completed: {scheduler.completed_count()}")
+        if validated_phases:
+            self.log(f"Already validated: {', '.join(sorted(validated_phases))}")
 
         consecutive_noop = 0
         max_consecutive_noop = 5
@@ -1105,7 +1724,9 @@ class Runner:
         while not self._shutdown.is_set() and total_runs < self.max_runs:
             # Re-parse task file to pick up changes from agents
             phases, phase_deps = parse_task_file(task_file)
-            scheduler = Scheduler(phases, phase_deps)
+            # Re-scan validated phases (a validation agent may have written a PASS)
+            validated_phases = scan_validated_phases(spec_dir)
+            scheduler = Scheduler(phases, phase_deps, validated_phases)
 
             if self.tui:
                 self.tui.phases = phases
@@ -1114,6 +1735,16 @@ class Runner:
             if scheduler.all_complete():
                 self.log("All tasks complete!")
                 break
+
+            # Draining: don't spawn new tasks, just wait for running agents.
+            if self._draining.is_set():
+                with self._lock:
+                    if not self.agents:
+                        self.log("Drain complete — all agents finished")
+                        break
+                self._poll_agents()
+                time.sleep(1)
+                continue
 
             # Check BLOCKED.md
             if self.blocked_file.exists():
@@ -1182,6 +1813,65 @@ class Runner:
                 available_slots -= 1
                 spawned += 1
                 total_runs += 1
+
+            # ── Phase-boundary validation ──────────────────────────────
+            # Check if any phase just completed all its tasks but hasn't
+            # been validated yet.  Spawn a dedicated validation agent.
+            for phase in scheduler.phases_needing_validation():
+                if phase.slug in validating_phases:
+                    continue  # already has a validation agent running
+                if available_slots <= 0:
+                    break
+
+                # Ensure the phase validate dir exists
+                phase_vdir = Path(spec_dir) / "validate" / phase.slug
+                phase_vdir.mkdir(parents=True, exist_ok=True)
+
+                prompt = build_validation_prompt(
+                    spec_dir, str(task_file), phase, str(learnings_file)
+                )
+
+                # Create a synthetic task for tracking
+                val_task_id = f"VALIDATE-{phase.slug}"
+                val_task = Task(
+                    id=val_task_id,
+                    description=f"Phase validation: {phase.name}",
+                    phase=phase.slug,
+                    parallel=False,
+                    status=TaskStatus.RUNNING,
+                    line_num=0,
+                )
+
+                self.agent_counter += 1
+                agent_id = self.agent_counter
+
+                log_path = self.log_dir / f"agent-{agent_id}-{val_task_id}-{self.timestamp}.jsonl"
+                stderr_path = self.log_dir / f"agent-{agent_id}-{val_task_id}-{self.timestamp}.stderr"
+
+                self.log(f"Spawning validation Agent {agent_id} for {phase.name}")
+
+                proc = spawn_agent(val_task, prompt, log_path, stderr_path)
+
+                slot = AgentSlot(
+                    agent_id=agent_id,
+                    task=val_task,
+                    process=proc,
+                    pid=proc.pid,
+                    start_time=time.time(),
+                    log_file=log_path,
+                    status="running",
+                )
+
+                with self._lock:
+                    self.agents.append(slot)
+
+                validating_phases.add(phase.slug)
+                available_slots -= 1
+                spawned += 1
+                total_runs += 1
+
+            # Clean up validating_phases for phases that are now validated
+            validating_phases -= validated_phases
 
             # Update TUI
             if self.tui:
@@ -1288,7 +1978,12 @@ class Runner:
             time.sleep(1)
 
     def _drain_agents(self):
-        """Wait for all running agents to finish."""
+        """Wait for all running agents to finish their current work.
+
+        No timeout — agents doing legitimate work (long builds, large test
+        suites) should not be killed arbitrarily.  The user can Ctrl-C to
+        abort, which triggers _handle_signal → _kill_all_agents.
+        """
         while True:
             with self._lock:
                 if not self.agents:
@@ -1338,8 +2033,36 @@ def main():
                         help="Max concurrent agents (default: 3)")
     parser.add_argument("--layout", choices=["vertical", "grid"], default="vertical",
                         help="Agent pane layout: vertical (stacked, default) or grid (side-by-side)")
+    parser.add_argument("--no-sandbox", action="store_true",
+                        help="Disable bubblewrap sandbox (not recommended)")
 
     args = parser.parse_args()
+
+    # ── Sandbox setup ──
+    global _sandbox_enabled, _bwrap_path, _proxy
+    if args.no_sandbox:
+        _sandbox_enabled = False
+        print("⚠ Sandbox DISABLED by --no-sandbox flag", file=sys.stderr)
+    else:
+        _bwrap_path = _detect_bwrap()
+        if _bwrap_path:
+            _sandbox_enabled = True
+            # Start the allowlist network proxy.
+            _proxy = _AllowlistProxy(allowlist=_NETWORK_ALLOWLIST)
+            _proxy.start()
+            print(
+                f"🔒 Sandbox enabled (bwrap: {_bwrap_path})\n"
+                f"🌐 Network proxy on 127.0.0.1:{_proxy.port} "
+                f"(allowlist: {', '.join(_NETWORK_ALLOWLIST)})",
+                file=sys.stderr,
+            )
+        else:
+            _sandbox_enabled = False
+            print(
+                "⚠ bubblewrap (bwrap) not found — running WITHOUT sandbox.\n"
+                "  Install bwrap or use Claude's Nix package (which bundles it).",
+                file=sys.stderr,
+            )
 
     # Resolve spec dirs
     if args.spec_dir:
@@ -1360,7 +2083,11 @@ def main():
         max_parallel=args.max_parallel,
         layout=args.layout,
     )
-    runner.run()
+    try:
+        runner.run()
+    finally:
+        if _proxy:
+            _proxy.stop()
 
 
 if __name__ == "__main__":

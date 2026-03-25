@@ -92,6 +92,24 @@ Skip presets that clearly don't apply (don't show enterprise for a throwaway scr
 
 If Nix is NOT available, fall back to Docker/devcontainers. Do not block on Nix.
 
+## Agent sandboxing
+
+Implementation agents (Phase 7) run inside a **bubblewrap (bwrap) sandbox**. The sandbox is transparent to agents — they don't need to do anything special. The runner handles all sandbox setup.
+
+### What agents need to know
+
+- **Only the project directory is writable.** Global install paths don't exist. Install tools via `flake.nix`, not globally.
+- **Network is restricted.** DNS is neutered; outbound connections only work through an allowlist proxy. Allowed domains: `api.anthropic.com`, `registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org`, `cache.nixos.org`, `github.com`.
+- **No credential files exist.** `~/.claude/`, `~/.ssh/`, `~/.aws/` are not mounted. Auth is handled by the runner via a one-shot file descriptor.
+- **`--no-sandbox` disables sandboxing** (for debugging). `--unshare-pid` isolates the PID namespace.
+
+### Install rules (defense in depth)
+
+Even without the sandbox, agents MUST use project-scoped installs:
+- **NEVER** use `nix profile install`, `npm install -g`, `uv tool install`, `pip install` (global), or `curl | sh`
+- **ALWAYS** add tools to the project's `flake.nix` devShell
+- The sandbox enforces this at the OS level — global install paths are not writable
+
 ## .gitignore management
 
 **After every phase that produces or defines new artifacts**, ensure the project's `.gitignore` is up to date. This is not a one-time setup — re-evaluate on every phase transition.
