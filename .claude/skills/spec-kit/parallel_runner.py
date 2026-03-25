@@ -1628,7 +1628,7 @@ def spawn_agent(task: Task, prompt: str, log_path: Path,
     The only window is between fork and the CLI's readFileSync — a race
     that's impractical to exploit.
     """
-    cmd = [
+    claude_cmd = [
         "claude",
         "--dangerously-skip-permissions",
         "--model", "opus",
@@ -1636,6 +1636,16 @@ def spawn_agent(task: Task, prompt: str, log_path: Path,
         "--output-format", "stream-json",
         "-p", prompt,
     ]
+
+    # Wrap in nix develop if the project has a flake.nix, so agents get
+    # the full dev environment (native deps, toolchains, etc.).
+    # Always wrap — even if runner is inside nix develop, the child env
+    # may be stripped (sandbox mode) or the runner may have been launched
+    # outside nix develop.
+    if (Path.cwd() / "flake.nix").exists() and shutil.which("nix"):
+        cmd = ["nix", "develop", "--command"] + claude_cmd
+    else:
+        cmd = claude_cmd
 
     env = None
 
