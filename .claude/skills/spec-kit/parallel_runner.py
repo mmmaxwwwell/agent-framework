@@ -1643,7 +1643,10 @@ def spawn_agent(task: Task, prompt: str, log_path: Path,
     # may be stripped (sandbox mode) or the runner may have been launched
     # outside nix develop.
     if (Path.cwd() / "flake.nix").exists() and shutil.which("nix"):
-        cmd = ["nix", "develop", "--command"] + claude_cmd
+        cmd = [
+            "nix", "--extra-experimental-features", "nix-command flakes",
+            "develop", "--command",
+        ] + claude_cmd
     else:
         cmd = claude_cmd
 
