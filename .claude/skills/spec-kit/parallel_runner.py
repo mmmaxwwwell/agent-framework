@@ -301,35 +301,52 @@ class Scheduler:
             if not self.phase_deps_met(phase.slug):
                 continue
 
-            # Within a phase, find ready tasks
-            sequential_blocked = False
+            # Within a phase, find ready tasks.
+            # Rules:
+            #   - [P] tasks can run concurrently with each other
+            #   - A sequential task (no [P]) must wait for ALL preceding
+            #     tasks (both [P] and sequential) to complete
+            #   - A [P] task must wait for all preceding sequential tasks
+            #     to complete, but can run alongside other [P] tasks
+            has_incomplete_above = False
+            has_incomplete_sequential_above = False
             for task in phase.tasks:
                 if task.status in (TaskStatus.COMPLETE, TaskStatus.SKIPPED):
                     continue
-                if task.id in running_ids:
+
+                is_incomplete = (
+                    task.id in running_ids
+                    or task.status == TaskStatus.PENDING
+                    or task.status == TaskStatus.BLOCKED
+                )
+
+                if is_incomplete and task.id in running_ids:
+                    # Running — track it as incomplete but don't add to ready
+                    has_incomplete_above = True
                     if not task.parallel:
-                        sequential_blocked = True
-                    continue
-                if task.status != TaskStatus.PENDING:
-                    if not task.parallel:
-                        sequential_blocked = True
+                        has_incomplete_sequential_above = True
                     continue
 
-                # Sequential task: only ready if no prior sequential task is incomplete
+                if task.status != TaskStatus.PENDING:
+                    # Blocked or other non-ready state
+                    has_incomplete_above = True
+                    if not task.parallel:
+                        has_incomplete_sequential_above = True
+                    continue
+
+                # Task is PENDING and not running
                 if not task.parallel:
-                    if sequential_blocked:
-                        break  # can't go past an incomplete sequential task
+                    # Sequential task: must wait for ALL preceding tasks
+                    if has_incomplete_above:
+                        break  # can't go past — blocks everything below
                     ready.append(task)
-                    sequential_blocked = True  # block subsequent sequential tasks
+                    has_incomplete_above = True
+                    has_incomplete_sequential_above = True
                 else:
-                    # Parallel task: ready if sequential deps before it are done
-                    if not sequential_blocked:
+                    # [P] task: can run if no incomplete sequential task above
+                    if not has_incomplete_sequential_above:
                         ready.append(task)
-                    # Even with sequential_blocked, [P] tasks can run if they
-                    # were listed after the blocking task but are marked parallel.
-                    # The spec says [P] tasks touch different files.
-                    elif task.parallel:
-                        ready.append(task)
+                        has_incomplete_above = True
 
         return ready
 
