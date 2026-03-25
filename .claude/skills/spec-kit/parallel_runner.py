@@ -287,8 +287,7 @@ class Scheduler:
         state = self._get_state(slug)
         if state.complete:
             return False
-        # Needs agent if: never validated, OR validated but review had fixes
-        return state.needs_validate_review or not state.validated
+        return state.needs_validate_review
 
     def phase_deps_met(self, slug: str) -> bool:
         deps = self.phase_deps.get(slug, [])
@@ -392,8 +391,10 @@ class PhaseValidationState:
             return True  # Never validated
         if self.review_clean:
             return False  # Already clean — done
-        # Validated but review had fixes — need another cycle to re-validate + re-review
-        return self.review_cycle > 0 and not self.review_clean
+        # Validated but never reviewed (review_cycle=0), or reviewed with
+        # fixes (review_cycle>0, review_clean=False) — either way, need
+        # a VR cycle.
+        return True
 
 
 def scan_phase_validation_states(spec_dir: str) -> dict[str, PhaseValidationState]:
