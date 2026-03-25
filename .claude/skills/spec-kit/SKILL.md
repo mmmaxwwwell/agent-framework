@@ -92,6 +92,78 @@ Skip presets that clearly don't apply (don't show enterprise for a throwaway scr
 
 If Nix is NOT available, fall back to Docker/devcontainers. Do not block on Nix.
 
+## .gitignore management
+
+**After every phase that produces or defines new artifacts**, ensure the project's `.gitignore` is up to date. This is not a one-time setup — re-evaluate on every phase transition.
+
+### When to run
+
+Check and update `.gitignore` after completing **any** of these phases:
+- **Phase 0 (install/init)** — create the initial `.gitignore` with baseline entries
+- **Phase 2 (specify)** — if the spec introduces new artifact types (e.g. generated files, dev certs)
+- **Phase 5 (plan)** — the plan may define build output dirs, codegen targets, database files, etc.
+- **Phase 6 (tasks)** — if tasks reference new directories (e.g. `validate/`, custom output dirs)
+- **Phase 7 (implement)** — re-check after implementation adds runtime artifacts
+
+### How to run
+
+1. Read the current `.gitignore` (or note it doesn't exist yet)
+2. Compute the required entries based on what's been decided so far (see baseline + conditional below)
+3. Merge: add any missing entries, never remove entries the user added manually
+4. Write the updated `.gitignore` if it changed
+5. If entries were added, briefly tell the user what was added and why
+
+### Baseline entries (always present)
+
+```gitignore
+# Spec-kit / agent artifacts
+test-logs/
+logs/
+validate/
+BLOCKED.md
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Direnv
+.direnv/
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+```
+
+### Conditional entries (add when relevant)
+
+| Condition | Entries to add |
+|-----------|---------------|
+| Nix/flakes in use | `result` (nix build output symlink) |
+| Security baseline (any preset except poc) | `*.pem`, `*.key`, `credentials.json` |
+| Build output dir defined in plan | The specific dir (e.g. `build/`, `out/`, `.next/`) |
+| Codegen at build time | The generated dir (e.g. `src/generated/`) |
+| Database files (SQLite, etc.) | `*.sqlite`, `*.sqlite3`, `*.db` |
+| Coverage reports | `coverage/`, `.nyc_output/`, `htmlcov/` |
+| Docker | `.docker/` |
+| Custom dev certs | `certs/` or wherever they're stored |
+
+### Interaction with presets
+
+- **poc**: Baseline only — skip security and infrastructure entries
+- **local/public/enterprise**: Baseline + all conditional entries that apply based on interview decisions
+
 ## Quick reference
 
 | Phase | Command | What it does |
@@ -151,7 +223,8 @@ For each phase:
 1. Tell the user which phase you're running and why it's next
 2. Load the phase file (or command template for simple phases)
 3. Follow its instructions exactly
-4. After completing the phase, summarize what was produced and **automatically proceed to the next phase** (see auto-advance below)
+4. **Update `.gitignore`** if this phase is listed in the gitignore management section above
+5. After completing the phase, summarize what was produced and **automatically proceed to the next phase** (see auto-advance below)
 
 **Reference files are loaded on demand by the phase files** — they tell you which reference to load and when. Never preload all references.
 
