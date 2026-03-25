@@ -848,7 +848,7 @@ def build_prompt(task_file: str, spec_dir: str, learnings_file: str,
     nix_note = ""
     if (Path.cwd() / "flake.nix").exists():
         nix_note = """
-**Environment**: This project uses Nix (`flake.nix`). You are running inside `nix develop`, which provides all native dependencies (numpy, node, compilers, etc.). Do NOT work around missing native deps with lazy imports or try/except — they are available. If a native dep is genuinely missing, it's a flake.nix issue, not a code issue.
+**Environment**: This project uses Nix (`flake.nix`). Your PATH already includes all tools from the nix devshell — run commands directly (e.g. `node`, `npm`, `python3`, `pytest`, `uv`). Do NOT prefix commands with `nix develop --command`. Do NOT work around missing native deps with lazy imports or try/except — they are available. If a native dep is genuinely missing, it's a flake.nix issue, not a code issue.
 """
 
     prompt = f"""You are an implementation agent for a spec-kit project. Your job is to execute exactly ONE task from the task list, then stop.
@@ -971,7 +971,7 @@ def build_validate_review_prompt(spec_dir: str, task_file: str, phase: Phase,
     nix_note = ""
     if (Path.cwd() / "flake.nix").exists():
         nix_note = """
-**Environment**: You are running inside `nix develop`. All native dependencies declared in `flake.nix` are available. If tests fail due to missing native libraries (e.g. `libstdc++.so.6`, shared objects), that is a `flake.nix` issue — report it as an environment problem, not a code bug. Do NOT create fix tasks for environment-only failures.
+**Environment**: This project uses Nix (`flake.nix`). Your PATH already includes all tools from the nix devshell — run commands directly (e.g. `node`, `npm`, `python3`, `pytest`, `uv`). Do NOT prefix commands with `nix develop --command`. If tests fail due to missing native libraries (e.g. `libstdc++.so.6`, shared objects), that is a `flake.nix` issue — report it as an environment problem, not a code bug. Do NOT create fix tasks for environment-only failures.
 """
 
     # Determine diff scope for the review portion
@@ -1119,6 +1119,8 @@ Also check for a **Checkpoint** line at the end of the phase in `{task_file}`.
 ### Run validation
 
 Run the build/test commands. Capture all output.
+
+**Code coverage is mandatory.** The test command MUST collect coverage (e.g. `c8` for Node native runner, `--coverage` for Jest/Vitest, `--cov` for pytest). If the project's test command does not include coverage flags, fix the test script in `package.json`/`CLAUDE.md`/equivalent to add them before running. Coverage output must appear in the terminal so it's visible in logs.
 
 **Important**: For early phases, the build/test infrastructure may not exist yet or may only cover a subset. Run what's available. If literally nothing can be validated yet, note this and pass.
 
@@ -1534,10 +1536,13 @@ def _build_sandbox_env() -> dict[str, str]:
     so they don't appear in /proc/*/cmdline of the bwrap process.
     """
     home = Path.home()
+    # Inherit PATH from the parent process so nix develop tools (node,
+    # python, npm, pytest, etc.) are available inside the sandbox.  Fall
+    # back to a minimal system PATH if PATH is somehow unset.
     env: dict[str, str] = {
         "HOME": str(home),
         "USER": os.environ.get("USER", "sandbox"),
-        "PATH": "/run/current-system/sw/bin:/usr/bin:/bin",
+        "PATH": os.environ.get("PATH", "/run/current-system/sw/bin:/usr/bin:/bin"),
     }
 
     # Auth: the CLI needs ~/.claude/.credentials.json for its full OAuth

@@ -72,6 +72,39 @@ CONTEXT:
   Request: { requestId: "req-1", messageType: 13, data: "AAAA..." }
 ```
 
+## Code coverage collection
+
+Every test run MUST collect and report code coverage. Coverage is not optional — it's how the fix-validate loop confirms that new code is actually exercised by tests, not just present.
+
+### Setup requirements
+
+During plan/implementation, configure the project's test command to collect coverage automatically:
+
+| Language | Tool | Command pattern |
+|----------|------|-----------------|
+| Node.js (native test runner) | `c8` | `c8 --reporter=text --reporter=json node --test` |
+| Node.js (Vitest) | Built-in | `vitest run --coverage` (uses `@vitest/coverage-v8` or `@vitest/coverage-istanbul`) |
+| Node.js (Jest) | Built-in | `jest --coverage` |
+| Python (pytest) | `pytest-cov` | `pytest --cov=src --cov-report=term --cov-report=json` |
+| Go | Built-in | `go test -coverprofile=coverage.out ./...` |
+| Rust | `cargo-llvm-cov` | `cargo llvm-cov --json` |
+
+### Output requirements
+
+1. **Terminal summary** — always print a human-readable coverage table to stdout so it appears in agent logs and the terminal. This is the primary feedback mechanism.
+2. **JSON report** — write a machine-readable coverage report to `coverage/coverage-summary.json` (or language equivalent) so downstream tools can parse it.
+3. **The test command in `CLAUDE.md` and `package.json` (or equivalent) MUST include coverage flags** — coverage should be collected on every `npm test` / `pytest` / etc., not require a separate command.
+
+### What agents must do
+
+- **Plan phase**: choose the coverage tool and add it to dev dependencies. Add the coverage command to the project's test script.
+- **Implementation phase**: when writing tests, verify coverage output appears. If a test file is added but coverage doesn't increase for the corresponding source file, investigate — the test may not be exercising the code it claims to.
+- **Validation phase**: coverage output is part of the test run. The validation agent reads the terminal output to confirm coverage was collected. If the coverage command is missing or broken, the validation agent must fix it before proceeding.
+
+### .gitignore
+
+Coverage output directories (`coverage/`, `.nyc_output/`, `htmlcov/`, `coverage.out`) are already listed in the SKILL.md `.gitignore` conditional entries — ensure they're added when coverage is configured.
+
 ## How the fix-validate loop works at runtime
 
 The loop operates at **phase boundaries**, not per-task. It's a **disk-based state machine** driven by the task runner:

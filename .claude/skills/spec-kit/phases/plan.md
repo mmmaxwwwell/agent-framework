@@ -79,6 +79,7 @@ Present these in order. Skip items marked N/A in the spec.
 
 ### Testing strategy
 - **Test runner** — Native test runner, Jest, Vitest, pytest, etc.
+- **Code coverage** — Coverage tool (c8, vitest coverage, jest --coverage, pytest-cov, etc.), wired into the default test command so every run collects coverage. See `reference/testing.md` § Code coverage collection.
 - **Custom reporter** — For structured test output (required by fix-validate loop)
 - **Test tiers** — Unit, integration, contract, e2e — what goes where
 - **Test fixtures** — Real servers, test databases, mock boundaries
