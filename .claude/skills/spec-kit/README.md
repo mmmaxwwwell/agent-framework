@@ -10,6 +10,14 @@ This skill closes those gaps by mandating minimum depth at every phase and bakin
 
 ## What it adds beyond vanilla spec-kit
 
+### Analyze phase (Phase 4) — mandatory loop
+
+Vanilla spec-kit treats `/speckit.analyze` as optional. This skill makes it **mandatory and looping**: after clarify completes, the analyze phase runs repeatedly against the spec until it finds zero ambiguities, inconsistencies, or gaps. Only then does the workflow advance to planning. This eliminates the class of bugs where an ambiguous spec produces a plausible-but-wrong plan that agents implement faithfully.
+
+### Auto-advance between phases
+
+Phases auto-chain: constitution → specify → clarify → analyze loop → plan → tasks → **stop**. The agent proceeds to the next phase automatically after each completion — except Phase 7 (implement), which requires explicit user confirmation before launching the runner.
+
 ### Spec phase (Phase 2)
 
 - **Edge case enumeration** — Every spec must include an "Edge Cases & Failure Modes" section. Without it, implementing agents encounter ambiguous situations and either guess wrong or write BLOCKED.md. With it, they have a lookup table for "what should happen when X goes wrong."
@@ -130,15 +138,7 @@ run-tasks.sh          ← Bash wrapper for parallel_runner.py
 parallel_runner.py    ← Task runner: parses task list, spawns parallel agents
 ```
 
-### Token savings by phase
-
-| Phase | Monolith (old) | Lazy-loaded (new) | Savings |
-|-------|---------------|-------------------|---------|
-| Interview (poc) | ~32k | ~5k | ~85% |
-| Interview (enterprise) | ~32k | ~12k | ~60% |
-| Plan | ~32k | ~6-10k | ~70% |
-| Tasks | ~32k | ~5k | ~85% |
-| Implement | ~32k | ~5k | ~85% |
+Typical savings: **60-90%** fewer tokens per phase for poc/local presets. Enterprise interview is the worst case since it loads nearly all reference files.
 
 ## Version
 

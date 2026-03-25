@@ -100,7 +100,7 @@ If Nix is NOT available, fall back to Docker/devcontainers. Do not block on Nix.
 | 1 | `/speckit.constitution` | Define governance principles & architectural rules |
 | 2 | `/speckit.specify` | Write a structured feature specification |
 | 3 | `/speckit.clarify` | Identify and resolve ambiguities in specs |
-| 4 | `/speckit.analyze` | Validate spec consistency (optional) |
+| 4 | `/speckit.analyze` | Validate spec consistency (loops until clean) |
 | 5 | `/speckit.plan` | Generate technical implementation plan |
 | 6 | `/speckit.tasks` | Break plan into actionable task list |
 | 7 | `/speckit.implement` | Execute tasks with TDD, phased ordering |
@@ -123,7 +123,7 @@ Read and follow `phases/install.md`.
 |----------------------|----------|-------------|-------------|
 | Task list | `specs/*/tasks.md` or `tasks.md` | Ready for Phase 7 (implement) | Check for plan |
 | Plan | `specs/*/plan.md` or `plan.md` | Ready for Phase 6 (tasks) | Check for spec |
-| Feature spec | `specs/*/spec.md` | Check for `[NEEDS CLARIFICATION]` tags → Phase 3 (clarify) or Phase 5 (plan) | Check for constitution |
+| Feature spec | `specs/*/spec.md` | Check for `[NEEDS CLARIFICATION]` tags → Phase 3 (clarify), then Phase 4 (analyze loop) → once clean, Phase 5 (plan) | Check for constitution |
 | Constitution | `.specify/memory/constitution.md` | Ready for Phase 2 (specify) | Start with Phase 1 (constitution) |
 | Interview notes | `specs/*/interview-notes.md` | Resume from where interview left off | Fresh project — start interview |
 
@@ -141,7 +141,7 @@ Present the user with their current state and next recommended step.
 | Constitution (Phase 1) | Read `.specify/commands/constitution.md` template directly. Sets architectural rules — 9 "articles" covering library-first design, test-first development, simplicity, etc. Optional but recommended. If the user already has strong opinions about architecture, capture them here. |
 | Specify (Phase 2) | `phases/interview.md` |
 | Clarify (Phase 3) | Read `.specify/commands/clarify.md` template directly. Scans for ambiguities across 11 categories, generates up to 5 prioritized questions presented one at a time, integrates answers back into the spec. |
-| Analyze (Phase 4) | Read `.specify/commands/analyze.md` template directly |
+| Analyze (Phase 4) | Read `.specify/commands/analyze.md` template directly. **Mandatory and looping** — see below. |
 | Plan (Phase 5) | `phases/plan.md` |
 | Tasks (Phase 6) | `phases/tasks.md` |
 | Implement (Phase 7) | `phases/implement.md`. Note: spec-kit's built-in `/speckit.implement` runs in a single context and will hit limits on larger projects — use the parallel runner instead. |
@@ -151,9 +151,29 @@ For each phase:
 1. Tell the user which phase you're running and why it's next
 2. Load the phase file (or command template for simple phases)
 3. Follow its instructions exactly
-4. After completing the phase, summarize what was produced and recommend the next step
+4. After completing the phase, summarize what was produced and **automatically proceed to the next phase** (see auto-advance below)
 
 **Reference files are loaded on demand by the phase files** — they tell you which reference to load and when. Never preload all references.
+
+### Auto-advance between phases
+
+After completing any phase, **automatically start the next phase** without waiting for the user to ask. The one exception: **never auto-start Phase 7 (implement)**. Instead, summarize what's ready and ask the user to confirm before launching the implementation runner.
+
+The full auto-advance chain: constitution → specify → clarify → **analyze loop** → plan → tasks → **stop and confirm** → implement.
+
+### Phase 4 (analyze) — mandatory loop until clean
+
+Phase 4 is **not optional**. After clarify (Phase 3) completes — or whenever a spec exists without `[NEEDS CLARIFICATION]` tags — run the analyze phase. This is a loop:
+
+1. Read `.specify/commands/analyze.md` and execute it against the spec
+2. If the analysis finds ambiguities, inconsistencies, or gaps:
+   - Present the findings to the user
+   - Resolve each issue (update the spec, ask the user, or clarify inline)
+   - **Run analyze again** on the updated spec
+3. Repeat until the analysis comes back clean — no ambiguities, no inconsistencies, no gaps
+4. Only then proceed to Phase 5 (plan)
+
+There is no iteration cap. The spec must be unambiguous before planning begins. Each iteration should get shorter as issues are resolved. If the same issue keeps recurring across iterations, flag it to the user as a potential design decision that needs an explicit call.
 
 ---
 
