@@ -999,6 +999,10 @@ def build_review_prompt(spec_dir: str, task_file: str, skills_dir: str,
     potentially review again (review/validate cycle).
     """
     # Determine diff scope
+    # For cycle 2+, use a delta diff (only changes since the last review
+    # commit) to avoid re-reviewing already-reviewed code.  The full phase
+    # diff is still available as a fallback command in the prompt.
+    full_base_sha = None  # base of the entire phase (for context)
     if phase:
         # Find commits for this phase's tasks
         task_ids = [t.id for t in phase.tasks]
@@ -1012,7 +1016,7 @@ def build_review_prompt(spec_dir: str, task_file: str, skills_dir: str,
             )
             commits = [c for c in result.stdout.strip().split("\n") if c]
             if commits:
-                base_sha = commits[0] + "~1"
+                full_base_sha = commits[0] + "~1"
             else:
                 raise ValueError("no phase commits found")
         except Exception:
@@ -1022,9 +1026,9 @@ def build_review_prompt(spec_dir: str, task_file: str, skills_dir: str,
                     ["git", "merge-base", "HEAD", "main"],
                     capture_output=True, text=True, timeout=10
                 )
-                base_sha = result.stdout.strip() or "HEAD~20"
+                full_base_sha = result.stdout.strip() or "HEAD~20"
             except Exception:
-                base_sha = "HEAD~20"
+                full_base_sha = "HEAD~20"
         phase_name = phase.name
         phase_slug = phase.slug
     else:
@@ -1038,7 +1042,7 @@ def build_review_prompt(spec_dir: str, task_file: str, skills_dir: str,
             )
             commits = result.stdout.strip().split("\n")
             if commits and commits[0]:
-                base_sha = commits[0] + "~1"
+                full_base_sha = commits[0] + "~1"
             else:
                 raise ValueError("no commits")
         except Exception:
@@ -1047,11 +1051,30 @@ def build_review_prompt(spec_dir: str, task_file: str, skills_dir: str,
                     ["git", "merge-base", "HEAD", "main"],
                     capture_output=True, text=True, timeout=10
                 )
-                base_sha = result.stdout.strip() or "HEAD~20"
+                full_base_sha = result.stdout.strip() or "HEAD~20"
             except Exception:
-                base_sha = "HEAD~20"
+                full_base_sha = "HEAD~20"
         phase_name = "all"
         phase_slug = "all"
+
+    # For cycle 2+, find the review commit to use as delta base
+    base_sha = full_base_sha
+    delta_mode = False
+    if review_cycle > 1 and phase:
+        try:
+            # Find the commit for the previous review record
+            prev_review = f"review #{review_cycle - 1} for {phase_slug}"
+            result = subprocess.run(
+                ["git", "log", "--all", "--oneline",
+                 f"--grep={prev_review}", "-1", "--format=%H"],
+                capture_output=True, text=True, timeout=10
+            )
+            prev_sha = result.stdout.strip()
+            if prev_sha:
+                base_sha = prev_sha
+                delta_mode = True
+        except Exception:
+            pass  # fall back to full phase diff
 
     # Read prior review findings for context (if this is cycle 2+)
     prior_reviews = ""
@@ -1097,18 +1120,56 @@ These are findings from previous review cycles. Check if your prior fixes were a
 {prior_reviews}
 """
 
-    return f"""You are a code review agent for **{phase_name}** ({phase_slug}). This is review cycle #{review_cycle}.
+    # For cycle 2+, use a compact review checklist instead of the full skill
+    # to save ~2-3K tokens per cycle.  The agent already has context from
+    # prior review records.
+    if review_cycle > 1:
+        skill_section = """## Review checklist (compact — see prior reviews for full context)
 
-## Diff scope
+Check the diff for: bugs, security vulnerabilities, incorrect logic, broken error handling, missing input validation, race conditions, resource leaks, and anything causing runtime failures or data loss.
+
+**Only fix things that are clearly wrong.** No refactoring, renaming, style, tests, comments, or docs."""
+    else:
+        skill_section = f"""## Review skill reference
+
+Follow the code review skill instructions below.
+
+---
+
+{skill_content}"""
+
+    # Build diff instructions — on cycle 2+, provide both the delta and
+    # full phase diff so the agent focuses on new changes but can see
+    # interactions with earlier code.
+    if delta_mode:
+        diff_section = f"""## Diff scope
+
+**Delta** (changes since your last review — start here):
 ```
 git diff {base_sha}...HEAD
 ```
 
-Run that command to see the changes for this phase.
+**Full phase diff** (for context on how new changes interact with earlier code):
+```
+git diff {full_base_sha}...HEAD
+```
+
+Run the delta diff first. Only consult the full diff if you need to understand how a fix interacts with surrounding phase code."""
+    else:
+        diff_section = f"""## Diff scope
+```
+git diff {base_sha}...HEAD
+```
+
+Run that command to see the changes for this phase."""
+
+    return f"""You are a code review agent for **{phase_name}** ({phase_slug}). This is review cycle #{review_cycle}.
+
+{diff_section}
 {prior_section}
 ## Review instructions
 
-Follow the code review skill instructions below. Your review is a 3-step process:
+Your review is a 3-step process:
 
 ### Step 1: Review and fix
 Review the diff and **fix directly in the code** any issues that MUST be fixed: bugs, security vulnerabilities, correctness issues, broken error handling, missing input validation, and anything that would cause runtime failures or data loss. Commit each fix with a conventional commit message.
@@ -1155,9 +1216,7 @@ Commit the review record: `docs: code review #{review_cycle} for {phase_slug}`
 - Do NOT use the Skill tool
 - The heading of `{review_file}` MUST contain either `REVIEW-CLEAN` or `REVIEW-FIXES` — the runner parses this
 
----
-
-{skill_content}
+{skill_section}
 """
 
 
@@ -1637,18 +1696,7 @@ def spawn_agent(task: Task, prompt: str, log_path: Path,
         "-p", prompt,
     ]
 
-    # Wrap in nix develop if the project has a flake.nix, so agents get
-    # the full dev environment (native deps, toolchains, etc.).
-    # Always wrap — even if runner is inside nix develop, the child env
-    # may be stripped (sandbox mode) or the runner may have been launched
-    # outside nix develop.
-    if (Path.cwd() / "flake.nix").exists() and shutil.which("nix"):
-        cmd = [
-            "nix", "--extra-experimental-features", "nix-command flakes",
-            "develop", "--command",
-        ] + claude_cmd
-    else:
-        cmd = claude_cmd
+    cmd = claude_cmd
 
     env = None
 
@@ -2448,6 +2496,18 @@ def main():
                 "  Install bwrap or use Claude's Nix package (which bundles it).",
                 file=sys.stderr,
             )
+
+    # ── Nix environment check ──
+    if (Path.cwd() / "flake.nix").exists():
+        in_nix = os.environ.get("IN_NIX_SHELL") or os.environ.get("DIRENV_DIR")
+        if not in_nix:
+            print(
+                "⚠ This project has a flake.nix but you're not inside nix develop.\n"
+                "  Agents will lack native dependencies (numpy, node, etc.).\n"
+                "  Run: nix develop --command python3 " + " ".join(sys.argv),
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # Resolve spec dirs
     if args.spec_dir:
