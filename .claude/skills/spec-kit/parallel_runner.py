@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -1125,7 +1126,7 @@ Run the build/test commands. Capture all output.
 **Fix missing tools before reporting failure.** If a build/test command fails because a tool is not installed (e.g. `eslint: command not found`, `tsc: not found`, missing npm packages), fix it:
 - Missing npm devDependency → `npm install --ignore-scripts` (then `npm rebuild <pkg>` only if native compilation needed)
 - Missing Python package → `uv add --dev <pkg>` or `uv sync --dev`
-- Missing system tool (not an npm/pip package) → add it to `flake.nix` devShell, commit the change, then write a FAIL record noting the flake.nix was updated and the runner must be restarted inside the new `nix develop` shell to pick up the change
+- Missing system tool (not an npm/pip package) → add it to `flake.nix` devShell and commit the change. The runner detects flake.nix modifications and automatically restarts inside the updated `nix develop` shell.
 - Then re-run the command. Only report a failure if the command fails AFTER dependencies are installed.
 
 **Important**: For early phases, the build/test infrastructure may not exist yet or may only cover a subset. Run what's available. If literally nothing can be validated yet, note this and pass.
@@ -1932,7 +1933,30 @@ class Runner:
         max_consecutive_noop = 5
         total_runs = 0
 
+        # Track flake.nix hash so we can re-exec if an agent modifies it
+        flake_path = Path.cwd() / "flake.nix"
+        def _flake_hash() -> str:
+            try:
+                return hashlib.sha256(flake_path.read_bytes()).hexdigest()
+            except FileNotFoundError:
+                return ""
+        flake_hash_at_start = _flake_hash()
+
         while not self._shutdown.is_set() and total_runs < self.max_runs:
+            # If an agent modified flake.nix, drain and re-exec inside
+            # the new nix develop shell so updated tools are on PATH.
+            if flake_path.exists() and _flake_hash() != flake_hash_at_start:
+                self.log("flake.nix changed — draining agents and restarting inside new nix develop shell")
+                self._draining.set()
+                self._drain_agents()
+                if self.tui:
+                    self.tui.stop()
+                os.execvp("nix", [
+                    "nix", "develop", "--command",
+                    sys.executable, *sys.argv,
+                ])
+                # execvp replaces the process — this line is never reached
+
             # Re-parse task file to pick up changes from agents
             phases, phase_deps = parse_task_file(task_file)
             # Re-scan phase validation states (validation/review/re-validation lifecycle)
