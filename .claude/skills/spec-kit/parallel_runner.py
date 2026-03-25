@@ -2164,10 +2164,15 @@ class Runner:
                 spawned += 1
                 total_runs += 1
 
-            # Clean up validating_phases for phases that have moved past initial validation
-            for slug, state in phase_states.items():
-                if state.validated and slug in validating_phases:
-                    validating_phases.discard(slug)
+            # Clean up validating_phases: remove phases whose validation
+            # agent has finished (regardless of pass/fail).  This allows
+            # re-validation after a fix task completes.
+            with self._lock:
+                running_val_slugs = {
+                    a.task.phase for a in self.agents
+                    if a.task.id.startswith("VALIDATE-")
+                }
+            validating_phases &= running_val_slugs
 
             # ── Phase-boundary code review ─────────────────────────────
             # After validation passes, spawn a review agent for the phase.
@@ -2300,11 +2305,14 @@ class Runner:
                 spawned += 1
                 total_runs += 1
 
-            # Clean up revalidating_phases
-            revalidating_phases -= {
-                slug for slug in revalidating_phases
-                if not scheduler.phase_needs_review_validation(slug)
-            }
+            # Clean up revalidating_phases: remove phases whose revalidation
+            # agent has finished, allowing re-validation after further fixes.
+            with self._lock:
+                running_reval_slugs = {
+                    a.task.phase for a in self.agents
+                    if a.task.id.startswith("REVALIDATE-")
+                }
+            revalidating_phases &= running_reval_slugs
 
             # Update TUI
             if self.tui:
