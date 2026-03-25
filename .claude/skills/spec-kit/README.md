@@ -92,19 +92,53 @@ Three tiers of security tooling, integrated into CI:
 | No migration strategy until v2 | Idempotent up/down migrations + seed scripts from day one |
 | Insecure defaults slip through | Secure by default — insecure choices require explicit informed consent |
 
-## Files in this directory
+## Architecture: lazy-loaded phases + reference files
 
-| File | Purpose |
-|------|---------|
-| `SKILL.md` | Core skill prompt — implementation requirements, workflow, and rules. Loaded by all agents. |
-| `interview-wrapper.md` | Interview-phase prompt — enterprise infrastructure decisions, security scanning tier selection, user preference capture. Loaded only during interviews. |
-| `plan-wrapper.md` | Plan-phase prompt — exhaustive architecture walkthrough with the user, technology decision checklist. Loaded only during planning. |
-| `run-tasks.sh` | Task runner script that spawns fresh agents per task with fix-validate loops |
-| `README.md` | This file — human-facing documentation |
+The skill uses a **dispatcher pattern** for token efficiency. Instead of loading ~25k tokens of enterprise knowledge into every agent context, the skill loads only what's needed for the current phase.
 
-### Why multiple files?
+```
+SKILL.md              ← Thin dispatcher (~3k tokens): preset selection, phase detection, routing
+phases/
+  install.md          ← Phase 0: install specify, init project
+  interview.md        ← Phase 2: specification interview
+  plan.md             ← Phase 5: architecture walkthrough and plan generation
+  tasks.md            ← Phase 6: task list generation
+  implement.md        ← Phase 7: runner, fix-validate loop, auto-unblocking
+reference/            ← Enterprise knowledge base, loaded on demand by phase files
+  testing.md          ← Integration testing, structured output, stub processes
+  logging.md          ← Structured logging spec
+  errors.md           ← Error hierarchy, propagation
+  config.md           ← Config management
+  security.md         ← Security baseline, scanning tiers, headers
+  shutdown.md         ← Graceful shutdown
+  health.md           ← Health checks
+  rate-limiting.md    ← Rate limiting & backpressure
+  observability.md    ← Metrics, tracing
+  migration.md        ← Migration & versioning
+  cicd.md             ← CI/CD pipeline
+  dx.md               ← Developer experience tooling
+  ui-flow.md          ← UI_FLOW.md spec
+  data-model.md       ← Data model depth
+  api-contracts.md    ← API contract depth
+  traceability.md     ← FR numbering, learnings format
+  idempotency.md      ← Idempotency & readiness checks
+  edge-cases.md       ← Edge case enumeration
+  complexity.md       ← Complexity tracking
+  phase-deps.md       ← Phase dependencies & parallelization
+presets/              ← Quality presets (poc, local, public, enterprise)
+run-tasks.sh          ← Bash wrapper for parallel_runner.py
+parallel_runner.py    ← Task runner: parses task list, spawns parallel agents
+```
 
-Token efficiency. SKILL.md (1,354 lines) contains everything implementing agents need — output format rules, testing methodology, fix-validate loop mechanics, enterprise implementation standards. The wrappers contain user-facing interview/planning guidance that implementing agents don't need. This saves ~400 tokens per implementation run without reducing output quality.
+### Token savings by phase
+
+| Phase | Monolith (old) | Lazy-loaded (new) | Savings |
+|-------|---------------|-------------------|---------|
+| Interview (poc) | ~32k | ~5k | ~85% |
+| Interview (enterprise) | ~32k | ~12k | ~60% |
+| Plan | ~32k | ~6-10k | ~70% |
+| Tasks | ~32k | ~5k | ~85% |
+| Implement | ~32k | ~5k | ~85% |
 
 ## Version
 
