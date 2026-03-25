@@ -2,6 +2,10 @@
 
 You are generating the implementation plan for a spec-kit project. Before writing `plan.md`, you MUST walk the user through every major architecture and technology decision. The user can engage deeply with each decision or say "yolo" to delegate to your best judgment.
 
+## Preset awareness
+
+Read `interview-notes.md` for the `preset:` line. Then read the corresponding preset file from `presets/<preset>.md` (relative to the spec-kit skill directory). The preset overrides the plan requirements below — it tells you which foundational phases to skip, which documentation depth to require, and which sections are optional. **Follow the preset overrides.** The checklist below is the full enterprise list; the preset narrows it.
+
 ## Your Approach
 
 1. **Read the inputs** — Read `spec.md` and `interview-notes.md` from the spec directory. These contain the requirements and all decisions made during the interview.

@@ -10,6 +10,39 @@ argument-hint: [project-name]
 
 You are helping the user work with **spec-kit** (`specify` CLI), GitHub's toolkit for Specification-Driven Development (SDD). In SDD, natural-language specifications are the primary artifact — you write detailed specs describing *what* and *why*, then generate plans, tasks, and implementation from those specs.
 
+## Project preset — PICK FIRST
+
+Before doing anything else, determine the project's quality preset. This controls how many questions you ask, which infrastructure you include, and how heavy the process is. **Ask the user to pick one** (or detect from context if they already stated it):
+
+| Preset | Use when | Questions | Infrastructure |
+|--------|----------|-----------|---------------|
+| **poc** | Throwaway prototype, speed over everything | 3-5 | None — console.log, hardcoded config, no auth/tests/CI |
+| **local** | Single-user local tool (CLI, desktop, dev tooling) | 5-10 | Light — error handling, config, basic tests |
+| **public** | Single-user but internet-exposed | 8-12 | Medium — security headers, input validation, rate limiting, CI |
+| **enterprise** | Multi-user, production, team-maintained | Exhaustive | Full — everything in this SKILL.md |
+
+**How to apply the preset:**
+
+1. Read the preset file from `presets/<preset>.md` (relative to this SKILL.md)
+2. The preset file lists overrides for each phase: what to skip, what to default, what to still ask about
+3. **The preset overrides this SKILL.md's MANDATORY tags** — if the preset says "skip", skip it even if SKILL.md says MANDATORY
+4. **This SKILL.md remains your knowledge base** — you understand all the enterprise patterns. If the user asks about something the preset skipped (e.g., "should I add logging?"), reference the relevant section here and advise. Frame it as "when you're ready to harden this" rather than blocking current progress.
+5. Record the chosen preset in `interview-notes.md` so downstream phases (plan, tasks, implement) know which preset is active
+
+**If the user doesn't pick**: After hearing the project description, **suggest the best-fit preset** with a brief pros/cons comparison of every plausible match. Example:
+
+> This sounds like a local developer tool, so I'd recommend **local**. Here's how the options compare for your project:
+>
+> | Preset | Pros | Cons |
+> |--------|------|------|
+> | **poc** | Fastest path to working code, ~3 questions | No tests, no error handling — you'll rewrite most of it |
+> | **local** (recommended) | Solid tests, good error messages, still fast | Slight overhead for config module and error hierarchy |
+> | **public** | N/A — this tool isn't network-exposed | Would add unnecessary security hardening |
+>
+> Skip presets that clearly don't apply (don't show enterprise for a throwaway script, don't show poc for a multi-user SaaS). Only show plausible matches. Let the user pick or accept your recommendation.
+
+**Upgrading later**: The user can re-run the spec-kit skill with a higher preset at any time. The agent reads the existing spec and interview-notes, identifies what the new preset adds, and walks through only the new decisions.
+
 ## Quick reference
 
 | Phase | Command | What it does |
@@ -188,7 +221,12 @@ The runner parses `tasks.md` for phases, `[P]` markers, and the Phase Dependenci
 
 **Fix-validate loop** — validation runs at phase boundaries, not per-task. When the last task in a phase completes, the agent runs the project's test suite. If it fails, the agent writes structured failure state to `validate/<phase>/<N>.md` and appends a phase-fix task (`phase3-fix1`, `phase3-fix2`, ...) to the task list. The next runner iteration picks up the fix task with fresh context and the full failure history on disk. After 10 failed fixes, the agent writes `BLOCKED.md` and the runner stops.
 
-**Automatic code review** — When the last implementation task completes, the agent appends a `REVIEW` task. The runner detects this, switches to a review-specific prompt that embeds the appropriate code-review skill (React, Node, or general), diffs all changes from the feature branch, and writes findings to `REVIEW.md` in the spec directory. The review is read-only — it reports issues but does not fix them.
+**Automatic code review** — When the last implementation task completes, the agent appends a `REVIEW` task. The runner detects this, switches to a review-specific prompt that embeds the appropriate code-review skill (React, Node, or general), diffs all changes from the feature branch, and performs a two-tier review:
+
+1. **Auto-implement necessary fixes** — bugs, security vulnerabilities, correctness issues, broken error handling, missing input validation, and anything that would cause runtime failures or data loss. The agent fixes these directly in the code and commits.
+2. **Write `REVIEW-TODO.md`** — optional improvements that are helpful but not necessary: refactoring suggestions, performance optimizations, better naming, additional test coverage, documentation gaps, code style improvements. Each item includes the file, line range, what to improve, and why. This file lives in the spec directory alongside `REVIEW.md`.
+3. **Write `REVIEW.md`** — summary of all findings: what was auto-fixed (with commit refs), what was deferred to `REVIEW-TODO.md`, and overall assessment.
+4. **Fix-validate loop** — after applying fixes, the agent runs the project's test suite. If tests fail (the review fixes broke something), the agent enters the standard fix-validate loop: read `test-logs/`, diagnose, fix, re-run. After 10 failed attempts, write `BLOCKED.md`. Tests MUST pass before the review task is marked complete.
 
 **learnings.md** — a shared memory file in the spec directory that accumulates across runs. Each agent reads it for context and appends gotchas, decisions, and patterns it discovered. This prevents repeated mistakes and keeps later agents consistent with earlier decisions.
 
@@ -1319,6 +1357,137 @@ The agentic implementation loop MUST extend to CI failures. When the implementin
 3. **Diagnose and fix**: Same fix-validate loop pattern — read failure logs, identify root cause (CI environment often differs from local), fix code or CI config, push and re-monitor
 4. **CI-specific learnings**: CI gotchas go into `learnings.md` (e.g., "CI runner uses Ubuntu, local dev is NixOS — path to tool X differs")
 5. **Failure limit**: After 3 failed CI fix attempts, write `BLOCKED.md` with CI failure details and what was tried
+
+---
+
+## Developer Experience (DX) Tooling
+
+Every project MUST ship with first-class developer experience out of the box. A new developer (or agent) should be able to clone the repo, run one command, and have a fully working development environment. No hunting for scripts, no "ask Bob how to set up the database."
+
+### One-command dev setup
+
+The project MUST have a single entry point that starts everything needed for development:
+
+- **`npm run dev`** (or equivalent: `make dev`, `just dev`, `cargo run`, etc.) — starts the dev server, watches for changes, and starts all backing services (database, cache, queue, emulators)
+- If backing services need setup first (migrations, seeding), the dev command handles it automatically (idempotent — safe to re-run)
+- The command MUST print a clear summary on startup: what's running, what ports, and how to access it
+
+### Script inventory
+
+The project's task runner (`package.json` scripts, `Makefile`, `Justfile`, `Taskfile`, etc.) MUST include all common developer workflows as named scripts. At minimum:
+
+| Script | Purpose |
+|--------|---------|
+| `dev` | Start everything for local development (server + backing services + watch mode) |
+| `test` | Run all tests |
+| `test:unit` | Run unit tests only |
+| `test:integration` | Run integration tests only |
+| `lint` | Run linter |
+| `lint:fix` | Run linter with auto-fix |
+| `typecheck` | Run type checker (if applicable — TypeScript, mypy, etc.) |
+| `build` | Production build |
+| `db:migrate` | Run database migrations (if applicable) |
+| `db:seed` | Seed the database (if applicable) |
+| `db:reset` | Drop + recreate + migrate + seed (if applicable) |
+| `codegen` | Run all code generation (Prisma, GraphQL, protobuf, OpenAPI, etc.) (if applicable) |
+| `clean` | Remove build artifacts, test-logs, temp files |
+| `clean:all` | Nuclear option — remove ALL dev state: build artifacts, test-logs, node_modules/venv, database files, generated files, dev certs, .env (back to clone-fresh). After this, `npm run dev` rebuilds everything from scratch. |
+| `check` | Run all validation: lint + typecheck + test (single command for pre-commit / CI parity) |
+
+Additional scripts as needed by the project (e.g., `emulator:start`, `storybook`, `e2e`, `deploy:preview`). Every script a developer might need should already exist — never force them to remember raw commands.
+
+### Dev server requirements
+
+The dev server MUST provide a fast, frictionless inner loop:
+
+- **Hot reload / HMR** — file changes reflect immediately without full restart. For backend servers, use file-watching restart (e.g., `nodemon`, `watchexec`, `air`). For frontend, use the framework's built-in HMR.
+- **Proxy configuration** — if the project has a separate frontend and backend, the dev server MUST proxy API requests so the developer doesn't deal with CORS in development. Document the proxy config in the README.
+- **HTTPS in development** (if the production app uses HTTPS or the project uses APIs that require it — OAuth callbacks, secure cookies, service workers) — generate self-signed dev certificates automatically on first `npm run dev`. Use `mkcert` or equivalent. Store certs in `.dev-certs/` (gitignored). If HTTPS isn't needed in dev, skip this.
+- **Port selection** — use a consistent, documented port. If the port is in use, print a clear error with the conflicting process (not just "EADDRINUSE"). Optionally auto-select the next available port.
+
+### Environment management
+
+The project MUST make environment setup frictionless:
+
+- **`.env.example`** — committed to git, contains every env var the project uses with placeholder values and comments explaining each one. Secrets get placeholder values like `your-api-key-here`. The dev command MUST check for `.env` and, if missing, copy `.env.example` to `.env` and tell the developer to fill in secrets.
+- **`.env`** — gitignored, never committed. Created from `.env.example` by the developer (or automatically by the dev command on first run).
+- **Environment isolation** — if the project uses Nix, include a `flake.nix` (or `shell.nix`) that provides all tools. If using devcontainers, include `.devcontainer/`. If using Docker Compose for backing services, include `docker-compose.yml` (or `compose.yml`). The goal: `nix develop` or `docker compose up` gives you everything.
+- **direnv integration** (optional but recommended for Nix projects) — include `.envrc` with `use flake` (or `use nix`) so environment activates automatically on `cd`. Add `.direnv/` to `.gitignore`.
+
+### Code generation
+
+If the project uses any code generation (ORM schemas, GraphQL types, protobuf stubs, OpenAPI clients, CSS modules, etc.):
+
+- **`codegen` script** — runs all generators in the correct order (e.g., Prisma generate before TypeScript compile)
+- **Generated files** — clearly marked. Either:
+  - Placed in a dedicated directory (e.g., `src/generated/`, `__generated__/`) with a `.gitignore` if generated at build time, or committed if they're part of the source tree
+  - Or prefixed with a `// @generated` comment and a `DO NOT EDIT` header
+- **Dev command integration** — if codegen output is needed for the app to run, `npm run dev` MUST run codegen automatically before starting the server
+- **Watch mode** (if applicable) — for schema-driven codegen (GraphQL, protobuf), watch the schema files and regenerate on change during development
+
+### Debugging setup
+
+The project MUST include ready-to-use debugging configurations:
+
+- **VS Code `launch.json`** — include debug configurations in `.vscode/launch.json` for:
+  - Attaching to the running dev server (Node.js: `--inspect`, Python: `debugpy`, Go: `dlv`, Rust: `lldb`)
+  - Running tests with debugger attached
+  - Running a specific test file with debugger attached
+- **Source maps** — enabled in development builds so debugger breakpoints and stack traces map to source code, not compiled output
+- **Debugger-friendly dev command** — `npm run dev` should start the server with the debugger port open (e.g., `--inspect` for Node.js) so developers can attach at any time without restarting
+- **README documentation** — brief section explaining how to debug (attach VS Code, set breakpoints, inspect variables)
+
+If the project targets multiple editors, include configurations for the most common ones. VS Code is the minimum; add JetBrains run configs (`.run/`) if the team uses IntelliJ/WebStorm.
+
+### CLAUDE.md integration
+
+The project's `CLAUDE.md` MUST include a "Development" section with:
+
+```markdown
+## Development
+
+### Quick start
+\`\`\`bash
+npm run dev  # starts everything — server, database, watch mode
+\`\`\`
+
+### Available scripts
+| Script | Purpose |
+|--------|---------|
+| `dev` | ... |
+| `test` | ... |
+(full table from the project's actual scripts)
+
+### Environment setup
+- Copy `.env.example` to `.env` and fill in secrets
+- Required tools: (list from flake.nix or package.json engines)
+```
+
+This ensures agents always know how to work with the project without guessing.
+
+### What the plan MUST include
+
+- DX tooling as a task in the foundational infrastructure phase (alongside or immediately after the build/test setup)
+- The script inventory tailored to the project's stack and needs
+- Dev server configuration (hot reload, proxy, ports)
+- Environment management setup (`.env.example`, isolation strategy)
+- Code generation pipeline (if applicable)
+- Debugging configurations
+- README and CLAUDE.md documentation for all of the above
+
+### What the spec MUST include
+
+- A functional requirement that `npm run dev` (or equivalent) boots the entire development environment
+- A functional requirement that all scripts in the inventory exist and work
+- A functional requirement that `.env.example` documents all environment variables
+- A functional requirement that debugging configurations are included and documented
+
+### Preset behavior
+
+- **POC**: `dev` script only — just start the thing. `.env.example` if env vars are used. Skip everything else.
+- **Local**: `dev`, `test`, `build`, `clean`, `check`. `.env.example`. Basic VS Code launch.json. Skip proxy, HTTPS certs, codegen unless applicable.
+- **Public**: Full inventory. `.env.example` with secret placeholders. Dev server with proxy and port management. VS Code debugging. Codegen if applicable. Skip HTTPS dev certs unless OAuth/service workers require it.
+- **Enterprise**: Everything. Full script inventory, `.env.example`, environment isolation (Nix/devcontainer/Docker Compose), HTTPS dev certs if applicable, codegen pipeline, full debugging setup for VS Code + JetBrains, CLAUDE.md development section.
 
 ---
 

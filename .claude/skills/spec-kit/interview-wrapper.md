@@ -2,6 +2,10 @@
 
 You are conducting a specification interview for a new project or feature. Your goal is to produce a comprehensive, implementation-ready specification with zero ambiguity.
 
+## Preset awareness
+
+Check `interview-notes.md` (if it exists) for a `preset:` line, or ask the user which preset they chose. Then read the corresponding preset file from `presets/<preset>.md` (relative to the spec-kit skill directory). The preset overrides the interview behavior below — it tells you what to skip, what to default without asking, how many questions to ask, and what interview style to use. **Follow the preset overrides.** The topic checklist below is the full enterprise list; the preset narrows it.
+
 ## Your Approach
 
 1. **Understand the idea** — Ask the user to describe their project/feature. Listen carefully.
@@ -111,6 +115,14 @@ For each of these topics, present the enterprise-grade default, explain why it m
 - Determine: backward compatibility promise, deprecation timeline
 - If deferred: document the strategy decision as TODO
 
+#### Branching strategy
+- **Spec-kit default**: each feature gets its own branch (`specs/<feature-name>`), with PRs back to main. This is the standard SDD workflow.
+- **Alternative**: work directly on `main`. Simpler for solo developers, POCs, or projects where feature branches add overhead without value.
+- Ask: "Do you want feature branches with PRs, or just work directly on main? Feature branches give you review checkpoints and easy rollback. Main-branch development is faster for solo work."
+- If main-branch: spec-kit's branch creation during `specify` is skipped. Implementation commits go directly to main. No PR workflow.
+- If feature-branch: follow spec-kit's default. Determine: branch naming convention, squash-merge vs merge-commit preference.
+- Document the decision — it affects how the task runner commits code and whether PR-based code review is possible.
+
 #### CI/CD pipeline
 - Ask: "Which CI platform? GitHub Actions, GitLab CI, or something else?"
 - Determine: deployment target (if any), branch protection rules
@@ -168,6 +180,17 @@ Ask: "Tier 1 is free and covers the basics. Want Tier 2 tools too? Any ecosystem
 - Present: auto-migration of config format changes between versions
 - Ask: "How important is backward compatibility for your config files?"
 
+#### Developer experience (DX) tooling
+- This is non-negotiable — every project ships with great DX. Present the full scope and confirm details:
+- **Task runner**: confirm which one (package.json scripts, Makefile, Justfile, Taskfile). Default to package.json for Node.js, Makefile for Go/C/Rust, Justfile for polyglot.
+- **One-command dev setup**: `npm run dev` (or equivalent) boots server + all backing services + watch mode. Ask: "Which backing services need to start with dev? Database, cache, queue, emulators?"
+- **Dev server**: Confirm hot reload / HMR strategy. Ask: "Separate frontend/backend? If so I'll set up API proxying so you don't deal with CORS in dev." Determine if HTTPS dev certs are needed (OAuth callbacks, secure cookies, service workers).
+- **Environment management**: `.env.example` with all vars documented, auto-copy to `.env` on first run. Ask: "Using Nix, devcontainers, or Docker Compose for environment isolation? Or just local installs?" Include direnv if Nix.
+- **Code generation**: Ask: "Does the project use any codegen? ORM schemas, GraphQL types, protobuf, OpenAPI clients?" If yes, set up `codegen` script and integrate into dev startup + watch mode.
+- **Debugging**: VS Code `launch.json` for attaching to dev server and running tests with debugger. Dev server starts with debugger port open by default. Ask: "Any other editors? JetBrains?" Add configs if so.
+- **Clean slate**: `clean` removes build artifacts. `clean:all` nukes everything — node_modules, database, generated files, dev certs — back to fresh clone state. `npm run dev` rebuilds from scratch after.
+- Ask: "Any custom developer workflows I should script? Database snapshots, deploy previews, storybook, e2e runner?"
+
 ### UI-specific topics (only if the project has a UI)
 - Screen inventory and navigation flows
 - State machines for domain objects
@@ -211,7 +234,9 @@ Document every interview decision:
 - Security: scanning tiers selected, CORS policy, headers
 - Observability: metrics lib, tracing strategy, error reporting
 - Migration: library, seed strategy, versioning approach
+- Branching: feature branches with PRs, or direct-to-main
 - CI/CD: platform, quality gates, agentic feedback loop strategy
+- DX tooling: task runner, dev server config, environment isolation, codegen, debugging setup
 - Rate limiting: strategy or "deferred with recommendation"
 - Shutdown: timeout value
 - Health checks: active vs cached probe strategy
