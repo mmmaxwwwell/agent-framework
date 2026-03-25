@@ -1,8 +1,8 @@
 # Preset: POC (Proof of Concept)
 
-**Goal**: Get a working prototype as fast as possible. Skip everything that isn't core functionality.
+**Goal**: Get a working prototype as fast as possible. Skip infrastructure and process overhead, but never skip things that help agents make informed decisions. The POC preset is the only preset that trades engineering rigor for speed — every other preset is enterprise-grade with different scope.
 
-**Design principle**: Skip infrastructure and process overhead, but never skip things that help agents make informed decisions. FR numbering, traceability, and learnings cost near-zero time but prevent agents from guessing wrong and wasting runs.
+**Design principle**: FR numbering, traceability, and learnings cost near-zero time but prevent agents from guessing wrong and wasting runs. Include them. Skip everything that adds setup time without proving the concept works.
 
 ## Interview phase overrides
 
@@ -69,3 +69,5 @@
 ## What the agent should still know
 
 The agent has the full SKILL.md loaded. It understands enterprise patterns exist. If the user asks "should I add logging?" or "what about auth?", the agent can reference the enterprise knowledge in SKILL.md and suggest the right approach — but it should frame it as "when you're ready to harden this, here's what to add" rather than blocking progress now.
+
+**Upgrading from POC**: When the user is ready to move beyond POC, recommend the **local** preset (for non-networked tools) or **public** preset (for internet-exposed apps). Both are enterprise-grade and will fill in everything POC skipped. The agent reads the existing spec and interview-notes, identifies what the new preset adds, and walks through only the new decisions.
