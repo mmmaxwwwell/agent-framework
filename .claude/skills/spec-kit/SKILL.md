@@ -1485,9 +1485,10 @@ This ensures agents always know how to work with the project without guessing.
 ### Preset behavior
 
 - **POC**: `dev` script only — just start the thing. `.env.example` if env vars are used. Skip everything else.
-- **Local**: `dev`, `test`, `build`, `clean`, `check`. `.env.example`. Basic VS Code launch.json. Skip proxy, HTTPS certs, codegen unless applicable.
-- **Public**: Full inventory. `.env.example` with secret placeholders. Dev server with proxy and port management. VS Code debugging. Codegen if applicable. Skip HTTPS dev certs unless OAuth/service workers require it.
-- **Enterprise**: Everything. Full script inventory, `.env.example`, environment isolation (Nix/devcontainer/Docker Compose), HTTPS dev certs if applicable, codegen pipeline, full debugging setup for VS Code + JetBrains, CLAUDE.md development section.
+- **Local / Public / Enterprise**: Full first-class DX. Complete script inventory, `.env.example`, environment isolation (Nix/devcontainer/Docker Compose as appropriate), codegen pipeline if applicable, VS Code debugging configs (+ JetBrains for enterprise), `clean:all`, CLAUDE.md development section. The only differences:
+  - **Local**: skip HTTPS dev certs, skip proxy config (unless the project has separate frontend/backend). Skip JetBrains configs unless user asks.
+  - **Public**: include HTTPS dev certs if OAuth/service workers require it. Include proxy config if separate frontend/backend.
+  - **Enterprise**: include everything — HTTPS dev certs, proxy, JetBrains configs, full environment isolation.
 
 ---
 
