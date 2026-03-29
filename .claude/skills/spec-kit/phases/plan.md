@@ -76,14 +76,20 @@ Present these in order. Skip items marked N/A in the spec.
 - **Security headers** — Present the baseline set, note any project-specific additions
 - **Graceful shutdown** — Confirm timeout, present the cleanup order for this specific project
 - **Health checks** — Confirm active vs. cached probes, dependency list
+- **Loading/initialization states** — For every async startup operation (model loading, dependency downloading, connection establishment, service discovery), plan the UI states the user sees. Define the state machine: what triggers each transition, what the user sees at each state, what happens on failure. The user should NEVER see a "ready" state while initialization is in progress, and should NEVER see a raw crash during startup — always an actionable error message.
 
 ### Testing strategy
 - **Test runner** — Native test runner, Jest, Vitest, pytest, etc.
 - **Code coverage** — Coverage tool (c8, vitest coverage, jest --coverage, pytest-cov, etc.), wired into the default test command so every run collects coverage. See `reference/testing.md` § Code coverage collection.
 - **Custom reporter** — For structured test output (required by fix-validate loop)
-- **Test tiers** — Unit, integration, contract, e2e — what goes where
-- **Test fixtures** — Real servers, test databases, mock boundaries
-- **Concurrency** — Parallel unit tests, sequential integration tests
+- **Test tiers** — Unit, integration (per-boundary), user-flow integration (end-to-end chain), contract — what goes where
+- **User-flow test plan** — For each primary user flow in the spec, identify: the chain of boundaries crossed, the injectable seams for deterministic input (fixture files, pre-cached resources, test data), and the observable output to verify. See `reference/testing.md` § "User-flow integration tests". This plan ensures implementing agents know WHAT flows to test and HOW to make them deterministic.
+- **Test fixtures** — Real servers, test databases, audio/media fixtures, pre-cached model files — whatever the user-flow tests need for deterministic input without mocking boundaries
+- **First-run testing** — Plan how to test cold-start scenarios (empty caches, no downloaded resources, first-time config creation). Identify which flows have first-run behavior and what fixtures/cleanup is needed.
+- **Packaging tests** — If the project produces a distributable artifact: plan how to install-and-test in a clean environment. Identify files that must be bundled, dependencies that must be declared, and paths that must be relative (not absolute dev paths). See Pattern 7 in `reference/testing.md`.
+- **Dependency compatibility** — If the project uses ML models, versioned binary assets, or native extensions: plan version pinning strategy and interface verification tests. Identify which dependencies have breaking changes across versions (model input schemas, removed APIs, missing wheels). See Pattern 8.
+- **Cross-application integration** — If the project integrates with another app: identify the real delivery mechanism (public API, clipboard, IPC, file system) and plan tests for it. Document sandbox limitations early — don't discover them during implementation. See Pattern 9.
+- **Concurrency** — Parallel unit tests, sequential integration tests, sequential user-flow tests
 
 ### CI/CD
 - **Pipeline structure** — Confirm stages from interview
@@ -113,6 +119,11 @@ Present these in order. Skip items marked N/A in the spec.
 - **Semver policy** — How agents determine patch/minor/major
 - **Changelog** — Auto-generated or manual
 
+### Post-implementation validation strategy
+- **Build and install command** — The exact command to build the distributable artifact and install it outside the dev workspace. This must be documented so the smoke test agent can execute it.
+- **Primary user flows** — List every flow that the smoke test agent will exercise. Each flow should have: entry point, expected state transitions, expected final result. This becomes the smoke test checklist.
+- **CI/CD pipeline access** — Confirm the agent can use `gh` CLI to monitor CI runs, read failure logs, and push fixes. Confirm the CI workflow file path and trigger conditions.
+
 ---
 
 ## Constitution compliance check
@@ -133,6 +144,7 @@ After all decisions are made but before writing the plan:
 | Plan section | Reference file | Load BEFORE writing |
 |-------------|---------------|---------------------|
 | Test infrastructure / fix-validate strategy | `reference/testing.md` | Phase 1 plan section |
+| User-flow integration test plan | `reference/testing.md` § "User-flow integration tests" | Testing strategy section — map each user flow to its boundary chain, injectable seams, and observable output |
 | Foundational infrastructure: logging | `reference/logging.md` | Phase 2 logging task description |
 | Foundational infrastructure: error handling | `reference/errors.md` | Phase 2 error handling task description |
 | Foundational infrastructure: config | `reference/config.md` | Phase 2 config task description |

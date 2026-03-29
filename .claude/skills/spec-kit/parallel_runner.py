@@ -79,6 +79,7 @@ class AgentSlot:
     log_file: Optional[Path] = None
     exit_code: Optional[int] = None
     status: str = "starting"  # starting, running, done, failed, rate_limited
+    attempt: int = 1  # which attempt this is for the task (1 = first try)
 
 
 # ── Task file parser ───────────────────────────────────────────────────
@@ -95,6 +96,8 @@ DEPENDENCY_SECTION_RE = re.compile(r'^##\s+(?:Phase\s+)?Dependencies', re.IGNORE
 # Phase reference: "Phase 2b (Retro Wiring)" → captures "2b"
 _PHASE_REF_RE = re.compile(r'Phase\s+(\d+[a-zA-Z]?|[A-Za-z][\w-]*)(?:\s*\([^)]*\))?')
 _ARROW_RE = re.compile(r'\s*(?:──?▶|->|→)\s*')
+# Task ID reference: "T019" or "T019-T027" — captures the first task ID
+_TASK_REF_RE = re.compile(r'T(\d+)(?:-T\d+)?')
 
 
 
@@ -127,6 +130,7 @@ def parse_task_file(path: Path) -> tuple[list[Phase], dict[str, list[str]]]:
     raw_deps: list[tuple[str, str]] = []  # (src_key, dst_key) from dep section
     current_phase: Optional[Phase] = None
     in_dep_section = False
+    last_dep_dst: Optional[str] = None  # for continuation lines
 
     for i, line in enumerate(lines):
         # Detect dependency section
@@ -140,18 +144,52 @@ def parse_task_file(path: Path) -> tuple[list[Phase], dict[str, list[str]]]:
             if re.match(r'^##(?!#)\s', line):
                 in_dep_section = False
             else:
+                # Skip code fence markers, blank lines, and non-dependency subsections
+                stripped = line.strip()
+                if stripped.startswith('```') or not stripped:
+                    continue
+                # Stop parsing at non-dependency subsections (e.g. "Parallel Agent Strategy")
+                if re.match(r'^###\s', line) and 'depend' not in line.lower():
+                    in_dep_section = False
+                    continue
+                # Only parse lines that contain Phase references or look like
+                # dep declarations (have parens with Phase labels).
+                # Skip lines that are just task ID chains without Phase labels
+                # (e.g., "Agent A: T001→T006 → T007→T011")
+                if 'Phase' not in line and '(' not in line:
+                    continue
                 # Split line on arrows to get segments, then extract phase refs
                 # Handles: Phase 1 ──▶ Phase 2 (foo) ──▶ Phase 3
                 # Handles: Phase 6 + Phase 7 + Phase 8 ──▶ Phase 9
+                # Handles: continuation lines like "                → Phase 5"
+                #   (empty src → use last_dep_dst as source)
+                # Handles: task ID refs like "T019-T027 → T045 (Phase 10)"
+                #   (resolve task IDs to their phase)
                 segments = _ARROW_RE.split(line)
                 if len(segments) >= 2:
                     for j in range(len(segments) - 1):
-                        # Source segment may have "+" joined phases
-                        src_ids = _PHASE_REF_RE.findall(segments[j])
-                        dst_ids = _PHASE_REF_RE.findall(segments[j + 1])
-                        # Each dst is the first phase ref in the next segment
+                        src_segment = segments[j]
+                        dst_segment = segments[j + 1]
+
+                        # Extract phase refs from source — try Phase N first,
+                        # then fall back to task ID → phase lookup
+                        src_ids = _PHASE_REF_RE.findall(src_segment)
+                        if not src_ids:
+                            # Try task IDs: "T019-T027 + T039-T044"
+                            task_ids = _TASK_REF_RE.findall(src_segment)
+                            src_ids = [f"__task__T{tid}" for tid in task_ids]
+                        if not src_ids and last_dep_dst:
+                            # Continuation line: empty src → use last destination
+                            src_ids = [last_dep_dst]
+
+                        dst_ids = _PHASE_REF_RE.findall(dst_segment)
+                        if not dst_ids:
+                            task_ids = _TASK_REF_RE.findall(dst_segment)
+                            dst_ids = [f"__task__T{tid}" for tid in task_ids]
+
                         if dst_ids:
                             dst = dst_ids[0]
+                            last_dep_dst = dst
                             for src in src_ids:
                                 raw_deps.append((src, dst))
                 continue
@@ -195,14 +233,21 @@ def parse_task_file(path: Path) -> tuple[list[Phase], dict[str, list[str]]]:
     # Build lookup: phase number -> actual slug, and raw key -> actual slug
     num_to_slug: dict[str, str] = {}
     key_to_slug: dict[str, str] = {}
+    task_to_phase: dict[str, str] = {}  # task ID -> phase slug
     for p in phases:
         num = _extract_phase_number(p.slug)
         if num:
             num_to_slug[num] = p.slug
         key_to_slug[p.slug] = p.slug
+        for t in p.tasks:
+            task_to_phase[t.id] = p.slug
 
     def resolve_key(key: str) -> Optional[str]:
-        """Resolve a dependency key (e.g. '2', 'phase2', 'phase-2-core') to an actual phase slug."""
+        """Resolve a dependency key (e.g. '2', 'phase2', 'phase-2-core', '__task__T019') to an actual phase slug."""
+        # Task ID reference from dep parsing
+        if key.startswith("__task__"):
+            tid = key[len("__task__"):]
+            return task_to_phase.get(tid)
         if key in key_to_slug:
             return key
         # Try as a bare number
@@ -217,13 +262,15 @@ def parse_task_file(path: Path) -> tuple[list[Phase], dict[str, list[str]]]:
             return num_to_slug[num]
         return None
 
-    # Resolve raw deps into actual phase slugs
+    # Resolve raw deps into actual phase slugs (deduplicate, remove self-deps)
     phase_deps: dict[str, list[str]] = {}
     for src_key, dst_key in raw_deps:
         src_slug = resolve_key(src_key)
         dst_slug = resolve_key(dst_key)
-        if src_slug and dst_slug:
-            phase_deps.setdefault(dst_slug, []).append(src_slug)
+        if src_slug and dst_slug and src_slug != dst_slug:
+            deps = phase_deps.setdefault(dst_slug, [])
+            if src_slug not in deps:
+                deps.append(src_slug)
 
     # Infer phase dependencies from ordering if no explicit dep section
     if not phase_deps and len(phases) > 1:
@@ -549,8 +596,9 @@ def render_dependency_graph(phases: list[Phase], phase_deps: dict[str, list[str]
         agent_strs = []
         for a in agents:
             elapsed = int(time.time() - a.start_time) if a.start_time else 0
+            att = f" att#{a.attempt}" if a.attempt > 1 else ""
             agent_strs.append(
-                f"{STATUS_COLORS[TaskStatus.RUNNING]}Agent {a.agent_id}: {a.task.id} ({elapsed}s){RESET}"
+                f"{STATUS_COLORS[TaskStatus.RUNNING]}Agent {a.agent_id}: {a.task.id}{att} ({elapsed}s){RESET}"
             )
         header.append(f" Running: {' │ '.join(agent_strs)}")
 
@@ -785,7 +833,8 @@ class TUI:
         """Build rendered lines for a single agent pane."""
         pane_lines = []
         elapsed = int(time.time() - agent.start_time) if agent.start_time else 0
-        header = f"Agent {agent.agent_id}: {agent.task.id} ({agent.status}, {elapsed}s)"
+        att = f" att#{agent.attempt}" if agent.attempt > 1 else ""
+        header = f"Agent {agent.agent_id}: {agent.task.id}{att} ({agent.status}, {elapsed}s)"
         pane_lines.append(f"{BOLD}{header[:pane_width]}{RESET}")
         pane_lines.append("─" * pane_width)
 
@@ -846,7 +895,8 @@ class HeadlessLogger:
         lines.append(f"\nRunning agents: {len(agents)}")
         for a in agents:
             elapsed = int(time.time() - a.start_time) if a.start_time else 0
-            lines.append(f"  Agent {a.agent_id}: {a.task.id} ({a.status}, {elapsed}s)")
+            att = f" att#{a.attempt}" if a.attempt > 1 else ""
+            lines.append(f"  Agent {a.agent_id}: {a.task.id}{att} ({a.status}, {elapsed}s)")
 
         with open(status_file, "w") as f:
             f.write("\n".join(lines) + "\n")
@@ -856,7 +906,7 @@ class HeadlessLogger:
 
 def build_prompt(task_file: str, spec_dir: str, learnings_file: str,
                  constitution: str, reference_files: list[str],
-                 task: Task) -> str:
+                 task: Task, attempt_history: Optional[list[dict]] = None) -> str:
     """Build the agent prompt, targeting a specific task."""
 
     manifest_lines = []
@@ -963,7 +1013,52 @@ Append any useful discoveries to `{learnings_file}`.
 1. In `{task_file}`, change task {task.id}'s `- [ ]` to `- [x]`
 2. Commit all changes with a conventional commit message including the task ID (e.g., `feat({task.id}): ...`)
 
-## Rules
+"""
+
+    # ── Prior attempt history ──────────────────────────────────────────
+    if attempt_history:
+        prompt += f"\n## Prior attempts for {task.id}\n\n"
+        prompt += f"This task has been attempted **{len(attempt_history)} time(s)** before by other agents that crashed (usually API connection errors). Learn from their progress:\n\n"
+
+        # Summarize patterns
+        wrote_code = [a for a in attempt_history if a.get("progress") == "wrote_code"]
+        conn_errors = [a for a in attempt_history if "API Error" in a.get("error", "") or "connect" in a.get("error", "").lower()]
+
+        if wrote_code:
+            all_written = []
+            for a in wrote_code:
+                all_written.extend(a.get("files_written", []))
+            unique_written = list(dict.fromkeys(all_written))
+            prompt += f"**Code was already written** by prior agents: {', '.join(unique_written)}. Check if these files exist and are complete before rewriting.\n\n"
+
+        if conn_errors:
+            # Find the tool that was running when connection died
+            crash_tools = [a.get("last_tool", "?") for a in conn_errors if a.get("last_tool")]
+            prompt += f"**Connection errors killed prior agents.** They crashed during: {', '.join(crash_tools[-5:])}. "
+            # Check if they all crash during network-heavy ops
+            network_ops = [t for t in crash_tools if any(kw in t.lower() for kw in ["go test", "go build", "git clone", "go mod", "npm", "cargo"])]
+            if len(network_ops) > len(crash_tools) // 2:
+                prompt += "Most crashes happened during network-dependent build/test commands. "
+                prompt += "If builds fail due to missing deps, try `go mod vendor` or equivalent offline strategies. "
+                prompt += "If the task code is already written and tests can't run due to connection issues, verify the code compiles (`go vet`, `go build`) and mark the task complete — phase validation will run tests later.\n\n"
+            else:
+                prompt += "\n\n"
+
+        prompt += "**Last 3 attempts:**\n"
+        for a in attempt_history[-3:]:
+            prompt += f"- Agent {a['agent']}: {a['progress']}, {a['tool_count']} tools, {a['duration_s']}s"
+            if a.get("files_written"):
+                prompt += f", wrote: {', '.join(a['files_written'])}"
+            if a.get("error"):
+                prompt += f", died: {a['error'][:80]}"
+            prompt += "\n"
+
+        prompt += f"""
+**If you determine this task cannot complete right now** (e.g., network deps unavailable, resource contention with concurrent agents), write a short explanation to `DEFER-{task.id}.md` and stop. The runner will retry this task when fewer agents are running.
+
+"""
+
+    prompt += f"""## Rules
 
 - Execute your assigned task ({task.id}) ONLY, then stop
 - Do NOT skip ahead to later phases
@@ -1155,7 +1250,7 @@ Also check for a **Checkpoint** line at the end of the phase in `{task_file}`.
 
 Run the build/test commands. Capture all output.
 
-**Code coverage is mandatory.** The test command MUST collect coverage (e.g. `c8` for Node native runner, `--coverage` for Jest/Vitest, `--cov` for pytest). If the project's test command does not include coverage flags, fix the test script in `package.json`/`CLAUDE.md`/equivalent to add them before running. Coverage output must appear in the terminal so it's visible in logs.
+**Code coverage is mandatory for every test suite in the project.** If the project's test commands do not already collect coverage, fix them — add the standard coverage tool for that language/framework (every mainstream ecosystem has one) and wire it into the test command. Coverage MUST produce both terminal output and a file report in `coverage/` (JSON, XML, LCOV, or equivalent). See `reference/testing.md` § Code coverage collection for details.
 
 **Fix missing tools before reporting failure.** If a build/test command fails because a tool is not installed (e.g. `eslint: command not found`, `tsc: not found`, missing npm packages), YOU MUST install it — do not skip it or call it a "pre-existing issue":
 - Missing npm package (referenced in scripts but not in devDependencies) → `npm install --save-dev <package> --ignore-scripts` to add it, then `npm rebuild <pkg>` only if native compilation needed
@@ -1311,7 +1406,7 @@ class _AllowlistProxy:
         self._server.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
         self._server.bind(("127.0.0.1", 0))  # OS picks a free port.
         self.port = self._server.getsockname()[1]
-        self._server.listen(32)
+        self._server.listen(256)
         self._server.settimeout(1.0)
         self._thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._thread.start()
@@ -1341,7 +1436,7 @@ class _AllowlistProxy:
 
     def _handle(self, client: _socket.socket):
         try:
-            client.settimeout(30)
+            client.settimeout(120)
             # Read the CONNECT request line.
             data = b""
             while b"\r\n\r\n" not in data and len(data) < 8192:
@@ -1750,6 +1845,280 @@ def check_rate_limited(stderr_path: Path) -> bool:
         return False
 
 
+def check_connection_error(log_path: Path) -> Optional[str]:
+    """Check if the agent died from an API connection error.
+
+    Returns the error string if found, None otherwise.
+    Reads the jsonl result line — these errors appear there, not in stderr.
+    """
+    try:
+        for raw_line in reversed(log_path.read_text().splitlines()):
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                msg = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("type") == "result" and msg.get("is_error"):
+                result_text = msg.get("result", "")
+                if re.search(r'UND_ERR_SOCKET|ECONNRESET|ECONNREFUSED|ETIMEDOUT|Unable to connect to API', result_text):
+                    return result_text
+        return None
+    except Exception:
+        return None
+
+
+def extract_attempt_summary(log_path: Path) -> dict:
+    """Extract a structured summary of what an agent attempted from its jsonl log.
+
+    Returns a dict suitable for writing to the attempt log:
+      tool_sequence, files_written, files_read, last_tool, error, progress_stage
+    """
+    tools: list[str] = []
+    files_written: list[str] = []
+    files_read: list[str] = []
+    last_tool = ""
+    error = ""
+    num_tool_calls = 0
+
+    try:
+        for raw_line in log_path.read_text().splitlines():
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                msg = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+
+            if msg.get("type") == "assistant":
+                content = msg.get("message", {}).get("content", [])
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "tool_use":
+                        name = block.get("name", "?")
+                        inp = block.get("input", {})
+                        num_tool_calls += 1
+                        if name in ("Write",):
+                            fp = inp.get("file_path", "")
+                            files_written.append(fp.split("/")[-1])
+                            last_tool = f"Write({fp.split('/')[-1]})"
+                        elif name == "Edit":
+                            fp = inp.get("file_path", "")
+                            files_written.append(fp.split("/")[-1])
+                            last_tool = f"Edit({fp.split('/')[-1]})"
+                        elif name == "Read":
+                            fp = inp.get("file_path", "")
+                            files_read.append(fp.split("/")[-1])
+                            last_tool = f"Read({fp.split('/')[-1]})"
+                        elif name == "Bash":
+                            cmd = inp.get("command", "")[:80]
+                            last_tool = f"Bash({cmd})"
+                        else:
+                            last_tool = name
+                        tools.append(last_tool)
+                    elif block.get("type") == "text":
+                        text = block.get("text", "")
+                        if re.search(r'Error|error', text) and "API Error" in text:
+                            error = text[:200]
+
+            elif msg.get("type") == "result" and msg.get("is_error"):
+                error = msg.get("result", "")[:200]
+
+    except Exception:
+        pass
+
+    # Determine progress stage
+    if files_written:
+        progress = "wrote_code"
+    elif num_tool_calls > 15:
+        progress = "exploring"
+    elif num_tool_calls > 5:
+        progress = "reading_context"
+    else:
+        progress = "startup"
+
+    return {
+        "tool_count": num_tool_calls,
+        "files_written": list(dict.fromkeys(files_written)),  # dedupe, preserve order
+        "files_read": list(dict.fromkeys(files_read)),
+        "last_tool": last_tool,
+        "error": error,
+        "progress": progress,
+    }
+
+
+def write_attempt_record(spec_dir: str, task_id: str, agent_id: int,
+                         duration_s: int, summary: dict):
+    """Append an attempt record to {spec_dir}/attempts/{task_id}.jsonl."""
+    attempts_dir = Path(spec_dir) / "attempts"
+    attempts_dir.mkdir(parents=True, exist_ok=True)
+    record = {
+        "agent": agent_id,
+        "timestamp": datetime.now().isoformat(),
+        "duration_s": duration_s,
+        **summary,
+    }
+    with open(attempts_dir / f"{task_id}.jsonl", "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def read_attempt_history(spec_dir: str, task_id: str) -> list[dict]:
+    """Read all prior attempt records for a task."""
+    path = Path(spec_dir) / "attempts" / f"{task_id}.jsonl"
+    if not path.exists():
+        return []
+    records = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line:
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return records
+
+
+def check_deferred(task_id: str) -> bool:
+    """Check if a DEFER file exists for this task."""
+    return Path(f"DEFER-{task_id}.md").exists()
+
+
+def clear_deferred(task_id: str):
+    """Remove the DEFER file for a task."""
+    p = Path(f"DEFER-{task_id}.md")
+    if p.exists():
+        p.unlink()
+
+
+def check_circuit_breaker(spec_dir: str, window_minutes: int = 10,
+                          threshold: int = 3) -> Optional[int]:
+    """Check if recent attempts across all tasks are all connection errors.
+
+    Returns seconds to wait if circuit is tripped, None otherwise.
+    Looks at the last `threshold` attempts within `window_minutes` across
+    ALL tasks. If all of them are connection errors, trip the breaker.
+    """
+    attempts_dir = Path(spec_dir) / "attempts"
+    if not attempts_dir.is_dir():
+        return None
+
+    cutoff = datetime.now().timestamp() - (window_minutes * 60)
+    recent: list[dict] = []
+
+    for f in attempts_dir.glob("*.jsonl"):
+        for line in f.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                # Parse timestamp
+                ts = datetime.fromisoformat(record.get("timestamp", "")).timestamp()
+                if ts >= cutoff:
+                    recent.append(record)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+    if len(recent) < threshold:
+        return None
+
+    # Sort by timestamp descending, check last N
+    recent.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
+    last_n = recent[:threshold]
+
+    all_conn_errors = all(
+        re.search(r'UND_ERR_SOCKET|ECONNRESET|ECONNREFUSED|ETIMEDOUT|Unable to connect to API',
+                  r.get("error", ""))
+        for r in last_n
+    )
+
+    if all_conn_errors:
+        return 300  # wait 5 minutes
+    return None
+
+
+def should_use_retry_prompt(history: list[dict]) -> bool:
+    """Determine if a task should get a lightweight retry prompt.
+
+    True when: code was already written by a prior agent AND
+    the last 2+ failures were connection errors (not code bugs).
+    """
+    if len(history) < 2:
+        return False
+
+    # Check if any attempt wrote code
+    any_wrote_code = any(h.get("progress") == "wrote_code" for h in history)
+    if not any_wrote_code:
+        return False
+
+    # Check last 2 attempts were connection errors
+    last_two = history[-2:]
+    return all(
+        re.search(r'UND_ERR_SOCKET|ECONNRESET|ECONNREFUSED|ETIMEDOUT|Unable to connect to API',
+                  h.get("error", ""))
+        for h in last_two
+    )
+
+
+def build_retry_prompt(task_file: str, spec_dir: str, learnings_file: str,
+                       task: Task, history: list[dict]) -> str:
+    """Build a minimal prompt for retrying a task where code is already written.
+
+    Skips the full context-reading phase. Tells the agent to verify existing
+    code compiles/passes and mark the task complete.
+    """
+    # Collect files written by prior agents
+    all_written = []
+    for h in history:
+        all_written.extend(h.get("files_written", []))
+    unique_written = list(dict.fromkeys(all_written))
+
+    nix_note = ""
+    if (Path.cwd() / "flake.nix").exists():
+        nix_note = """
+**Environment**: This project uses Nix (`flake.nix`). Your PATH already includes all tools from the nix devshell — run commands directly. Do NOT prefix commands with `nix develop --command`.
+"""
+
+    prompt = f"""You are a retry agent. A prior agent already implemented task **{task.id}** but crashed from an API connection error before it could verify and mark complete.
+{nix_note}
+## Your job
+
+1. Check that the implementation files exist: {', '.join(unique_written) if unique_written else '(check git diff or git status for recent changes)'}
+2. Read `CLAUDE.md` for build/test commands
+3. Try to compile: `go build ./...` or equivalent
+4. If it compiles, run a quick test: `go test -short ./...` or equivalent for the relevant package
+5. If tests pass (or the only failures are unrelated to this task), mark the task complete
+6. If the code is broken or incomplete, fix it
+
+## Marking complete
+
+1. In `{task_file}`, change task {task.id}'s `- [ ]` to `- [x]`
+2. Commit with: `feat({task.id}): ...`
+3. Append any discoveries to `{learnings_file}`
+
+## If build/test can't run
+
+If dependencies can't be fetched (network issues), but the code looks correct:
+- Verify with `go vet ./...` (no network needed)
+- If vet passes and the code looks complete, mark complete — phase validation will run full tests later
+
+## Do NOT
+
+- Re-read the spec, plan, or data-model — you don't need them
+- Rewrite code that already exists
+- Explore the codebase extensively
+- Write to `DEFER-{task.id}.md` unless the code genuinely doesn't exist
+
+**This is attempt #{len(history) + 1}.** Prior agents crashed from connection errors, not code bugs. Be fast and focused.
+"""
+    return prompt
+
+
 # ── Main orchestrator ─────────────────────────────────────────────────
 
 class Runner:
@@ -1768,7 +2137,7 @@ class Runner:
         self._shutdown = threading.Event()
         self._draining = threading.Event()  # First Ctrl-C: finish running agents, don't spawn new ones
         self.agents: list[AgentSlot] = []
-        self.agent_counter = 0
+        self.agent_counter = self._find_max_agent_id()
         self._lock = threading.Lock()
 
         self.logger: Optional[HeadlessLogger] = None
@@ -1778,6 +2147,18 @@ class Runner:
             self.logger = HeadlessLogger(self.log_dir / f"parallel-{self.timestamp}")
         else:
             pass  # TUI created per-feature
+
+    def _find_max_agent_id(self) -> int:
+        """Resume agent numbering from the highest existing ID in the logs dir."""
+        max_id = 0
+        try:
+            for f in self.log_dir.iterdir():
+                m = re.match(r"agent-(\d+)-", f.name)
+                if m:
+                    max_id = max(max_id, int(m.group(1)))
+        except OSError:
+            pass
+        return max_id
 
     def log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -1910,6 +2291,7 @@ class Runner:
                 pass
 
     def _run_feature(self, spec_dir: str):
+        self._current_spec_dir = spec_dir  # for _poll_agents attempt tracking
         task_file = Path(spec_dir) / "tasks.md"
         learnings_file = Path(spec_dir) / "learnings.md"
         constitution = Path(".specify/memory/constitution.md")
@@ -2038,6 +2420,22 @@ class Runner:
                 current_running = len(self.agents)
             available_slots = self.max_parallel - current_running
 
+            # ── Circuit breaker ────────────────────────────────────────
+            # If recent attempts are all connection errors, pause instead
+            # of burning through agents for nothing.
+            breaker_wait = check_circuit_breaker(spec_dir)
+            if breaker_wait and available_slots > 0:
+                with self._lock:
+                    if not self.agents:  # only pause when no agents running
+                        self.log(f"Circuit breaker tripped — last 3 attempts were connection errors. Waiting {breaker_wait // 60}m...")
+                        # Sleep in small increments so we can respond to shutdown
+                        for _ in range(breaker_wait):
+                            if self._shutdown.is_set():
+                                break
+                            time.sleep(1)
+                        self.log("Circuit breaker cooldown complete, resuming")
+                        continue  # re-enter main loop
+
             # Spawn new agents for ready tasks
             spawned = 0
             for task in ready:
@@ -2046,10 +2444,32 @@ class Runner:
                 if task.id in running_ids:
                     continue
 
-                prompt = build_prompt(
-                    str(task_file), spec_dir, str(learnings_file),
-                    str(constitution), reference_files, task
-                )
+                # Check if task is deferred — only run when it's the sole agent
+                if check_deferred(task.id):
+                    with self._lock:
+                        other_running = len([a for a in self.agents if a.task.id != task.id])
+                    if other_running > 0:
+                        continue  # skip until we're the only agent
+                    else:
+                        clear_deferred(task.id)
+                        self.log(f"Running deferred task {task.id} (solo slot)")
+
+                history = read_attempt_history(spec_dir, task.id)
+
+                # Use lightweight retry prompt when code exists but agents
+                # keep dying from connection errors
+                if history and should_use_retry_prompt(history):
+                    prompt = build_retry_prompt(
+                        str(task_file), spec_dir, str(learnings_file),
+                        task, history
+                    )
+                    self.log(f"Using lightweight retry prompt for {task.id} (code already written)")
+                else:
+                    prompt = build_prompt(
+                        str(task_file), spec_dir, str(learnings_file),
+                        str(constitution), reference_files, task,
+                        attempt_history=history if history else None
+                    )
 
                 self.agent_counter += 1
                 agent_id = self.agent_counter
@@ -2057,7 +2477,9 @@ class Runner:
                 log_path = self.log_dir / f"agent-{agent_id}-{task.id}-{self.timestamp}.jsonl"
                 stderr_path = self.log_dir / f"agent-{agent_id}-{task.id}-{self.timestamp}.stderr"
 
-                self.log(f"Spawning Agent {agent_id} for task {task.id}: {task.description[:60]}")
+                attempt_num = len(history) + 1 if history else 1
+                att_str = f" (attempt #{attempt_num})" if attempt_num > 1 else ""
+                self.log(f"Spawning Agent {agent_id} for task {task.id}{att_str}: {task.description[:60]}")
 
                 proc = spawn_agent(task, prompt, log_path, stderr_path)
 
@@ -2069,6 +2491,7 @@ class Runner:
                     start_time=time.time(),
                     log_file=log_path,
                     status="running",
+                    attempt=attempt_num,
                 )
 
                 with self._lock:
@@ -2244,14 +2667,30 @@ class Runner:
                     stderr_path = self.log_dir / f"agent-{agent.agent_id}-{agent.task.id}-{self.timestamp}.stderr"
 
                     if rc == 0:
-                        agent.status = "done"
-                        self.log(f"Agent {agent.agent_id} ({agent.task.id}) completed successfully")
+                        # Check if agent wrote a DEFER file instead of completing
+                        if check_deferred(agent.task.id):
+                            agent.status = "deferred"
+                            self.log(f"Agent {agent.agent_id} ({agent.task.id}) deferred — will retry when solo")
+                        else:
+                            agent.status = "done"
+                            self.log(f"Agent {agent.agent_id} ({agent.task.id}) completed successfully")
                     elif check_rate_limited(stderr_path):
                         agent.status = "rate_limited"
                         self.log(f"Agent {agent.agent_id} ({agent.task.id}) rate limited — will retry")
+                    elif agent.log_file and check_connection_error(agent.log_file):
+                        agent.status = "connection_error"
+                        conn_err = check_connection_error(agent.log_file)
+                        self.log(f"Agent {agent.agent_id} ({agent.task.id}) connection error: {conn_err[:60]}")
                     else:
                         agent.status = "failed"
                         self.log(f"Agent {agent.agent_id} ({agent.task.id}) failed (exit {rc})")
+
+                    # Write attempt record for non-VR tasks
+                    spec_dir = getattr(self, '_current_spec_dir', '')
+                    if spec_dir and not agent.task.id.startswith("VR-"):
+                        duration_s = int(time.time() - agent.start_time)
+                        summary = extract_attempt_summary(agent.log_file) if agent.log_file else {}
+                        write_attempt_record(spec_dir, agent.task.id, agent.agent_id, duration_s, summary)
 
                     finished.append(agent)
 
@@ -2260,12 +2699,18 @@ class Runner:
                 with self._lock:
                     self.agents = [a for a in self.agents if a not in finished]
 
-                # Handle rate-limited agents — wait and re-queue
+                # Handle retryable agents
                 for agent in finished:
                     if agent.status == "rate_limited":
                         self.log(f"Rate limited on {agent.task.id}. Waiting 60s before retry...")
                         time.sleep(60)
                         # Task stays PENDING, will be picked up next iteration
+                    elif agent.status == "connection_error":
+                        # Task stays PENDING — attempt history will guide the next agent
+                        self.log(f"Connection error on {agent.task.id} — will retry with attempt history")
+                    elif agent.status == "deferred":
+                        # Task stays PENDING — defer check in spawn loop will hold it
+                        pass
 
                 # Update TUI
                 if self.tui:
@@ -2373,11 +2818,13 @@ def main():
         if not in_nix:
             print(
                 "⚠ This project has a flake.nix but you're not inside nix develop.\n"
-                "  Agents will lack native dependencies (numpy, node, etc.).\n"
-                "  Run: nix develop --command python3 " + " ".join(sys.argv),
+                "  Re-entering inside nix develop shell...",
                 file=sys.stderr,
             )
-            sys.exit(1)
+            os.execvp("nix", [
+                "nix", "develop", "--command",
+                sys.executable, *sys.argv,
+            ])
 
     # Resolve spec dirs
     if args.spec_dir:

@@ -197,6 +197,83 @@ Common scenarios that agents MUST handle without writing BLOCKED.md:
 - **Dependency version mismatch**: Update the lockfile or `flake.nix` pins, resolve the conflict.
 - **Missing project dependency**: Add to `package.json` / `pyproject.toml` / `flake.nix` and install project-locally (`npm install --ignore-scripts`, `pip install --only-binary :all:` in a venv). Then `npm rebuild <pkg>` only for packages needing native compilation. Never install globally.
 
+---
+
+## Post-Implementation Validation: Local Smoke Test + CI/CD
+
+After ALL implementation phases pass their automated tests and code reviews, the runner enters the **post-implementation validation** phase. This is where the agent becomes the user — it builds the distributable artifact, installs it in a clean-ish environment, and exercises every primary user flow end-to-end. Then it pushes to the remote and fix-validates CI/CD.
+
+This phase exists because automated tests — even good integration tests — miss an entire class of bugs that only surface when you actually run the finished product. Packaging manifests exclude files. Dev-only paths break. Native libraries aren't linked. First-run downloads fail. Loading states are missing. The agent troubleshoots these exactly like a human developer would, except it doesn't give up after the first error.
+
+### Phase 1: Build and Install
+
+1. **Build the distributable artifact** — run the project's build/package command (`npm run package`, `python -m build`, `cargo build --release`, `docker build`, etc.)
+2. **Install in a clean-ish environment** — NOT the dev workspace. For extensions: install the packaged artifact via the platform's CLI (`code --install-extension *.vsix`). For packages: install in a fresh venv/node_modules. For binaries: copy to a temp dir and run from there. For containers: `docker run` with no volume mounts to the source tree.
+3. **Verify the artifact contains everything it needs** — list the contents of the package and check against the project's runtime dependencies. If files are missing (source code, models, config templates, native libs), fix the packaging manifest and rebuild.
+
+### Phase 2: User Flow Smoke Test (fix-validate loop)
+
+For each primary user flow from the spec:
+
+1. **Exercise the flow from the user's entry point** — launch the installed artifact, trigger the first user action, and observe what happens. Capture ALL output: stdout, stderr, log files, status changes.
+2. **When it fails (it will)** — read the error, classify it (see bug taxonomy below), fix it, rebuild, reinstall, retry. This is a fix-validate loop with a cap of 20 iterations per flow.
+3. **Track progress** — after each fix, note which step in the chain you reached. If you're not getting farther after 3 consecutive fixes, escalate: re-read the full error chain, check if a foundational assumption is wrong (wrong model version, wrong Python version, missing system library), and try a different approach.
+4. **Verify loading/initialization states** — on first launch, observe: does the UI show a loading/preparing state while resources download? Does it degrade gracefully if a dependency is slow? Does it recover after a transient failure? Missing loading states are the #1 UX bug in first-run scenarios.
+5. **Test cold start vs warm start** — clear caches, delete downloaded models/resources, restart. Verify the first-run experience works. Then verify the second run is faster (cached).
+
+### Phase 3: CI/CD Validation (fix-validate loop)
+
+After local smoke passes:
+
+1. **Commit and push** to a feature branch
+2. **Monitor CI** — use `gh run list` and `gh run view` to watch the pipeline
+3. **When CI fails** — use `gh run view --log-failed` to read the failure logs. Diagnose and fix locally, push, repeat.
+4. **Common CI failures** that differ from local:
+   - Missing system packages (CI doesn't have your Nix flake — add install steps to the workflow)
+   - Different OS/arch (CI runs Ubuntu, you run NixOS — native extensions may differ)
+   - Missing secrets/tokens (add to repo secrets or use `--no-verify` for scanning tools that need them)
+   - Network restrictions (CI can't reach internal registries — use public mirrors or cache in the workflow)
+   - Timeout differences (CI runners are slower — increase test timeouts for integration tests)
+5. **No hard cap** — same rules as smoke test: keep going as long as there's forward progress. Only write `BLOCKED.md` if stuck in circles or genuinely blocked (missing secrets, permissions, etc.).
+
+### Bug taxonomy for smoke test troubleshooting
+
+When a failure occurs during smoke testing, classify it to choose the right fix strategy. This taxonomy is ordered by frequency — the agent should check the most common categories first.
+
+| Category | Symptoms | Fix strategy |
+|----------|----------|--------------|
+| **Packaging manifest gaps** | `MODULE_NOT_FOUND`, `FileNotFoundError`, missing source files | Fix `.vscodeignore` / `MANIFEST.in` / `files` in `package.json`. Rebuild and verify file list. |
+| **Native library not linked** | `OSError: cannot load library`, `PortAudio not found`, `libXXX.so not found` | Add the library to `LD_LIBRARY_PATH` (Linux), `DYLD_LIBRARY_PATH` (macOS), or bundle it. For Nix: add to `buildInputs` and expose via `LD_LIBRARY_PATH` in the spawn environment. |
+| **Dependency version incompatibility** | `No wheel for cpXXX`, `ModuleNotFoundError` for a sub-module that was removed, model input shape mismatch | Pin the exact working version. Check if the dep has wheels for the target Python/Node version. For models: verify the model file matches the code's expected API (input tensor names, output shape). |
+| **Dependency API breakage** | `ImportError: cannot import name 'X'`, `AttributeError`, `TypeError` on a library call that used to work | The library removed/renamed an API between versions. Pin to the last working version, or update the code to use the new API. Add a smoke test that imports and calls the specific APIs used. |
+| **Transitive dependency resource gaps** | Package installs but resource files (models, templates, configs) are missing from the installed location | The pip/npm package doesn't include data files, or a post-install hook didn't run. Download resources explicitly, cache them outside the venv, and copy/symlink into place. |
+| **Network/TLS in isolated environments** | `SSL: CERTIFICATE_VERIFY_FAILED`, `ConnectionError` on downloads that work in dev | The isolated environment (venv, container, CI) may not have system CA certs. Use `certifi` (Python) or `NODE_EXTRA_CA_CERTS` (Node). Or use a library with bundled certs (`requests` vs `urllib`). |
+| **Hardcoded paths / URLs** | `404 Not Found` on downloads, `ENOENT` on file reads, wrong binary path | Replace hardcoded absolute paths with relative paths from the artifact root. For download URLs: verify the URL is correct (case-sensitive repo names, correct release tags, correct version). |
+| **Output format assumptions** | Feature works but downstream processing fails (regex doesn't match, parser rejects input) | The real output format differs from what the code assumes. E.g., Whisper adds punctuation, APIs return different field names, model outputs different precision. Fix the parser to be tolerant of real output. |
+| **Cross-app sandbox limitations** | Can't write to another extension's input, can't simulate keystrokes, can't access webview | The target app's API is more limited than assumed. Identify what IS possible (clipboard, public commands, IPC). Implement the best available mechanism and document the limitation. |
+| **Platform-specific behavior** | Works on X11 but not Wayland, works on macOS but not Linux, works on Python 3.11 but not 3.12 | Test on the actual target platform. For display server differences: detect at runtime and use the appropriate tool. For Python/Node version differences: pin in the project config and verify in CI. |
+| **Missing loading/initialization states** | UI appears broken during startup, no feedback during downloads, user sees error before system is ready | Add intermediate states (Preparing, Downloading, Connecting) to the UI. Show progress for slow operations. Don't show "ready" until ALL subsystems are initialized. |
+| **Process stderr not captured** | Child process crashes but parent shows generic "failed" with no details | Capture and log child process stderr. Include it in error messages. Parse structured log output if the child uses JSON logging. |
+| **Ephemeral build environments** | `.venv` recreated on each install, losing cached pip packages / downloaded resources | Cache resources outside the ephemeral directory (`~/.cache/<project>/`). Copy into the build environment on startup instead of re-downloading. |
+
+### Agent escalation strategy
+
+The smoke test loop uses a **fast-then-deep** strategy:
+
+1. **Use opus for all smoke test iterations.** These failures are often non-obvious — version incompatibilities, model format mismatches, platform-specific behavior, packaging gaps that require understanding the full build chain. A weaker model will waste iterations misdiagnosing the problem.
+2. **After 5 consecutive iterations with no progress on the SAME error**: The agent should enable full research capability — web search for the specific error, check library changelogs for breaking changes, read platform documentation for sandbox limitations.
+3. **When the agent resolves a bug and hits a NEW error**: The stall counter resets to 0. This is forward progress, not a stall.
+4. **There is NO hard iteration cap.** As long as the agent is making forward progress (getting farther in the chain, encountering new errors at later steps, or the error is changing category), keep going. The only reasons to write `BLOCKED.md` are:
+   - **Circular**: the agent has tried the same fix category 3+ times and keeps reverting to the same error
+   - **Stuck**: 5+ consecutive iterations with zero forward progress — same step, same error category, no new information
+   - **Genuinely human-dependent**: the fix requires credentials, hardware, or a design decision the agent can't make
+
+"Forward progress" means ANY of: reaching a later step in the user flow chain, encountering a new error category, or the same error now has a different root cause. If the agent fixed 15 different issues and is on issue 16, that's progress — keep going.
+
+"Going in circles" means: the agent applied a fix, it broke something earlier that was already working, it fixed that, and now the original error is back. When this happens, the deep agent must step back, understand the dependency between the two fixes, and find a solution that satisfies both constraints simultaneously.
+
+---
+
 ### BLOCKED.md format
 
 When `BLOCKED.md` IS written (genuinely human-dependent), it MUST include:
