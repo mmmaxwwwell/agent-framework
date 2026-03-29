@@ -153,12 +153,117 @@ Every CI run MUST produce:
 - Code coverage report (if applicable)
 - Build artifacts (if applicable)
 
+## Local security scan validation (fix-validate loop)
+
+Security scanning is part of the phase validation lifecycle — not a separate workflow. When the runner spawns a validation agent at a phase boundary, that agent runs **build → test → lint → security scan**. If any scanner finds issues, the standard fix-validate loop kicks in: the validation agent writes a FAIL record, a fix task is appended, a fresh fix agent reads the findings and patches the code, and the runner re-validates.
+
+### How it works
+
+1. **Phase completes** — all tasks marked `[x]`
+2. **Validation agent spawns** — runs the project's test suite AND security scanners locally
+3. **Scanners run with JSON output** — structured findings with file, line, rule ID, severity, description
+4. **If findings exist** → validation FAIL, fix task appended to the phase
+5. **Fix agent reads findings** — structured JSON from `test-logs/security/` (same directory pattern as test failures)
+6. **Fix agent patches code** — addresses each finding, commits
+7. **Re-validate** — runner spawns another validation agent, scanners run again
+8. **Loop until clean** — same rules as test fix-validate: 10 attempts, then BLOCKED.md
+
+### Scanner commands (local, JSON output)
+
+The validation agent runs these commands and writes output to `test-logs/security/<scanner>.json`:
+
+```bash
+# SCA — dependency vulnerabilities
+trivy fs --format json --severity CRITICAL,HIGH --output test-logs/security/trivy.json .
+
+# SAST — static analysis
+semgrep --json --config p/default --config p/golang --output test-logs/security/semgrep.json .
+
+# Secrets — leaked credentials
+gitleaks detect --report-format json --report-path test-logs/security/gitleaks.json --no-git
+
+# Go vulnerabilities
+govulncheck -format json ./... > test-logs/security/govulncheck.json
+```
+
+Adjust scanner configs per project (language-specific rulesets, severity thresholds). The scanner list comes from `reference/security.md` — use whatever scanners the project's CI pipeline runs, so local validation catches the same issues CI would.
+
+### Security findings in structured output
+
+Security scan results follow the same pattern as test failures — structured files that fix agents can parse without reading raw CLI output:
+
+| File | Format | Content |
+|------|--------|---------|
+| `test-logs/security/<scanner>.json` | JSON | Raw scanner output (findings with file, line, rule, severity) |
+| `test-logs/security/summary.json` | JSON | `{ "scanners": { "trivy": { "findings": 0 }, "semgrep": { "findings": 2 }, ... }, "total": 2, "pass": false }` |
+
+The validation agent produces `summary.json` by aggregating scanner results. Fix agents read `summary.json` first (to understand scope), then drill into individual scanner JSON files for details.
+
+### What fix agents do with findings
+
+Fix agents classify each finding before acting:
+
+| Category | Action |
+|----------|--------|
+| **Dependency vulnerability** | Update the dependency version in `go.mod` / `package.json` / `flake.nix`. Run `go mod tidy` or equivalent. |
+| **SAST finding (code pattern)** | Read the flagged code, understand the rule, fix the pattern. Common: SQL injection, command injection, path traversal, hardcoded secrets. |
+| **Secret detected** | Remove the secret from code, add to `.gitignore` if it's a file, rotate the credential if it was committed to history. |
+| **False positive** | Write a suppression comment (e.g., `// nosemgrep: rule-id`, `#nosec`) with a justification. Record in `learnings.md` so future agents don't re-suppress. |
+
+Fix agents MUST NOT suppress findings without justification. If a finding is genuinely a false positive, the suppression comment must explain why. If the agent can't determine whether it's a false positive, it fixes the code rather than suppressing.
+
+### Integration with phase validation lifecycle
+
+The phase validation state machine gains a new validation step:
+
+```
+Tasks complete → validate (build + test + lint + security scan) → review → clean
+```
+
+Security scan failure is treated identically to test failure — same fix task pattern, same iteration cap, same BLOCKED.md escalation. The validation agent writes a single PASS/FAIL record that covers all validation steps (tests AND security). A phase doesn't pass validation if any scanner has findings.
+
+### Why local, not CI-only
+
+Running scanners locally in the fix-validate loop catches issues **before pushing**. This avoids burning 10-30 minute CI cycles on code that has known vulnerabilities. The CI pipeline runs the same scanners as a final gate, but the local loop is the primary feedback mechanism for the implementing agent.
+
 ## Agentic CI feedback loop
 
-When the implementing agent pushes code and CI fails, the agent must diagnose and fix:
+Tasks that push code and iterate on CI failures MUST be tagged `[needs: gh, ci-loop]` in tasks.md. This activates a runner-managed debug cycle that uses separate sub-agents instead of one long-running context:
 
-1. **Monitor CI run**: After pushing, monitor to completion (e.g., `gh run watch`)
-2. **Retrieve failure logs**: On failure, pull logs (e.g., `gh run view <id> --log-failed`)
-3. **Diagnose and fix**: Same fix-validate loop — read failure logs, fix code or CI config, push and re-monitor
-4. **CI-specific learnings**: CI gotchas go into `learnings.md`
-5. **Failure limit**: After 3 failed CI fix attempts, write `BLOCKED.md`
+### How it works
+
+1. **Runner pushes** the current branch
+2. **Runner polls CI** in the main thread (no agent context burned) via `gh run list` / `gh run view`
+3. **On failure**: runner downloads logs to `ci-debug/<task_id>/attempt-N-logs.txt`, then:
+   - Spawns a **diagnosis sub-agent** that reads the logs + prior history and writes `attempt-N-diagnosis.md`
+   - Spawns a **fix sub-agent** that reads the diagnosis, applies the fix, and pushes
+4. **Loop**: runner polls CI again for the fix, repeats until green or attempt cap (15) is hit
+5. **On success**: spawns a **finalize sub-agent** to create the PR and mark the task complete
+
+### Artifact directory
+
+All CI debug artifacts live in `ci-debug/<task_id>/`:
+
+| File | Purpose |
+|------|---------|
+| `state.json` | Resumable state — tracks all attempts |
+| `attempt-N-ci-result.json` | CI poll result (status, failed jobs, URL) |
+| `attempt-N-logs.txt` | Raw CI failure logs |
+| `attempt-N-diagnosis.md` | Diagnosis agent's analysis |
+| `attempt-N-fix-notes.md` | Fix agent's notes (if it disagreed with diagnosis) |
+
+Sub-agents read prior attempt files for context without inflating their own context window.
+
+### Resumability
+
+The `state.json` file tracks completed attempts. If the runner is killed and restarted, it resumes from the last incomplete attempt.
+
+### Task format
+
+```
+- [ ] T075 [needs: gh, ci-loop] CI/CD validation: push to develop, iterate until green, create PR
+```
+
+### Failure limit
+
+After 15 failed CI fix attempts, the runner writes `BLOCKED.md` for human review. The full history is preserved in `ci-debug/<task_id>/`.

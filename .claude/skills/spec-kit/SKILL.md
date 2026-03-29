@@ -22,17 +22,17 @@ phases/              # One file per workflow phase — load only what's needed
   tasks.md           # Phase 6: task list generation
   implement.md       # Phase 7: autonomous runner, fix-validate, auto-unblocking
 reference/           # Enterprise knowledge base — loaded on demand by phase files
-  testing.md         # Integration testing, structured output, stub processes, fix-validate loop
+  testing.md         # Integration testing, structured output, stub processes, fix-validate loop, security scan validation
   logging.md         # Structured logging spec
   errors.md          # Error hierarchy, propagation
   config.md          # Config management
-  security.md        # Security baseline, scanning tiers, headers
+  security.md        # Security baseline, scanning tiers, headers, local scanner commands, SARIF CI integration
   shutdown.md        # Graceful shutdown
   health.md          # Health checks
   rate-limiting.md   # Rate limiting & backpressure
   observability.md   # Metrics, tracing
   migration.md       # Migration & versioning
-  cicd.md            # CI/CD pipeline
+  cicd.md            # CI/CD pipeline, local security scan validation, agentic CI feedback loop
   dx.md              # Developer experience tooling
   ui-flow.md         # UI_FLOW.md spec
   data-model.md      # Data model depth
@@ -42,6 +42,7 @@ reference/           # Enterprise knowledge base — loaded on demand by phase f
   edge-cases.md      # Edge case enumeration
   complexity.md      # Complexity tracking
   phase-deps.md      # Phase dependencies & parallelization
+  readme.md          # Human-facing README.md structure, sections, quality checklist
 presets/             # Quality presets — loaded once per project
   poc.md             # Proof of concept
   local.md           # Single-user local tool
@@ -144,6 +145,7 @@ Check and update `.gitignore` after completing **any** of these phases:
 test-logs/
 logs/
 validate/
+ci-debug/
 BLOCKED.md
 
 # Environment
@@ -271,6 +273,18 @@ Phase 4 is **not optional**. After clarify (Phase 3) completes — or whenever a
 4. Only then proceed to Phase 5 (plan)
 
 There is no iteration cap. The spec must be unambiguous before planning begins. Each iteration should get shorter as issues are resolved. If the same issue keeps recurring across iterations, flag it to the user as a potential design decision that needs an explicit call.
+
+---
+
+## Learnings management
+
+The `learnings.md` file accumulates discoveries across tasks. The parallel runner manages its size automatically:
+
+- **Phase-based filtering**: Each agent receives only learnings from its phase and upstream dependencies (not the full file).
+- **Auto-pruning**: After each main-loop iteration, the runner removes learnings for tasks in phases that are fully validated AND have no pending downstream dependents. This keeps the file focused on active/upcoming work.
+- **Concise entries**: Agents are instructed to write max 3 bullet points per task, focusing on non-obvious gotchas only.
+
+No manual intervention is needed — the file shrinks naturally as phases complete.
 
 ---
 

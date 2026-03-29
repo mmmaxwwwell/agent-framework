@@ -18,6 +18,8 @@ These documents contain all the decisions from the interview and planning phases
 ## Task structure
 
 - Tasks marked `[P]` can be parallelized.
+- Tasks marked `[needs: gh]` are granted GitHub CLI access (GH_TOKEN) at runtime. Use this for tasks that call `gh` commands (push, PR creation, CI monitoring). **NEVER combine `[needs: gh]` with tasks that run package install commands** (npm install, pip install, go install, etc.) — this prevents supply-chain attacks from exfiltrating credentials.
+- Tasks marked `[needs: gh, ci-loop]` use a runner-managed CI debug cycle instead of a single agent. The runner pushes, polls CI, and spawns separate diagnosis/fix sub-agents in a loop. See `reference/cicd.md`.
 - Phases: Setup → Foundational → User Stories (P1-P3) → Polish.
 
 ## Required task patterns (subject to preset overrides)
@@ -39,11 +41,24 @@ These documents contain all the decisions from the interview and planning phases
 | CI/CD pipeline | `reference/cicd.md` | Pipeline stages (lint→build→test→scan→deploy), quality gates, SBOM, agentic CI feedback loop |
 | Security scanning | `reference/security.md` | Tool selection per tier, pre-commit hooks, CI integration, SARIF uploads |
 | DX tooling | `reference/dx.md` | Full script inventory, dev server config, Nix flake setup, debugging configs, CLAUDE.md section |
+| README.md | `reference/readme.md` | Section structure, cognitive funneling, badges, quality checklist, preset behavior |
 | Database seed script | `reference/migration.md` | Idempotent migrations, seed script pattern, admin process parity |
 
 **Skip loading reference files for topics the preset says to skip.** But for any foundational task you're writing, load its reference first so the task description is specific enough for an implementing agent to execute without guessing.
 
-Tasks MUST include (when not skipped by preset): logging infrastructure, error hierarchy, config module, graceful shutdown, health endpoints, CI/CD pipeline setup, security scanning integration, and database seed script (if applicable). These are infrastructure — they come before feature work.
+Tasks MUST include (when not skipped by preset): logging infrastructure, error hierarchy, config module, graceful shutdown, health endpoints, CI/CD pipeline setup, security scanning integration (local + CI SARIF uploads), and database seed script (if applicable). These are infrastructure — they come before feature work.
+
+### Security scanner setup tasks (foundational phase)
+
+Load `reference/security.md` and `reference/cicd.md` before writing these tasks.
+
+Security scanning infrastructure MUST be set up in the foundational phase so the fix-validate loop can use it from the first feature phase onward. Include these tasks:
+
+1. **Local security scanner integration** — add scanner binaries to `flake.nix` devShell (trivy, semgrep, gitleaks, plus ecosystem-specific tools). Create a `scripts/security-scan.sh` that runs all project-relevant scanners with JSON output to `test-logs/security/` and produces `summary.json`. This script is what the validation agent calls during phase validation.
+2. **CI SARIF upload integration** — update the CI workflow to output SARIF from each scanner and upload to GitHub Security tab via `github/codeql-action/upload-sarif@v3`. Add `security-events: write` permission to the workflow. See `reference/cicd.md` and `reference/security.md` for the exact SARIF flags per scanner.
+3. **`.gitignore` update** — ensure `test-logs/security/` is gitignored (covered by the existing `test-logs/` entry).
+
+The local scanner script is the key integration point — it's what makes security findings appear in the same fix-validate loop as test failures, using the same structured output pattern.
 
 **Nix coordination**: Check `interview-notes.md` for `Nix available: yes/no`. If yes, the **first Setup task** MUST be `flake.nix` creation with `devShells.default` providing all project tools, plus `.envrc` with `use flake`. All subsequent tasks that need tools (linters, test runners, database engines) should reference the flake rather than installing globally.
 
@@ -78,7 +93,7 @@ Load `reference/phase-deps.md` to structure the Phase Dependencies section with 
 Load `reference/complexity.md` — any task that introduces abstraction must reference the Complexity Tracking table.
 
 ### Approach note
-Include at the top of tasks.md: `Approach: Fix-validate loop. Each phase: run tests → read test-logs/ failures → fix code → re-run until green.` (Adjust based on preset — POC skips fix-validate.)
+Include at the top of tasks.md: `Approach: Fix-validate loop. Each phase: build → test → lint → security scan → read test-logs/ failures → fix code → re-run until green.` (Adjust based on preset — POC skips fix-validate and security scanning.)
 
 ### Conditional tasks — check the spec and include if applicable
 
@@ -149,13 +164,34 @@ After all automated tests pass and code review is clean, include a final phase w
 
 This phase uses a fix-validate loop with a 20-iteration cap. See `phases/implement.md § Post-Implementation Validation` for the full process, bug taxonomy, and escalation strategy.
 
-### CI/CD validation phase (post-smoke)
-After local smoke passes:
-1. **Push to feature branch** — commit all smoke test fixes and push
-2. **Monitor and fix CI failures** — use `gh run list`, `gh run view --log-failed` to read CI output. If a structured `ci-summary.json` artifact exists (from the CI debugging infrastructure task), download and read it first — it's faster than parsing raw logs. Fix failures, push, repeat. Cap: 15 iterations.
-3. **Create PR** — once CI is green, create the pull request with `gh pr create`
+### README generation (post-smoke, pre-CI)
+After local smoke passes, include a task to generate `README.md`. Load `reference/readme.md` before writing this task. The README documents what was actually built — it goes after implementation and smoke testing so the content is accurate.
 
-See `phases/implement.md § Post-Implementation Validation § Phase 3` for common CI failure categories.
+```
+- [ ] T0XX Generate README.md: write comprehensive human-facing README following reference/readme.md. Include: title/tagline, badges, description, visuals/demo, features list, getting started (prerequisites, install, first run with expected output), usage examples, configuration table, architecture overview, development setup, security notes, license. Verify all commands work by running them. [Story: developer onboarding]
+```
+
+The preset controls which sections to include — see `reference/readme.md § Preset behavior`. POC gets a minimal README; enterprise gets everything.
+
+### CI/CD validation phase (post-smoke)
+After local smoke passes, create a **single CI validation task** marked `[needs: gh, ci-loop]`:
+
+```
+- [ ] T0XX [needs: gh, ci-loop] CI/CD validation: push to branch, iterate until CI green (including security scans), create PR
+```
+
+**Note**: By this point, the local fix-validate loop has already caught and fixed security findings during every phase. The CI security scan is a final gate — it should pass on the first push if the local scanners used the same configs. If CI security fails, the ci-loop diagnose/fix agents handle it the same as any other CI failure.
+
+The `ci-loop` tag activates a runner-managed debug cycle (see `reference/cicd.md § Agentic CI feedback loop`):
+
+- The **runner** pushes code, polls CI, and downloads failure logs — no agent context burned on waiting
+- A **diagnosis sub-agent** reads logs and writes a structured diagnosis file
+- A **fix sub-agent** reads the diagnosis, applies the fix, and pushes
+- A **finalize sub-agent** creates the PR after CI passes
+
+All artifacts are written to `ci-debug/<task_id>/` so sub-agents can read prior history without inflating context. The cycle has a 15-attempt cap; after that, the runner writes `BLOCKED.md`.
+
+**All CI/CD tasks that use `gh` commands MUST be marked `[needs: gh]`.**  The runner injects a short-lived GH_TOKEN env var only for these tasks. Tasks without this marker never see the token. If an agent discovers it needs `gh` access mid-task, it writes `[needs: gh]` in `BLOCKED.md` and the runner auto-grants and retries.
 
 ### Code review task
 When the last implementation task completes, append a `REVIEW` task. See `phases/implement.md` for how the runner handles this.

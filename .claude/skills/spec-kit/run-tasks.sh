@@ -26,7 +26,7 @@
 # Stopping:
 #   The agent writes BLOCKED.md in the repo root when it needs your input.
 #   The script detects this and stops. Edit BLOCKED.md with your answer,
-#   then delete it and re-run the script.
+#   then re-run the script. The runner will clean up the file.
 #
 # Requires: python3 3.9+, claude CLI (Claude Code) with Max subscription
 # Run in tmux/screen so it survives terminal disconnects.

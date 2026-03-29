@@ -57,6 +57,7 @@ class Task:
     status: TaskStatus
     line_num: int
     dependencies: list[str] = field(default_factory=list)
+    capabilities: set[str] = field(default_factory=set)  # e.g. {"gh"} from [needs: gh]
 
 
 @dataclass
@@ -80,6 +81,8 @@ class AgentSlot:
     exit_code: Optional[int] = None
     status: str = "starting"  # starting, running, done, failed, rate_limited
     attempt: int = 1  # which attempt this is for the task (1 = first try)
+    input_tokens: int = 0     # cumulative input tokens (including cache)
+    output_tokens: int = 0    # cumulative output tokens
 
 
 # ── Task file parser ───────────────────────────────────────────────────
@@ -91,6 +94,7 @@ TASK_RE = re.compile(
     r'(?P<desc>.+)$'
 )
 PARALLEL_RE = re.compile(r'\[P\]')
+NEEDS_RE = re.compile(r'\[needs:\s*([^\]]+)\]')
 PHASE_HEADING_RE = re.compile(r'^##\s+Phase\s*(?::?\s*\d*\s*[-–—:]?\s*)?(.+)$', re.IGNORECASE)
 DEPENDENCY_SECTION_RE = re.compile(r'^##\s+(?:Phase\s+)?Dependencies', re.IGNORECASE)
 # Phase reference: "Phase 2b (Retro Wiring)" → captures "2b"
@@ -220,6 +224,12 @@ def parse_task_file(path: Path) -> tuple[list[Phase], dict[str, list[str]]]:
             else:
                 status = TaskStatus.PENDING
 
+            # Parse [needs: gh, ...] capability annotations
+            caps: set[str] = set()
+            needs_match = NEEDS_RE.search(line)
+            if needs_match:
+                caps = {c.strip().lower() for c in needs_match.group(1).split(',')}
+
             task = Task(
                 id=task_id,
                 description=desc,
@@ -227,6 +237,7 @@ def parse_task_file(path: Path) -> tuple[list[Phase], dict[str, list[str]]]:
                 parallel=is_parallel,
                 status=status,
                 line_num=i + 1,
+                capabilities=caps,
             )
             current_phase.tasks.append(task)
 
@@ -597,8 +608,12 @@ def render_dependency_graph(phases: list[Phase], phase_deps: dict[str, list[str]
         for a in agents:
             elapsed = int(time.time() - a.start_time) if a.start_time else 0
             att = f" att#{a.attempt}" if a.attempt > 1 else ""
+            tok = ""
+            total_tok = a.input_tokens + a.output_tokens
+            if total_tok > 0:
+                tok = f" {total_tok // 1000}k tok"
             agent_strs.append(
-                f"{STATUS_COLORS[TaskStatus.RUNNING]}Agent {a.agent_id}: {a.task.id}{att} ({elapsed}s){RESET}"
+                f"{STATUS_COLORS[TaskStatus.RUNNING]}Agent {a.agent_id}: {a.task.id}{att} ({elapsed}s{tok}){RESET}"
             )
         header.append(f" Running: {' │ '.join(agent_strs)}")
 
@@ -834,7 +849,9 @@ class TUI:
         pane_lines = []
         elapsed = int(time.time() - agent.start_time) if agent.start_time else 0
         att = f" att#{agent.attempt}" if agent.attempt > 1 else ""
-        header = f"Agent {agent.agent_id}: {agent.task.id}{att} ({agent.status}, {elapsed}s)"
+        total_tok = agent.input_tokens + agent.output_tokens
+        tok = f", {total_tok // 1000}k tok" if total_tok > 0 else ""
+        header = f"Agent {agent.agent_id}: {agent.task.id}{att} ({agent.status}, {elapsed}s{tok})"
         pane_lines.append(f"{BOLD}{header[:pane_width]}{RESET}")
         pane_lines.append("─" * pane_width)
 
@@ -896,17 +913,273 @@ class HeadlessLogger:
         for a in agents:
             elapsed = int(time.time() - a.start_time) if a.start_time else 0
             att = f" att#{a.attempt}" if a.attempt > 1 else ""
-            lines.append(f"  Agent {a.agent_id}: {a.task.id}{att} ({a.status}, {elapsed}s)")
+            total_tok = a.input_tokens + a.output_tokens
+            tok = f", {total_tok // 1000}k tok" if total_tok > 0 else ""
+            lines.append(f"  Agent {a.agent_id}: {a.task.id}{att} ({a.status}, {elapsed}s{tok})")
 
         with open(status_file, "w") as f:
             f.write("\n".join(lines) + "\n")
+
+
+# ── Context extraction helpers ───────────────────────────────────────
+
+def _extract_phase_block(task_file: str, task: Task, all_phases: list[Phase]) -> str:
+    """Extract only the task's phase block from tasks.md, plus a summary of other phases.
+
+    Returns a trimmed version of tasks.md containing:
+    - The approach line (first non-blank content line)
+    - A compact summary of completed tasks in other phases (just IDs)
+    - The full phase block for the task's phase
+    """
+    lines = Path(task_file).read_text().splitlines()
+    result_lines = []
+    current_phase_slug = None
+    in_target_phase = False
+    target_slug = task.phase
+
+    # Find approach line (first content after the title)
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("**Approach**") or stripped.startswith("*Approach*"):
+            result_lines.append(line)
+            break
+        # Also grab the title
+        if stripped.startswith("# ") and not stripped.startswith("## "):
+            result_lines.append(line)
+
+    result_lines.append("")
+
+    # Build compact summary of other phases
+    for phase in all_phases:
+        if phase.slug == target_slug:
+            continue
+        complete = [t for t in phase.tasks if t.status == TaskStatus.COMPLETE]
+        pending = [t for t in phase.tasks if t.status == TaskStatus.PENDING]
+        if complete and not pending:
+            result_lines.append(f"## {phase.name} — all {len(complete)} tasks complete")
+        elif complete:
+            complete_ids = ", ".join(t.id for t in complete)
+            pending_ids = ", ".join(t.id for t in pending)
+            result_lines.append(f"## {phase.name} — done: {complete_ids} | pending: {pending_ids}")
+        else:
+            result_lines.append(f"## {phase.name} — not started ({len(phase.tasks)} tasks)")
+
+    result_lines.append("")
+
+    # Include full phase block for the target phase
+    for line in lines:
+        pm = PHASE_HEADING_RE.match(line)
+        if pm:
+            slug = slugify_phase(line.lstrip('#').strip())
+            if slug == target_slug:
+                in_target_phase = True
+                result_lines.append(line)
+                continue
+            elif in_target_phase:
+                break  # hit next phase heading
+            continue
+        if in_target_phase:
+            result_lines.append(line)
+
+    return "\n".join(result_lines)
+
+
+def _extract_relevant_learnings(learnings_file: str, task: Task,
+                                 all_phases: list[Phase],
+                                 phase_deps: dict[str, list[str]]) -> str:
+    """Extract only learnings sections relevant to the current task.
+
+    Includes learnings from:
+    - Tasks in the same phase (sibling context)
+    - Tasks in upstream dependency phases
+    Skips learnings from unrelated phases to reduce context.
+    """
+    path = Path(learnings_file)
+    if not path.exists():
+        return ""
+
+    text = path.read_text()
+    if not text.strip():
+        return ""
+
+    # Find which phases are relevant: current phase + upstream deps
+    relevant_phases = {task.phase}
+    # Walk dependency chain upward
+    to_visit = list(phase_deps.get(task.phase, []))
+    while to_visit:
+        dep = to_visit.pop()
+        if dep not in relevant_phases:
+            relevant_phases.add(dep)
+            to_visit.extend(phase_deps.get(dep, []))
+
+    # Collect task IDs in relevant phases
+    relevant_task_ids: set[str] = set()
+    for phase in all_phases:
+        if phase.slug in relevant_phases:
+            for t in phase.tasks:
+                relevant_task_ids.add(t.id)
+
+    # Parse learnings by section (## T0XX — ...)
+    sections = []
+    current_section: list[str] = []
+    current_task_id: Optional[str] = None
+    header_line = None
+
+    for line in text.splitlines():
+        # Match section headers like "## T019 — SSH agent handler"
+        if line.startswith("## T") or line.startswith("## t"):
+            # Save previous section
+            if current_task_id and current_section:
+                sections.append((current_task_id, header_line, current_section))
+            # Extract task ID
+            parts = line.split("—")[0].split("–")[0].split("-")[0]
+            tid_match = re.search(r'T\d+', parts, re.IGNORECASE)
+            current_task_id = tid_match.group().upper() if tid_match else None
+            header_line = line
+            current_section = []
+        elif current_task_id is not None:
+            current_section.append(line)
+        # Keep the file header
+        elif line.startswith("# ") and not sections:
+            pass  # skip the main title
+
+    # Save last section
+    if current_task_id and current_section:
+        sections.append((current_task_id, header_line, current_section))
+
+    if not sections:
+        return text  # no structured sections, return as-is
+
+    # Filter to relevant sections
+    result_lines = ["# Learnings (filtered for your task)\n"]
+    included = 0
+    for tid, header, body in sections:
+        if tid in relevant_task_ids:
+            result_lines.append(header)
+            result_lines.extend(body)
+            included += 1
+
+    if included == 0:
+        return ""  # no relevant learnings
+
+    skipped = len(sections) - included
+    if skipped > 0:
+        result_lines.append(f"\n*({skipped} learning sections from unrelated phases omitted)*\n")
+
+    return "\n".join(result_lines)
+
+
+def _prune_completed_learnings(learnings_file: str,
+                               all_phases: list[Phase],
+                               phase_deps: dict[str, list[str]],
+                               validated_phases: set[str]) -> int:
+    """Remove learnings for tasks in fully-validated phases with no pending dependents.
+
+    A phase's learnings are pruned when:
+    1. The phase itself is fully validated (tasks done + review clean)
+    2. All phases that depend on it are also fully validated
+
+    Returns the number of sections removed.
+    """
+    path = Path(learnings_file)
+    if not path.exists():
+        return 0
+
+    text = path.read_text()
+    if not text.strip():
+        return 0
+
+    # Build reverse dependency map: phase -> set of phases that depend on it
+    downstream: dict[str, set[str]] = defaultdict(set)
+    for slug, deps in phase_deps.items():
+        for dep in deps:
+            downstream[dep].add(slug)
+
+    # A phase is prunable when it AND all its downstream dependents are validated
+    prunable_phases: set[str] = set()
+    for phase in all_phases:
+        if phase.slug not in validated_phases:
+            continue
+        # Check all downstream phases are also validated
+        all_downstream_done = all(
+            d in validated_phases for d in downstream.get(phase.slug, set())
+        )
+        if all_downstream_done:
+            prunable_phases.add(phase.slug)
+
+    if not prunable_phases:
+        return 0
+
+    # Collect prunable task IDs
+    prunable_task_ids: set[str] = set()
+    for phase in all_phases:
+        if phase.slug in prunable_phases:
+            for t in phase.tasks:
+                prunable_task_ids.add(t.id)
+
+    if not prunable_task_ids:
+        return 0
+
+    # Parse and filter sections
+    lines = text.splitlines()
+    output_lines: list[str] = []
+    current_section_lines: list[str] = []
+    current_task_id: str | None = None
+    in_header = True  # True until we see the first ## section
+    pruned = 0
+
+    for line in lines:
+        if line.startswith("## T") or line.startswith("## t"):
+            # Flush previous section
+            if current_task_id is not None:
+                if current_task_id in prunable_task_ids:
+                    pruned += 1
+                else:
+                    output_lines.extend(current_section_lines)
+            in_header = False
+            # Start new section
+            tid_match = re.search(r'T\d+', line.split("—")[0].split("–")[0].split("-")[0], re.IGNORECASE)
+            current_task_id = tid_match.group().upper() if tid_match else None
+            current_section_lines = [line]
+        elif line.startswith("## "):
+            # Non-task section header (e.g. "## phase6-pairing-flow-fix1")
+            # Flush previous
+            if current_task_id is not None:
+                if current_task_id in prunable_task_ids:
+                    pruned += 1
+                else:
+                    output_lines.extend(current_section_lines)
+            # Treat as non-task section — always keep
+            current_task_id = "__keep__"
+            current_section_lines = [line]
+        elif in_header:
+            output_lines.append(line)
+        else:
+            current_section_lines.append(line)
+
+    # Flush last section
+    if current_task_id is not None:
+        if current_task_id in prunable_task_ids:
+            pruned += 1
+        else:
+            output_lines.extend(current_section_lines)
+
+    if pruned > 0:
+        # Clean up trailing blank lines, ensure file ends with newline
+        result = "\n".join(output_lines).rstrip() + "\n"
+        path.write_text(result)
+
+    return pruned
 
 
 # ── Claude agent spawner ─────────────────────────────────────────────
 
 def build_prompt(task_file: str, spec_dir: str, learnings_file: str,
                  constitution: str, reference_files: list[str],
-                 task: Task, attempt_history: Optional[list[dict]] = None) -> str:
+                 task: Task, attempt_history: Optional[list[dict]] = None,
+                 all_phases: Optional[list[Phase]] = None,
+                 phase_deps: Optional[dict[str, list[str]]] = None,
+                 blocked_answer: Optional[str] = None) -> str:
     """Build the agent prompt, targeting a specific task."""
 
     manifest_lines = []
@@ -936,6 +1209,21 @@ def build_prompt(task_file: str, spec_dir: str, learnings_file: str,
 **Environment**: This project uses Nix (`flake.nix`). Your PATH already includes all tools from the nix devshell — run commands directly (e.g. `node`, `npm`, `python3`, `pytest`, `uv`). Do NOT prefix commands with `nix develop --command`. Do NOT work around missing native deps with lazy imports or try/except — they are available. If a native dep is genuinely missing, it's a flake.nix issue, not a code issue.
 """
 
+    # ── Inline context: tasks (phase-filtered) and learnings ────────
+    if all_phases:
+        inline_tasks = _extract_phase_block(task_file, task, all_phases)
+    else:
+        inline_tasks = Path(task_file).read_text()
+
+    if all_phases and phase_deps is not None:
+        inline_learnings = _extract_relevant_learnings(
+            learnings_file, task, all_phases, phase_deps
+        )
+    else:
+        inline_learnings = ""
+        if Path(learnings_file).exists():
+            inline_learnings = Path(learnings_file).read_text()
+
     prompt = f"""You are an implementation agent for a spec-kit project. Your job is to execute exactly ONE task from the task list, then stop.
 {nix_note}
 ## Your assigned task
@@ -946,31 +1234,42 @@ This task is in phase **{task.phase}**.
 
 ## Step 1: Read context
 
-Read these files first — they are small and always needed:
-- `{task_file}` — the task list (your assigned task is {task.id})
-- `CLAUDE.md` (if it exists) — build/test commands and project conventions
+Read `CLAUDE.md` (if it exists) for build/test commands and project conventions.
 
-**Validation state directory**: `{spec_dir}/validate/` — if a task has failed validation before, its history is in `{spec_dir}/validate/<TASK_ID>/`.
+**Your task list** (phase-filtered — other phases shown as summaries):
+
+<task-list>
+{inline_tasks}
+</task-list>
 """
 
-    if Path(learnings_file).exists():
-        prompt += f"- `{learnings_file}` — discoveries from previous runs (read this to avoid repeating mistakes)\n"
+    if inline_learnings.strip():
+        prompt += f"""
+**Learnings from prior tasks** (filtered to your phase and its dependencies):
+
+<learnings>
+{inline_learnings}
+</learnings>
+"""
 
     prompt += f"""
+**Validation state directory**: `{spec_dir}/validate/` — if a task has failed validation before, its history is in `{spec_dir}/validate/<TASK_ID>/`.
+
 ## Step 1b: Load only the context you need
 
-Below is a manifest of available reference files with summaries. **Do NOT read all of them.** Based on your specific task, select and read ONLY the files relevant to what you need to implement:
+**Do NOT read `{task_file}` or `{learnings_file}`** — the relevant content is already included above.
+
+Below is a manifest of available reference files. **Do NOT read these unless your task specifically requires them.** Most tasks only need the source files they're modifying plus `CLAUDE.md`.
 
 {manifest}
 
-**Selection guide:**
-- Setup/config tasks → usually just `CLAUDE.md` is enough
-- Tasks referencing data models or schemas → read `data-model.md`
-- Tasks implementing API endpoints → read the relevant contract file
-- Tasks requiring architectural context → read `constitution.md` and/or `plan.md`
-- Tasks referencing feature behavior → read `spec.md`
-- Phase-fix tasks → read ALL files in the referenced `{spec_dir}/validate/<phase>/` directory plus `test-logs/`
-- When in doubt, read `plan.md` — it's the most useful general reference
+**When to read a reference file** (be selective — each file read adds to your context):
+- Tasks referencing data models or schemas → `data-model.md`
+- Tasks implementing API endpoints → the relevant contract file
+- Tasks requiring architectural context → `plan.md`
+- Tasks referencing feature behavior → `spec.md`
+- Phase-fix tasks → ALL files in `{spec_dir}/validate/<phase>/` plus `test-logs/`
+- **Most implementation tasks do NOT need spec.md, plan.md, or data-model.md** — the task description contains what you need
 
 ## Step 2: Execute your assigned task ({task.id})
 
@@ -993,7 +1292,7 @@ Phase-fix tasks are generated by the phase validation agent. They reference a va
 - Implement exactly what the task describes — follow the spec, plan, contracts, and data-model
 - If the task says to write tests, write them and verify they FAIL before writing any implementation
 - If the constitution exists, ensure your implementation complies with all principles
-- If something is unclear or you need a design decision, write the question to `BLOCKED.md` and STOP immediately
+- If something is unclear or you need a design decision, write the question to `BLOCKED.md` (include your task ID in the heading, e.g. `# BLOCKED: {task.id}`) and STOP immediately
 
 **Note**: Phase validation (build/test at phase boundaries) is handled automatically by the runner — you do NOT need to run it.
 
@@ -1006,7 +1305,7 @@ Before marking complete, review your own changes:
 
 ## Step 4: Record learnings
 
-Append any useful discoveries to `{learnings_file}`.
+Append any useful discoveries to `{learnings_file}`. Keep entries concise — max 3 bullet points per task, focusing only on non-obvious gotchas that would save a future agent time. Skip obvious things (API signatures, standard patterns, what was already documented).
 
 ## Step 5: Mark complete and commit
 
@@ -1058,6 +1357,19 @@ Append any useful discoveries to `{learnings_file}`.
 
 """
 
+    if blocked_answer:
+        prompt += f"""## Previous blocker — user response
+
+A previous agent working on this task wrote BLOCKED.md requesting human input. The user has responded. Here is the full BLOCKED.md content (including the original question and the user's edits):
+
+```
+{blocked_answer}
+```
+
+Use this information to proceed with the task. Do NOT write BLOCKED.md again for the same issue.
+
+"""
+
     prompt += f"""## Rules
 
 - Execute your assigned task ({task.id}) ONLY, then stop
@@ -1065,10 +1377,13 @@ Append any useful discoveries to `{learnings_file}`.
 - Do NOT refactor unrelated code
 - Do NOT read ROUTER.md or load any skills
 - Do NOT use the Skill tool
-- If you need user input, write to BLOCKED.md and stop immediately
+- If you need user input, write to BLOCKED.md and stop immediately. ALWAYS include your task ID (e.g. `# BLOCKED: T075`) in the first heading so the runner knows which task to retry.
+- If you need a tool that requires authentication (e.g. `gh` CLI), write `[needs: gh]` in BLOCKED.md with your task ID — the runner will auto-grant it and retry your task
+- SECURITY: If your task has `gh` access, you MUST NOT run any package installation commands (npm install, pip install, go install, cargo install, etc.) — these execute untrusted code that could exfiltrate credentials
+- GIT PUSH: Always push via HTTPS, never SSH. SSH remotes trigger hardware key (YubiKey) prompts that hang in headless mode. Use: `git push https://github.com/<owner>/<repo>.git <branch>` — the `GH_TOKEN` env var handles auth.
 - Prefer minimal changes that satisfy the task description
 - If a task is unnecessary (already done, obsolete), mark it `- [~]` with a reason and move to the next task
-- ALWAYS update `{learnings_file}` if you discovered anything non-obvious
+- ALWAYS update `{learnings_file}` if you discovered anything non-obvious (max 3 concise bullets per task)
 """
     return prompt
 
@@ -1348,172 +1663,6 @@ Commit the review record: `docs: code review #{review_cycle} for {phase_slug}`
 """
 
 
-# ── Network allowlist proxy ─────────────────────────────────────────────
-
-# Default domains agents may connect to.  Everything else is blocked.
-# Default domains agents may connect to.  Everything else is blocked
-# at the DNS level (resolv.conf is neutered inside the sandbox).
-# The CONNECT proxy resolves DNS on the host side for allowed domains.
-#
-# Note: Direct IP connections bypass this (can't prevent without root/eBPF).
-# This stops all hostname-based exfil, which covers npm postinstall, pip
-# install hooks, and any tool that uses standard DNS resolution.
-_NETWORK_ALLOWLIST: list[str] = [
-    # Claude API
-    "api.anthropic.com",
-    "claude.ai",
-    # Package registries (needed for npm install, pip install, uv)
-    "registry.npmjs.org",
-    "pypi.org",
-    "files.pythonhosted.org",
-    # Nix
-    "cache.nixos.org",
-    # GitHub (for git clones in flake inputs, uv installs from git)
-    "github.com",
-    "objects.githubusercontent.com",
-]
-
-import socket as _socket
-
-
-class _AllowlistProxy:
-    """HTTPS CONNECT proxy on localhost with domain allowlist.
-
-    Runs in a background thread.  Agents inside the sandbox set
-    HTTPS_PROXY / HTTP_PROXY to http://127.0.0.1:<port>.  The proxy:
-
-      1. Accepts a connection
-      2. Reads the HTTP CONNECT request (e.g. "CONNECT api.anthropic.com:443")
-      3. Checks the target host against the allowlist
-      4. If allowed: resolves DNS dynamically on the HOST side, connects,
-         replies 200, splices streams
-      5. If denied: replies 403, closes
-
-    DNS inside the sandbox is neutered (resolv.conf → 127.0.0.253), so
-    direct hostname connections fail.  The only path out is through this
-    proxy, which does its own resolution and enforces the allowlist.
-    """
-
-    def __init__(self, allowlist: list[str]):
-        self.allowlist = set(allowlist)
-        self.port: int = 0
-        self._stop = threading.Event()
-        self._server: Optional[_socket.socket] = None
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self):
-        self._server = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-        self._server.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-        self._server.bind(("127.0.0.1", 0))  # OS picks a free port.
-        self.port = self._server.getsockname()[1]
-        self._server.listen(256)
-        self._server.settimeout(1.0)
-        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._stop.set()
-        if self._server:
-            try:
-                self._server.close()
-            except OSError:
-                pass
-        if self._thread:
-            self._thread.join(timeout=3)
-
-    def _accept_loop(self):
-        while not self._stop.is_set():
-            try:
-                client, _ = self._server.accept()
-            except _socket.timeout:
-                continue
-            except OSError:
-                break
-            # Handle each connection in a thread to avoid blocking.
-            threading.Thread(
-                target=self._handle, args=(client,), daemon=True
-            ).start()
-
-    def _handle(self, client: _socket.socket):
-        try:
-            client.settimeout(120)
-            # Read the CONNECT request line.
-            data = b""
-            while b"\r\n\r\n" not in data and len(data) < 8192:
-                chunk = client.recv(4096)
-                if not chunk:
-                    return
-                data += chunk
-
-            first_line = data.split(b"\r\n")[0].decode("ascii", errors="replace")
-            # Expected: "CONNECT host:port HTTP/1.1"
-            parts = first_line.split()
-            if len(parts) < 2 or parts[0] != "CONNECT":
-                client.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-                return
-
-            target = parts[1]  # e.g. "api.anthropic.com:443"
-            host = target.rsplit(":", 1)[0]
-            port = int(target.rsplit(":", 1)[1]) if ":" in target else 443
-
-            # Check allowlist.
-            if host not in self.allowlist:
-                client.sendall(
-                    f"HTTP/1.1 403 Forbidden\r\nX-Blocked-Host: {host}\r\n\r\n".encode()
-                )
-                return
-
-            # Resolve DNS dynamically and connect.
-            try:
-                upstream = _socket.create_connection((host, port), timeout=10)
-            except (OSError, _socket.timeout):
-                client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                return
-
-            # Tell the client the tunnel is open.
-            client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-
-            # Splice data in both directions.
-            self._splice(client, upstream)
-
-        except Exception:
-            pass
-        finally:
-            try:
-                client.close()
-            except OSError:
-                pass
-
-    def _splice(self, a: _socket.socket, b: _socket.socket):
-        """Bidirectional data copy until either side closes."""
-        import select as _sel
-
-        a.setblocking(False)
-        b.setblocking(False)
-        try:
-            while not self._stop.is_set():
-                readable, _, _ = _sel.select([a, b], [], [], 1.0)
-                for sock in readable:
-                    try:
-                        data = sock.recv(65536)
-                    except (BlockingIOError, ConnectionResetError):
-                        continue
-                    if not data:
-                        return
-                    other = b if sock is a else a
-                    try:
-                        other.sendall(data)
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        return
-        finally:
-            try:
-                a.close()
-            except OSError:
-                pass
-            try:
-                b.close()
-            except OSError:
-                pass
 
 
 # ── Sandbox ────────────────────────────────────────────────────────────
@@ -1521,7 +1670,6 @@ class _AllowlistProxy:
 # Resolved once at import time; overwritten by main() after arg parsing.
 _sandbox_enabled: bool = True
 _bwrap_path: Optional[str] = None
-_proxy: Optional[_AllowlistProxy] = None
 
 
 def _detect_bwrap() -> Optional[str]:
@@ -1539,6 +1687,45 @@ def _detect_bwrap() -> Optional[str]:
         candidates = _glob.glob("/nix/store/*-bubblewrap-*/bin/bwrap")
         if candidates:
             return candidates[0]
+    return None
+
+
+# ── GitHub token acquisition ──────────────────────────────────────────
+
+_gh_token_cache: Optional[str] = None
+_gh_token_expires: float = 0.0
+_GH_TOKEN_TTL = 300  # 5 minutes — short-lived to limit exposure window
+
+
+def _acquire_gh_token() -> Optional[str]:
+    """Get a GitHub token via `gh auth token`, cached for 5 minutes.
+
+    Returns None if `gh` is not installed or not authenticated.
+    The token is passed as an env var to sandboxed agents — never written
+    to the filesystem inside the sandbox.
+    """
+    global _gh_token_cache, _gh_token_expires
+
+    now = time.time()
+    if _gh_token_cache and now < _gh_token_expires:
+        return _gh_token_cache
+
+    gh_bin = shutil.which("gh")
+    if not gh_bin:
+        return None
+
+    try:
+        result = subprocess.run(
+            [gh_bin, "auth", "token"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            _gh_token_cache = result.stdout.strip()
+            _gh_token_expires = now + _GH_TOKEN_TTL
+            return _gh_token_cache
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
     return None
 
 
@@ -1666,12 +1853,17 @@ def _build_sandbox_cmd(project_dir: Path, inner_cmd: list[str]) -> list[str]:
 
 # ── Agent spawning ─────────────────────────────────────────────────────
 
-def _build_sandbox_env() -> dict[str, str]:
+def _build_sandbox_env(capabilities: set[str] | None = None) -> dict[str, str]:
     """Build a minimal environment for sandboxed agents.
 
     Credentials are passed here (via Popen env=) instead of bwrap --setenv
     so they don't appear in /proc/*/cmdline of the bwrap process.
+
+    If capabilities includes "gh", a short-lived GH_TOKEN is injected so
+    the agent can use `gh` CLI commands.  Tasks without this capability
+    (e.g. npm install, pip install) never see the token.
     """
+    capabilities = capabilities or set()
     home = Path.home()
     # Inherit PATH from the parent process so nix develop tools (node,
     # python, npm, pytest, etc.) are available inside the sandbox.  Fall
@@ -1698,21 +1890,24 @@ def _build_sandbox_env() -> dict[str, str]:
         if val:
             env[var] = val
 
-    # Network proxy — all HTTPS traffic routed through the allowlist proxy.
-    # DNS is neutered inside the sandbox, so hostname connections only work
-    # through this proxy (which resolves DNS on the host side).
-    if _proxy and _proxy.port:
-        proxy_url = f"http://127.0.0.1:{_proxy.port}"
-        env["HTTPS_PROXY"] = proxy_url
-        env["HTTP_PROXY"] = proxy_url
-        env["ALL_PROXY"] = proxy_url
+    # Capability-gated credentials: only inject when the task declares it.
+    # This keeps tokens away from tasks that run untrusted code (npm/pip install).
+    if "gh" in capabilities:
+        token = _acquire_gh_token()
+        if token:
+            env["GH_TOKEN"] = token
 
     return env
 
 
 def spawn_agent(task: Task, prompt: str, log_path: Path,
-                stderr_path: Path) -> subprocess.Popen:
+                stderr_path: Path,
+                extra_capabilities: set[str] | None = None) -> subprocess.Popen:
     """Spawn a claude CLI process for the given task.
+
+    Capabilities from task.capabilities (parsed from [needs: gh] etc.) plus
+    any extra_capabilities (e.g. granted after a BLOCKED.md request) control
+    which credentials are injected into the sandbox environment.
 
     When sandboxing is enabled, the process runs inside bubblewrap with
     an allowlist-only filesystem.  The OAuth token is passed via a
@@ -1745,10 +1940,27 @@ def spawn_agent(task: Task, prompt: str, log_path: Path,
 
     env = None
 
+    # Merge task-declared capabilities with any extras (e.g. from BLOCKED.md retry)
+    all_caps = set(task.capabilities)
+    if extra_capabilities:
+        all_caps |= extra_capabilities
+
+    # SECURITY: strip credential-bearing capabilities from tasks that may
+    # execute untrusted code (npm install, pip install, etc.).  This is a
+    # hard block — even if [needs: gh] is declared, the token is NOT injected
+    # when the task description contains package-install patterns.
+    if _check_untrusted_code_risk(task):
+        stripped = all_caps & {"gh"}
+        if stripped:
+            import sys as _sys
+            print(f"[SECURITY] Stripping capabilities {stripped} from {task.id} — "
+                  f"task runs untrusted code", file=_sys.stderr)
+        all_caps -= {"gh"}
+
     if _sandbox_enabled and _bwrap_path:
         project_dir = Path.cwd()
         cmd = _build_sandbox_cmd(project_dir, cmd)
-        env = _build_sandbox_env()
+        env = _build_sandbox_env(capabilities=all_caps)
     else:
         # Not sandboxed — still need a clean env to avoid CLAUDECODE
         # detection which makes the CLI refuse to start.
@@ -1765,6 +1977,11 @@ def spawn_agent(task: Task, prompt: str, log_path: Path,
                     env["ANTHROPIC_AUTH_TOKEN"] = tok
             except (json.JSONDecodeError, OSError):
                 pass
+        # Inject GH_TOKEN for non-sandboxed mode too (capability-gated).
+        if "gh" in all_caps and "GH_TOKEN" not in env:
+            token = _acquire_gh_token()
+            if token:
+                env["GH_TOKEN"] = token
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1782,11 +1999,13 @@ def spawn_agent(task: Task, prompt: str, log_path: Path,
     return proc
 
 
-def read_stream_output(log_path: Path, last_pos: int) -> tuple[list[str], int, Optional[int]]:
+def read_stream_output(log_path: Path, last_pos: int) -> tuple[list[str], int, Optional[int], tuple[int, int]]:
     """Read new JSON lines from a stream-json log file.
-    Returns (display_lines, new_position, exit_code_if_result)."""
+    Returns (display_lines, new_position, exit_code_if_result, (input_tokens, output_tokens))."""
     lines = []
     exit_code = None
+    input_tokens = 0
+    output_tokens = 0
     try:
         with open(log_path, "r") as f:
             f.seek(last_pos)
@@ -1802,26 +2021,37 @@ def read_stream_output(log_path: Path, last_pos: int) -> tuple[list[str], int, O
             except json.JSONDecodeError:
                 continue
 
-            if msg.get("type") == "assistant" and msg.get("message", {}).get("content"):
-                for block in msg["message"]["content"]:
-                    if block.get("type") == "text" and block.get("text"):
-                        for tl in block["text"].splitlines():
-                            lines.append(tl)
-                    elif block.get("type") == "tool_use":
-                        inp = block.get("input", {})
-                        name = block.get("name", "?")
-                        detail = ""
-                        if name == "Bash":
-                            detail = inp.get("command", "")[:60]
-                        elif name in ("Read", "Write", "Edit"):
-                            detail = inp.get("file_path", "")
-                        elif name in ("Glob", "Grep"):
-                            detail = inp.get("pattern", "")
-                        elif name == "Agent":
-                            detail = inp.get("description", "")
-                        else:
-                            detail = json.dumps(inp)[:60]
-                        lines.append(f"[{name}] {detail}")
+            if msg.get("type") == "assistant":
+                # Extract token usage from assistant messages
+                usage = msg.get("message", {}).get("usage", {})
+                if usage:
+                    input_tokens = (
+                        usage.get("input_tokens", 0)
+                        + usage.get("cache_creation_input_tokens", 0)
+                        + usage.get("cache_read_input_tokens", 0)
+                    )
+                    output_tokens = usage.get("output_tokens", 0)
+
+                if msg.get("message", {}).get("content"):
+                    for block in msg["message"]["content"]:
+                        if block.get("type") == "text" and block.get("text"):
+                            for tl in block["text"].splitlines():
+                                lines.append(tl)
+                        elif block.get("type") == "tool_use":
+                            inp = block.get("input", {})
+                            name = block.get("name", "?")
+                            detail = ""
+                            if name == "Bash":
+                                detail = inp.get("command", "")[:60]
+                            elif name in ("Read", "Write", "Edit"):
+                                detail = inp.get("file_path", "")
+                            elif name in ("Glob", "Grep"):
+                                detail = inp.get("pattern", "")
+                            elif name == "Agent":
+                                detail = inp.get("description", "")
+                            else:
+                                detail = json.dumps(inp)[:60]
+                            lines.append(f"[{name}] {detail}")
             elif msg.get("type") == "result":
                 if msg.get("result"):
                     lines.append(msg["result"])
@@ -1831,18 +2061,68 @@ def read_stream_output(log_path: Path, last_pos: int) -> tuple[list[str], int, O
                 lines.append(f"ERROR: {err_msg}")
                 exit_code = 2
 
-        return lines, new_pos, exit_code
+        return lines, new_pos, exit_code, (input_tokens, output_tokens)
     except FileNotFoundError:
-        return [], last_pos, None
+        return [], last_pos, None, (0, 0)
 
 
-def check_rate_limited(stderr_path: Path) -> bool:
-    """Check if the agent hit a rate limit."""
+def check_rate_limited(stderr_path: Path, log_path: Optional[Path] = None) -> Optional[float]:
+    """Check if the agent hit a rate limit.
+
+    Returns the resetsAt epoch timestamp if found, or True-ish 1.0 if rate
+    limited but no timestamp available, or None if not rate limited.
+    """
+    # Check JSONL log for rate_limit_event with status "rejected" and resetsAt
+    if log_path:
+        try:
+            for raw_line in reversed(log_path.read_text().splitlines()):
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    msg = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                if msg.get("type") == "rate_limit_event":
+                    info = msg.get("rate_limit_info", {})
+                    if info.get("status") == "rejected" or info.get("overageDisabledReason") == "out_of_credits":
+                        resets_at = info.get("resetsAt")
+                        if resets_at:
+                            return float(resets_at)
+                        return 1.0  # rate limited but no timestamp
+        except Exception:
+            pass
+    # Fallback: check stderr for rate limit keywords
     try:
         text = stderr_path.read_text()
-        return bool(re.search(r'rate.?limit|usage.?limit|429|quota|capacity', text, re.IGNORECASE))
+        if re.search(r'rate.?limit|usage.?limit|429|quota|capacity', text, re.IGNORECASE):
+            return 1.0
     except Exception:
-        return False
+        pass
+    return None
+
+
+def check_auth_error(log_path: Path) -> Optional[str]:
+    """Check if the agent died from a permanent auth error (not retryable).
+
+    Returns the error string if found, None otherwise.
+    """
+    try:
+        for raw_line in reversed(log_path.read_text().splitlines()):
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                msg = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("type") == "result" and msg.get("is_error"):
+                result_text = msg.get("result", "")
+                if re.search(r'authentication_error|401|OAuth token has expired|Failed to authenticate', result_text):
+                    return result_text
+        return None
+    except Exception:
+        return None
 
 
 def check_connection_error(log_path: Path) -> Optional[str]:
@@ -1995,6 +2275,63 @@ def clear_deferred(task_id: str):
         p.unlink()
 
 
+# ── Capability request parsing ────────────────────────────────────────
+
+# Allowed capabilities that can be auto-granted from BLOCKED.md requests.
+# Anything not in this set requires manual user intervention.
+_AUTO_GRANTABLE_CAPS = {"gh"}
+
+# Capabilities that are NEVER allowed alongside untrusted code execution.
+# If a task's description matches any of these patterns, the capability is
+# stripped even if declared, to prevent supply-chain exfiltration.
+_UNTRUSTED_CODE_PATTERNS = re.compile(
+    r'npm\s+install|pip\s+install|pip3\s+install|poetry\s+install|'
+    r'yarn\s+install|pnpm\s+install|cargo\s+install|go\s+install|'
+    r'bundle\s+install|gem\s+install|composer\s+install|'
+    r'apt\s+install|apt-get\s+install|brew\s+install',
+    re.IGNORECASE,
+)
+
+# Credentials that must be stripped when untrusted code patterns are detected.
+_SENSITIVE_ENV_KEYS = {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN"}
+
+
+def _parse_capability_request(blocked_text: str) -> set[str]:
+    """Parse a BLOCKED.md for capability requests like `[needs: gh]`.
+
+    Returns the set of auto-grantable capabilities requested, or empty set
+    if this is a regular block (needs human input).
+    """
+    # Look for [needs: X] or [capability: X] or "needs gh" patterns
+    caps: set[str] = set()
+    for m in re.finditer(r'\[(?:needs|capability|cap):\s*([^\]]+)\]', blocked_text, re.IGNORECASE):
+        for c in m.group(1).split(','):
+            c = c.strip().lower()
+            if c in _AUTO_GRANTABLE_CAPS:
+                caps.add(c)
+
+    # Also match "gh CLI is not authenticated" or similar natural language
+    if not caps and re.search(r'gh\s+(?:cli|auth|token|command).*(?:not\s+(?:authenticated|available|found)|fail)', blocked_text, re.IGNORECASE):
+        caps.add("gh")
+
+    return caps
+
+
+def _extract_blocked_task_id(blocked_text: str) -> Optional[str]:
+    """Try to extract the task ID from a BLOCKED.md file."""
+    m = re.search(r'\b(T\d{3,4})\b', blocked_text)
+    return m.group(1) if m else None
+
+
+def _check_untrusted_code_risk(task: Task) -> bool:
+    """Return True if a task is likely to execute untrusted code (package installs etc).
+
+    When True, sensitive credentials (GH_TOKEN etc) MUST NOT be injected,
+    regardless of declared capabilities.
+    """
+    return bool(_UNTRUSTED_CODE_PATTERNS.search(task.description))
+
+
 def check_circuit_breaker(spec_dir: str, window_minutes: int = 10,
                           threshold: int = 3) -> Optional[int]:
     """Check if recent attempts across all tasks are all connection errors.
@@ -2099,7 +2436,7 @@ def build_retry_prompt(task_file: str, spec_dir: str, learnings_file: str,
 
 1. In `{task_file}`, change task {task.id}'s `- [ ]` to `- [x]`
 2. Commit with: `feat({task.id}): ...`
-3. Append any discoveries to `{learnings_file}`
+3. Append any discoveries to `{learnings_file}` (max 3 concise bullets)
 
 ## If build/test can't run
 
@@ -2119,6 +2456,388 @@ If dependencies can't be fetched (network issues), but the code looks correct:
     return prompt
 
 
+# ── CI debug loop ─────────────────────────────────────────────────────
+#
+# Tasks marked [needs: gh, ci-loop] use a runner-managed debug cycle
+# instead of a single long-running agent.  The runner:
+#
+#   1. Spawns a "push" sub-agent to push current code
+#   2. Polls CI in the main thread (no agent context burned)
+#   3. On failure: downloads logs, spawns a "diagnose" sub-agent that
+#      writes a diagnosis file, then spawns a "fix" sub-agent that
+#      reads the diagnosis and applies the fix
+#   4. Repeats until CI passes or the attempt cap is hit
+#
+# All artifacts go to ci-debug/<task_id>/ so agents can read prior
+# history without inflating their own context.
+
+CI_LOOP_MAX_ATTEMPTS = 50
+CI_LOOP_DIR = "ci-debug"
+
+
+def _get_https_remote_url() -> Optional[str]:
+    """Convert the origin remote URL to HTTPS form for GH_TOKEN auth.
+
+    SSH remotes (git@github.com:user/repo.git) trigger hardware key prompts
+    (YubiKey etc.), so we always push via HTTPS with GH_TOKEN instead.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=10,
+        )
+        url = result.stdout.strip()
+        # Convert SSH URL to HTTPS
+        m = re.match(r'git@github\.com:(.+?)(?:\.git)?$', url)
+        if m:
+            return f"https://github.com/{m.group(1)}.git"
+        if url.startswith("https://"):
+            return url
+    except Exception:
+        pass
+    return None
+
+
+def _gh_push(branch: str, log_fn=None) -> bool:
+    """Push to origin using GH_TOKEN over HTTPS (avoids SSH/YubiKey prompts).
+
+    Returns True on success.
+    """
+    token = _acquire_gh_token()
+    if not token:
+        if log_fn:
+            log_fn("No GH_TOKEN available for push")
+        return False
+
+    https_url = _get_https_remote_url()
+    if not https_url:
+        if log_fn:
+            log_fn("Could not determine HTTPS remote URL")
+        return False
+
+    # Use token in the URL for auth (git strips it from logs)
+    auth_url = https_url.replace("https://", f"https://x-access-token:{token}@")
+
+    env = dict(os.environ)
+    # Disable SSH agent to prevent YubiKey prompts
+    env.pop("SSH_AUTH_SOCK", None)
+
+    result = subprocess.run(
+        ["git", "push", auth_url, branch],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+    if result.returncode != 0:
+        if log_fn:
+            log_fn(f"Push failed: {result.stderr.strip()}")
+        return False
+    return True
+
+
+def _ci_debug_dir(task_id: str) -> Path:
+    """Return (and create) the ci-debug directory for a task."""
+    d = Path(CI_LOOP_DIR) / task_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _poll_ci_run(branch: str, timeout_minutes: int = 30,
+                 stop_event: Optional[threading.Event] = None) -> dict:
+    """Poll GitHub Actions for the latest run on `branch` until it completes.
+
+    Returns a dict with keys: status ("pass"|"fail"|"timeout"|"error"),
+    run_id, conclusion, url, and failed_jobs (list of job names).
+
+    If stop_event is set during polling, returns early with status "interrupted".
+    """
+    import time as _time
+
+    def _should_stop() -> bool:
+        return stop_event is not None and stop_event.is_set()
+
+    # Wait a moment for GitHub to register the push
+    for _ in range(10):
+        if _should_stop():
+            return {"status": "interrupted", "error": "drain/shutdown requested"}
+        _time.sleep(1)
+
+    # Find the latest run for this branch
+    try:
+        result = subprocess.run(
+            ["gh", "run", "list", "--branch", branch, "--limit", "1", "--json",
+             "databaseId,status,conclusion,url,headSha"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return {"status": "error", "error": f"gh run list failed: {result.stderr.strip()}"}
+
+        runs = json.loads(result.stdout)
+        if not runs:
+            return {"status": "error", "error": f"No CI runs found for branch {branch}"}
+
+        run = runs[0]
+        run_id = run["databaseId"]
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+    # Poll until complete
+    deadline = _time.time() + timeout_minutes * 60
+    while _time.time() < deadline:
+        if _should_stop():
+            return {"status": "interrupted", "run_id": run_id, "error": "drain/shutdown requested"}
+        try:
+            result = subprocess.run(
+                ["gh", "run", "view", str(run_id), "--json",
+                 "status,conclusion,url,jobs"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                # Sleep in small increments to stay responsive to stop_event
+                for _ in range(30):
+                    if _should_stop():
+                        return {"status": "interrupted", "run_id": run_id, "error": "drain/shutdown requested"}
+                    _time.sleep(1)
+                continue
+
+            data = json.loads(result.stdout)
+            if data.get("status") == "completed":
+                conclusion = data.get("conclusion", "unknown")
+                failed_jobs = [
+                    j["name"] for j in data.get("jobs", [])
+                    if j.get("conclusion") not in ("success", "skipped", None)
+                ]
+                return {
+                    "status": "pass" if conclusion == "success" else "fail",
+                    "run_id": run_id,
+                    "conclusion": conclusion,
+                    "url": data.get("url", ""),
+                    "failed_jobs": failed_jobs,
+                }
+        except Exception:
+            pass
+        # Sleep in small increments to stay responsive to stop_event
+        for _ in range(30):
+            if _should_stop():
+                return {"status": "interrupted", "run_id": run_id, "error": "drain/shutdown requested"}
+            _time.sleep(1)
+
+    return {"status": "timeout", "run_id": run_id}
+
+
+def _download_ci_logs(run_id: int, output_path: Path) -> bool:
+    """Download failed job logs from a CI run to a file.
+
+    Returns True if logs were written successfully.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "run", "view", str(run_id), "--log-failed"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            output_path.write_text(result.stdout)
+            return True
+        # Fallback: try full log
+        result = subprocess.run(
+            ["gh", "run", "view", str(run_id), "--log"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0:
+            # Truncate to last 500 lines to keep it manageable
+            lines = result.stdout.splitlines()
+            output_path.write_text("\n".join(lines[-500:]))
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _download_ci_artifact(run_id: int, artifact_name: str, output_dir: Path) -> Optional[Path]:
+    """Download a specific artifact from a CI run. Returns path or None."""
+    try:
+        result = subprocess.run(
+            ["gh", "run", "download", str(run_id), "-n", artifact_name, "-D", str(output_dir)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode == 0:
+            # Find the downloaded file
+            for f in output_dir.iterdir():
+                return f
+    except Exception:
+        pass
+    return None
+
+
+def build_ci_diagnose_prompt(task_id: str, attempt: int, debug_dir: Path,
+                             ci_result: dict, learnings_file: str) -> str:
+    """Build prompt for the CI diagnosis sub-agent.
+
+    This agent reads CI logs + prior history and writes a diagnosis file.
+    It does NOT fix code — just analyzes and recommends.
+    """
+    log_file = debug_dir / f"attempt-{attempt}-logs.txt"
+    history_files = sorted(debug_dir.glob("attempt-*-diagnosis.md"))
+    prior_section = ""
+    if history_files:
+        prior_section = f"""## Prior diagnosis history
+
+These files contain diagnoses from previous CI attempts. Read them to understand
+what was already tried and avoid repeating failed fixes:
+
+"""
+        for hf in history_files:
+            prior_section += f"- `{hf}`\n"
+        prior_section += "\n"
+
+    nix_note = ""
+    if (Path.cwd() / "flake.nix").exists():
+        nix_note = "**Environment**: This project uses Nix. Your PATH includes all devshell tools.\n\n"
+
+    return f"""You are a CI failure diagnosis agent for task **{task_id}**, attempt #{attempt}.
+
+{nix_note}## Your job
+
+Analyze the CI failure and write a diagnosis to `{debug_dir}/attempt-{attempt}-diagnosis.md`.
+
+**You MUST NOT modify any source code, config files, or CI workflows.**
+Your only output is the diagnosis file.
+
+## CI result
+
+- **Status**: {ci_result.get('conclusion', 'unknown')}
+- **URL**: {ci_result.get('url', 'N/A')}
+- **Failed jobs**: {', '.join(ci_result.get('failed_jobs', [])) or 'unknown'}
+- **Run ID**: {ci_result.get('run_id', 'N/A')}
+
+## Input files
+
+1. **CI failure logs**: `{log_file}` — raw output from failed CI jobs
+2. **Learnings**: `{learnings_file}` — project-specific gotchas
+
+{prior_section}## Diagnosis file format
+
+Write `{debug_dir}/attempt-{attempt}-diagnosis.md` with this structure:
+
+```markdown
+# CI Diagnosis — Attempt {attempt}
+
+## Root cause
+[One paragraph: what exactly failed and why]
+
+## Failed jobs
+[List each failed job with its specific error]
+
+## Recommended fix
+[Specific files to change and what to change — be precise with line numbers]
+
+## Risk assessment
+[What might break if this fix is applied naively]
+
+## Files to modify
+[Bulleted list of exact file paths that need changes]
+```
+
+## Rules
+
+- Read the CI logs thoroughly before writing
+- If prior diagnoses exist, note what changed since the last attempt
+- Be specific: "line 42 of .github/workflows/ci.yml references a nonexistent action" not "CI config is wrong"
+- If the same root cause repeats across attempts, flag it as a deeper issue
+- Do NOT modify any files other than the diagnosis file
+- Do NOT read ROUTER.md or use the Skill tool
+"""
+
+
+def build_ci_fix_prompt(task_id: str, attempt: int, debug_dir: Path,
+                        task_file: str, learnings_file: str) -> str:
+    """Build prompt for the CI fix sub-agent.
+
+    This agent reads the diagnosis and applies the fix + pushes.
+    """
+    diagnosis_file = debug_dir / f"attempt-{attempt}-diagnosis.md"
+    history_files = sorted(debug_dir.glob("attempt-*-diagnosis.md"))
+
+    nix_note = ""
+    if (Path.cwd() / "flake.nix").exists():
+        nix_note = "**Environment**: This project uses Nix. Your PATH includes all devshell tools.\n\n"
+
+    return f"""You are a CI fix agent for task **{task_id}**, attempt #{attempt}.
+
+{nix_note}## Your job
+
+1. Read `CLAUDE.md` for the project's build, lint, and test commands
+2. Read the diagnosis at `{diagnosis_file}`
+3. Apply the recommended fix
+4. **Run local validation before pushing** (see below)
+5. Commit and push to the current branch
+
+## Context files
+
+- **CLAUDE.md** — read this FIRST for build/test/lint commands
+- **Diagnosis**: `{diagnosis_file}` — read this to understand what to fix
+- **Prior attempts**: `{debug_dir}/` — contains logs and diagnoses from all attempts
+- **Learnings**: `{learnings_file}` — project-specific gotchas
+
+## Local validation (MANDATORY)
+
+After applying your fix, you MUST run local validation before pushing. Each wasted CI cycle costs 10-30 minutes of polling — catching regressions locally is critical.
+
+1. **Build**: Run the project's build command (e.g. `go build ./...`, `npm run build`, `cargo build`). If it fails, fix the build error before proceeding.
+2. **Lint**: Run the project's linter (e.g. `golangci-lint run`, `npm run lint`, `cargo clippy`). Fix any lint errors your changes introduced.
+3. **Unit tests**: Run the project's test suite with the short/unit flag (e.g. `go test -short ./...`, `npm test`, `pytest -x`). If tests fail, determine whether:
+   - Your fix caused the failure → fix it before pushing
+   - The failure is pre-existing (unrelated to your changes) → note it in `{debug_dir}/attempt-{attempt}-fix-notes.md` and proceed
+4. **Integration tests** (if available and fast): Run integration tests if the project has them and they complete in under 5 minutes. Skip if they require external services not available locally.
+
+**Only push after build + lint + tests pass** (or after confirming failures are pre-existing). If your fix doesn't compile or breaks tests, fix it — do NOT push broken code and wait 30 minutes for CI to tell you what you already could have caught locally.
+
+If ALL local validation commands fail to run (e.g. missing toolchain, no test infrastructure), document why in `{debug_dir}/attempt-{attempt}-fix-notes.md` and push anyway — but this should be rare.
+
+## Rules
+
+- Fix ONLY what the diagnosis identifies — do not refactor or improve other code
+- Commit with message: `fix({task_id}): [description of CI fix]`
+- Push to the current branch using HTTPS (not SSH) to avoid hardware key prompts:
+  `git push https://github.com/<owner>/<repo>.git <branch>` — the `GH_TOKEN` env var handles auth automatically
+- If the diagnosis is unclear or you disagree with it, write your reasoning to
+  `{debug_dir}/attempt-{attempt}-fix-notes.md` before applying an alternative fix
+- Do NOT create PRs or merge anything — the runner handles that after CI passes
+- Do NOT read ROUTER.md or use the Skill tool
+- Append any CI-specific discoveries to `{learnings_file}`
+"""
+
+
+def build_ci_finalize_prompt(task_id: str, task_file: str, debug_dir: Path,
+                             learnings_file: str) -> str:
+    """Build prompt for the CI finalization sub-agent.
+
+    Runs after CI passes: creates PR, marks task complete.
+    """
+    nix_note = ""
+    if (Path.cwd() / "flake.nix").exists():
+        nix_note = "**Environment**: This project uses Nix. Your PATH includes all devshell tools.\n\n"
+
+    return f"""You are a CI finalization agent for task **{task_id}**.
+
+{nix_note}CI has passed. Complete the task:
+
+1. Read the task description in `{task_file}` for {task_id}
+2. If the task says to create a PR: create it with `gh pr create`
+3. If the task describes additional post-CI steps (verify release, merge, etc.), do those
+4. Mark {task_id} as complete: change `- [ ]` to `- [x]` in `{task_file}`
+5. Commit: `feat({task_id}): CI/CD validation complete`
+6. Append a summary of the CI debug process to `{learnings_file}`
+
+## CI debug history
+
+The full history of CI attempts is in `{debug_dir}/`. Reference it for the learnings entry.
+
+## Rules
+
+- Do NOT read ROUTER.md or use the Skill tool
+- Do NOT re-push code — CI already passed on the current HEAD
+"""
+
+
 # ── Main orchestrator ─────────────────────────────────────────────────
 
 class Runner:
@@ -2131,6 +2850,7 @@ class Runner:
         self.script_dir = Path(__file__).parent
         self.skills_dir = self.script_dir.parent
         self.blocked_file = Path("BLOCKED.md")
+        self._blocked_answers: dict[str, str] = {}  # task_id -> user's answer from BLOCKED.md
         self.log_dir = Path("logs")
         self.log_dir.mkdir(exist_ok=True)
         self.timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -2179,16 +2899,19 @@ class Runner:
         if pidfile.exists():
             try:
                 old_pid = int(pidfile.read_text().strip())
-                # Check if the old process is still running.
-                os.kill(old_pid, 0)
-                # It's alive — kill its entire process group.
-                self.log(f"Killing stale runner (PID {old_pid}) from previous run")
-                try:
-                    os.killpg(os.getpgid(old_pid), signal.SIGTERM)
-                    time.sleep(2)
-                    os.killpg(os.getpgid(old_pid), signal.SIGKILL)
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
+                if old_pid == os.getpid():
+                    pass  # That's us (re-exec'd) — don't self-kill
+                else:
+                    # Check if the old process is still running.
+                    os.kill(old_pid, 0)
+                    # It's alive — kill its entire process group.
+                    self.log(f"Killing stale runner (PID {old_pid}) from previous run")
+                    try:
+                        os.killpg(os.getpgid(old_pid), signal.SIGTERM)
+                        time.sleep(2)
+                        os.killpg(os.getpgid(old_pid), signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        pass
             except (ValueError, ProcessLookupError, OSError):
                 pass  # Stale pidfile, process already gone.
 
@@ -2207,13 +2930,31 @@ class Runner:
         signal.signal(signal.SIGTERM, self._handle_signal)
         self._cleanup_stale_run()
 
-        # Check for leftover BLOCKED.md
+        # Check for leftover BLOCKED.md — if the user edited it with an answer, consume and continue
         if self.blocked_file.exists():
-            print("=== BLOCKED ===")
-            print(f"The agent has a pending question in {self.blocked_file}:")
-            print(self.blocked_file.read_text())
-            print("Edit the file with your answer, then delete it and re-run.")
-            sys.exit(2)
+            blocked_text = self.blocked_file.read_text()
+            # Try auto-grant first (capability requests like [needs: gh])
+            requested_caps = _parse_capability_request(blocked_text)
+            blocked_task_id = _extract_blocked_task_id(blocked_text)
+            if requested_caps:
+                if blocked_task_id:
+                    if not hasattr(self, '_granted_capabilities'):
+                        self._granted_capabilities: dict[str, set[str]] = {}
+                    self._granted_capabilities.setdefault(blocked_task_id, set()).update(requested_caps)
+                    self.log(f"Auto-granted capabilities {requested_caps} for {blocked_task_id}")
+                self.blocked_file.unlink()
+            elif blocked_task_id:
+                # User edited the file with their answer — consume it and retry the task
+                self._blocked_answers[blocked_task_id] = blocked_text
+                self.blocked_file.unlink()
+                self.log(f"Consumed user answer from BLOCKED.md for {blocked_task_id}")
+            else:
+                # Can't determine which task this is for — ask the user
+                print("=== BLOCKED ===")
+                print(f"BLOCKED.md exists but no task ID (e.g. T075) was found in it:")
+                print(blocked_text)
+                print("\nEnsure BLOCKED.md contains a task ID, then re-run. The runner will clean up the file.")
+                sys.exit(2)
 
         try:
             for spec_dir in self.spec_dirs:
@@ -2360,19 +3101,42 @@ class Runner:
         flake_hash_at_start = _flake_hash()
 
         while not self._shutdown.is_set() and total_runs < self.max_runs:
-            # If an agent modified flake.nix, drain and re-exec inside
-            # the new nix develop shell so updated tools are on PATH.
+            # If an agent modified flake.nix, drain running agents and
+            # re-exec inside the new nix develop shell so updated tools
+            # are on PATH for subsequent agents.
             if flake_path.exists() and _flake_hash() != flake_hash_at_start:
-                self.log("flake.nix changed — draining agents and restarting inside new nix develop shell")
+                self.log("flake.nix changed — draining agents before re-exec into new nix develop shell")
                 self._draining.set()
                 self._drain_agents()
+                self._draining.clear()
                 if self.tui:
                     self.tui.stop()
-                os.execvp("nix", [
-                    "nix", "develop", "--command",
-                    sys.executable, *sys.argv,
-                ])
-                # execvp replaces the process — this line is never reached
+                # Test that the new flake evaluates before committing to re-exec.
+                nix_cmd = ["nix", "develop", "--command"]
+                if os.environ.get("NIXPKGS_ALLOW_UNFREE") == "1":
+                    nix_cmd = ["nix", "develop", "--impure", "--command"]
+                probe = subprocess.run(
+                    nix_cmd + ["true"],
+                    capture_output=True, timeout=120,
+                )
+                if probe.returncode != 0 and b"unfree" in probe.stderr:
+                    self.log("Flake contains unfree packages — retrying with --impure")
+                    os.environ["NIXPKGS_ALLOW_UNFREE"] = "1"
+                    nix_cmd = ["nix", "develop", "--impure", "--command"]
+                    probe = subprocess.run(
+                        nix_cmd + ["true"],
+                        capture_output=True, timeout=120,
+                    )
+                if probe.returncode == 0:
+                    self.log("Re-execing into new nix develop shell...")
+                    os.execvp("nix", nix_cmd + [sys.executable, *sys.argv])
+                    # execvp replaces the process — this line is never reached
+                else:
+                    self.log(
+                        f"nix develop failed (exit {probe.returncode}) — "
+                        f"continuing with current shell. stderr: {probe.stderr.decode()[:200]}"
+                    )
+                    flake_hash_at_start = _flake_hash()
 
             # Re-parse task file to pick up changes from agents
             phases, phase_deps = parse_task_file(task_file)
@@ -2380,6 +3144,13 @@ class Runner:
             phase_states = scan_phase_validation_states(spec_dir)
             validated_phases = {s for s, st in phase_states.items() if st.complete}
             scheduler = Scheduler(phases, phase_deps, validated_phases, phase_states)
+
+            # Auto-prune learnings for fully-validated phases with no pending dependents
+            pruned = _prune_completed_learnings(
+                str(learnings_file), phases, phase_deps, validated_phases
+            )
+            if pruned > 0:
+                self.log(f"Pruned {pruned} learnings section(s) from fully-validated phases")
 
             if self.tui:
                 self.tui.phases = phases
@@ -2399,14 +3170,28 @@ class Runner:
                 time.sleep(1)
                 continue
 
-            # Check BLOCKED.md
+            # Check BLOCKED.md — auto-grant capability requests, pause for everything else
             if self.blocked_file.exists():
-                self.log("BLOCKED — agent needs input")
-                if self.tui:
-                    self.tui.stop()
-                print(f"\n=== BLOCKED ===\n{self.blocked_file.read_text()}")
-                print("Edit the file with your answer, delete it, then re-run.")
-                sys.exit(2)
+                blocked_text = self.blocked_file.read_text()
+                requested_caps = _parse_capability_request(blocked_text)
+                if requested_caps:
+                    # Auto-grant: remove BLOCKED.md, record granted caps for the task
+                    blocked_task_id = _extract_blocked_task_id(blocked_text)
+                    self.blocked_file.unlink()
+                    if blocked_task_id:
+                        if not hasattr(self, '_granted_capabilities'):
+                            self._granted_capabilities: dict[str, set[str]] = {}
+                        self._granted_capabilities.setdefault(blocked_task_id, set()).update(requested_caps)
+                        self.log(f"Auto-granted capabilities {requested_caps} for {blocked_task_id} — will retry with them")
+                    else:
+                        self.log(f"Capability request found but no task ID in BLOCKED.md — granting broadly")
+                else:
+                    self.log("BLOCKED — agent needs input")
+                    if self.tui:
+                        self.tui.stop()
+                    print(f"\n=== BLOCKED ===\n{blocked_text}")
+                    print("Edit BLOCKED.md with your answer, then re-run. The runner will clean up the file.")
+                    sys.exit(2)
 
             # Get running task IDs
             with self._lock:
@@ -2454,6 +3239,37 @@ class Runner:
                         clear_deferred(task.id)
                         self.log(f"Running deferred task {task.id} (solo slot)")
 
+                # ── CI loop tasks get a dedicated runner-managed cycle ──
+                if "ci-loop" in task.capabilities:
+                    self.log(f"Task {task.id} is a [ci-loop] task — running CI debug loop")
+                    # Run in a thread so the main loop can continue managing other agents
+                    ci_thread = threading.Thread(
+                        target=self._run_ci_loop,
+                        args=(task, spec_dir, task_file, str(learnings_file)),
+                        daemon=True,
+                        name=f"ci-loop-{task.id}",
+                    )
+                    ci_thread.start()
+                    running_ids.add(task.id)
+                    # Track as a virtual agent slot for TUI display
+                    self.agent_counter += 1
+                    slot = AgentSlot(
+                        agent_id=self.agent_counter,
+                        task=task,
+                        start_time=time.time(),
+                        status="running",
+                    )
+                    with self._lock:
+                        self.agents.append(slot)
+                    # Store thread reference for cleanup
+                    if not hasattr(self, '_ci_threads'):
+                        self._ci_threads: dict[str, threading.Thread] = {}
+                    self._ci_threads[task.id] = ci_thread
+                    available_slots -= 1
+                    spawned += 1
+                    total_runs += 1
+                    continue
+
                 history = read_attempt_history(spec_dir, task.id)
 
                 # Use lightweight retry prompt when code exists but agents
@@ -2468,7 +3284,10 @@ class Runner:
                     prompt = build_prompt(
                         str(task_file), spec_dir, str(learnings_file),
                         str(constitution), reference_files, task,
-                        attempt_history=history if history else None
+                        attempt_history=history if history else None,
+                        all_phases=phases,
+                        phase_deps=phase_deps,
+                        blocked_answer=self._blocked_answers.pop(task.id, None),
                     )
 
                 self.agent_counter += 1
@@ -2481,7 +3300,13 @@ class Runner:
                 att_str = f" (attempt #{attempt_num})" if attempt_num > 1 else ""
                 self.log(f"Spawning Agent {agent_id} for task {task.id}{att_str}: {task.description[:60]}")
 
-                proc = spawn_agent(task, prompt, log_path, stderr_path)
+                # Pass any capabilities granted via BLOCKED.md auto-retry
+                extra_caps = None
+                if hasattr(self, '_granted_capabilities'):
+                    extra_caps = self._granted_capabilities.get(task.id)
+
+                proc = spawn_agent(task, prompt, log_path, stderr_path,
+                                   extra_capabilities=extra_caps)
 
                 slot = AgentSlot(
                     agent_id=agent_id,
@@ -2637,6 +3462,16 @@ class Runner:
         if not hasattr(self, '_read_positions'):
             self._read_positions = {}
 
+        # Check for completed CI loop threads
+        if hasattr(self, '_ci_threads'):
+            for task_id, thread in list(self._ci_threads.items()):
+                if not thread.is_alive():
+                    self.log(f"CI loop thread for {task_id} completed")
+                    del self._ci_threads[task_id]
+                    # Remove the virtual agent slot
+                    with self._lock:
+                        self.agents = [a for a in self.agents if a.task.id != task_id]
+
         while not self._shutdown.is_set():
             with self._lock:
                 if not self.agents:
@@ -2649,7 +3484,7 @@ class Runner:
             for agent in agents_snapshot:
                 if agent.log_file:
                     pos = self._read_positions.get(agent.agent_id, 0)
-                    new_lines, new_pos, exit_code = read_stream_output(agent.log_file, pos)
+                    new_lines, new_pos, exit_code, (in_tok, out_tok) = read_stream_output(agent.log_file, pos)
                     self._read_positions[agent.agent_id] = new_pos
 
                     if new_lines:
@@ -2657,6 +3492,12 @@ class Runner:
                         # Keep only last 200 lines
                         if len(agent.output_lines) > 200:
                             agent.output_lines = agent.output_lines[-200:]
+
+                    # Update token counts (latest usage from stream replaces prior)
+                    if in_tok > 0:
+                        agent.input_tokens = in_tok
+                    if out_tok > 0:
+                        agent.output_tokens = out_tok
 
                     if exit_code is not None:
                         agent.exit_code = exit_code
@@ -2674,9 +3515,14 @@ class Runner:
                         else:
                             agent.status = "done"
                             self.log(f"Agent {agent.agent_id} ({agent.task.id}) completed successfully")
-                    elif check_rate_limited(stderr_path):
+                    elif (_rl := check_rate_limited(stderr_path, agent.log_file)):
                         agent.status = "rate_limited"
+                        agent._resets_at = _rl
                         self.log(f"Agent {agent.agent_id} ({agent.task.id}) rate limited — will retry")
+                    elif agent.log_file and check_auth_error(agent.log_file):
+                        agent.status = "auth_error"
+                        auth_err = check_auth_error(agent.log_file)
+                        self.log(f"Agent {agent.agent_id} ({agent.task.id}) auth error (permanent): {auth_err[:80]}")
                     elif agent.log_file and check_connection_error(agent.log_file):
                         agent.status = "connection_error"
                         conn_err = check_connection_error(agent.log_file)
@@ -2701,9 +3547,21 @@ class Runner:
 
                 # Handle retryable agents
                 for agent in finished:
-                    if agent.status == "rate_limited":
-                        self.log(f"Rate limited on {agent.task.id}. Waiting 60s before retry...")
-                        time.sleep(60)
+                    if agent.status == "auth_error":
+                        # Auth errors are permanent — stop the entire run
+                        agent.task.status = TaskStatus.FAILED
+                        self.log(f"FATAL: Auth error on {agent.task.id} — stopping all tasks. Re-authenticate and re-run.")
+                        self._shutdown.set()
+                    elif agent.status == "rate_limited":
+                        resets_at = getattr(agent, '_resets_at', None)
+                        if resets_at and resets_at > 1.0:
+                            wait_secs = max(0, resets_at - time.time()) + 10  # 10s buffer
+                            reset_time = datetime.fromtimestamp(resets_at).strftime("%H:%M:%S")
+                            self.log(f"Rate limited on {agent.task.id}. Waiting until {reset_time} ({int(wait_secs)}s)...")
+                            time.sleep(wait_secs)
+                        else:
+                            self.log(f"Rate limited on {agent.task.id}. Waiting 60s before retry...")
+                            time.sleep(60)
                         # Task stays PENDING, will be picked up next iteration
                     elif agent.status == "connection_error":
                         # Task stays PENDING — attempt history will guide the next agent
@@ -2724,6 +3582,232 @@ class Runner:
                     self.tui.update_agents(list(self.agents))
 
             time.sleep(1)
+
+    def _run_ci_loop(self, task: Task, spec_dir: str, task_file: Path,
+                     learnings_file: str):
+        """Run the CI debug loop for a [ci-loop] task.
+
+        Uses separate sub-agents for diagnosis and fixing, with the runner
+        polling CI in the main thread. All artifacts written to ci-debug/<task_id>/.
+
+        This method blocks until CI passes or the attempt cap is hit.
+        """
+        debug_dir = _ci_debug_dir(task.id)
+        ci_log_path = debug_dir / "ci-loop.log"
+
+        def ci_log(msg: str):
+            """Log to both the runner and the CI loop's own log file."""
+            ts = datetime.now().strftime("%H:%M:%S")
+            line = f"[{ts}] {msg}"
+            # Write to ci-loop.log for file-based visibility
+            with open(ci_log_path, "a") as f:
+                f.write(line + "\n")
+            # Update the virtual agent slot's output_lines for TUI display
+            with self._lock:
+                for agent in self.agents:
+                    if agent.task.id == task.id:
+                        agent.output_lines.append(line)
+                        if len(agent.output_lines) > 200:
+                            agent.output_lines = agent.output_lines[-200:]
+                        break
+            # Also log to runner (works in headless mode)
+            self.log(msg)
+
+        def _wait_for_subagent(sub_task: Task, prompt: str, label: str,
+                               caps: set[str] | None = None) -> int:
+            """Spawn a sub-agent, track it in the TUI, and wait for completion.
+
+            Returns the process exit code.
+            """
+            self.agent_counter += 1
+            aid = self.agent_counter
+            log_p = self.log_dir / f"agent-{aid}-{sub_task.id}-{self.timestamp}.jsonl"
+            stderr_p = self.log_dir / f"agent-{aid}-{sub_task.id}-{self.timestamp}.stderr"
+            proc = spawn_agent(sub_task, prompt, log_p, stderr_p,
+                               extra_capabilities=caps)
+
+            # Create a visible agent slot so TUI shows the sub-agent
+            slot = AgentSlot(
+                agent_id=aid, task=sub_task, process=proc,
+                pid=proc.pid, start_time=time.time(),
+                log_file=log_p, status="running",
+            )
+            with self._lock:
+                self.agents.append(slot)
+
+            ci_log(f"Spawned {label} (Agent {aid}, pid {proc.pid})")
+            proc.wait()
+            slot.status = "done" if proc.returncode == 0 else "failed"
+
+            # Remove sub-agent slot
+            with self._lock:
+                self.agents = [a for a in self.agents if a.agent_id != aid]
+
+            ci_log(f"{label} completed (exit {proc.returncode})")
+            return proc.returncode
+
+        branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+
+        # Write initial state file for resumability
+        state_file = debug_dir / "state.json"
+        state = {"task_id": task.id, "branch": branch, "attempts": []}
+        if state_file.exists():
+            try:
+                state = json.loads(state_file.read_text())
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        start_attempt = len(state["attempts"]) + 1
+        ci_log(f"Starting CI loop for {task.id} on branch {branch} (attempt {start_attempt})")
+
+        for attempt in range(start_attempt, CI_LOOP_MAX_ATTEMPTS + 1):
+            if self._shutdown.is_set():
+                ci_log(f"CI loop interrupted by shutdown")
+                return
+            if self._draining.is_set():
+                ci_log(f"CI loop stopping — drain requested (will resume on next run, attempt {attempt})")
+                return
+
+            attempt_record = {"attempt": attempt, "started": datetime.now().isoformat()}
+
+            # ── Step 1: Push (first attempt only; subsequent attempts have fix agent push) ──
+            if attempt == start_attempt:
+                ci_log(f"Attempt {attempt}: pushing to {branch}")
+                try:
+                    push_ok = _gh_push(branch, ci_log)
+                    if not push_ok:
+                        attempt_record["status"] = "push_failed"
+                        state["attempts"].append(attempt_record)
+                        state_file.write_text(json.dumps(state, indent=2))
+                        continue
+                except subprocess.TimeoutExpired:
+                    ci_log("Push timed out")
+                    continue
+
+            # ── Step 2: Poll CI (no agent context burned) ──
+            # Combine shutdown + draining into a single stop event for the poller
+            stop_event = threading.Event()
+            def _watch_stop():
+                while not stop_event.is_set():
+                    if self._shutdown.is_set() or self._draining.is_set():
+                        stop_event.set()
+                        return
+                    time.sleep(1)
+            watcher = threading.Thread(target=_watch_stop, daemon=True)
+            watcher.start()
+
+            ci_log(f"Attempt {attempt}: polling CI on {branch}...")
+            ci_result = _poll_ci_run(branch, stop_event=stop_event)
+            stop_event.set()  # stop the watcher thread
+            attempt_record["ci_result"] = ci_result
+
+            ci_result_file = debug_dir / f"attempt-{attempt}-ci-result.json"
+            ci_result_file.write_text(json.dumps(ci_result, indent=2))
+
+            if ci_result["status"] == "interrupted":
+                ci_log(f"CI polling interrupted by drain/shutdown")
+                attempt_record["status"] = "interrupted"
+                state["attempts"].append(attempt_record)
+                state_file.write_text(json.dumps(state, indent=2))
+                return
+
+            if ci_result["status"] == "pass":
+                ci_log(f"CI passed on attempt {attempt}!")
+                attempt_record["status"] = "pass"
+                state["attempts"].append(attempt_record)
+                state_file.write_text(json.dumps(state, indent=2))
+
+                # ── Finalize: create PR, mark complete ──
+                prompt = build_ci_finalize_prompt(
+                    task.id, str(task_file), debug_dir, learnings_file
+                )
+                finalize_task = Task(
+                    id=f"{task.id}-finalize",
+                    description=f"Finalize CI task {task.id}",
+                    phase=task.phase, parallel=False,
+                    status=TaskStatus.RUNNING, line_num=0,
+                    capabilities=task.capabilities,
+                )
+                _wait_for_subagent(finalize_task, prompt, "Finalize agent",
+                                   caps=task.capabilities)
+                return
+
+            if ci_result["status"] in ("error", "timeout"):
+                ci_log(f"CI {ci_result['status']}: {ci_result.get('error', 'timed out')}")
+                attempt_record["status"] = ci_result["status"]
+                state["attempts"].append(attempt_record)
+                state_file.write_text(json.dumps(state, indent=2))
+                if ci_result["status"] == "timeout":
+                    return
+                continue
+
+            # ── Step 3: CI failed — download logs ──
+            failed_jobs = ', '.join(ci_result.get('failed_jobs', [])) or 'unknown'
+            ci_log(f"CI failed (attempt {attempt}): {failed_jobs}")
+            log_file = debug_dir / f"attempt-{attempt}-logs.txt"
+            if not _download_ci_logs(ci_result["run_id"], log_file):
+                ci_log("Failed to download CI logs")
+                log_file.write_text(f"Failed to download logs for run {ci_result['run_id']}")
+
+            _download_ci_artifact(ci_result["run_id"], "ci-summary", debug_dir)
+
+            # ── Step 4: Diagnose ──
+            diag_prompt = build_ci_diagnose_prompt(
+                task.id, attempt, debug_dir, ci_result, learnings_file,
+            )
+            diag_task = Task(
+                id=f"{task.id}-diag-{attempt}",
+                description=f"Diagnose CI failure #{attempt}",
+                phase=task.phase, parallel=False,
+                status=TaskStatus.RUNNING, line_num=0,
+            )
+            _wait_for_subagent(diag_task, diag_prompt, f"Diagnosis agent (attempt {attempt})")
+
+            diag_file = debug_dir / f"attempt-{attempt}-diagnosis.md"
+            if not diag_file.exists():
+                ci_log("Diagnosis agent didn't write diagnosis file — skipping fix")
+                attempt_record["status"] = "diag_failed"
+                state["attempts"].append(attempt_record)
+                state_file.write_text(json.dumps(state, indent=2))
+                continue
+
+            # Check drain/shutdown between diagnose and fix
+            if self._shutdown.is_set() or self._draining.is_set():
+                ci_log(f"CI loop stopping after diagnosis — drain/shutdown requested")
+                attempt_record["status"] = "interrupted_after_diag"
+                state["attempts"].append(attempt_record)
+                state_file.write_text(json.dumps(state, indent=2))
+                return
+
+            # ── Step 5: Fix + push ──
+            fix_prompt = build_ci_fix_prompt(
+                task.id, attempt, debug_dir, str(task_file), learnings_file,
+            )
+            fix_task = Task(
+                id=f"{task.id}-fix-{attempt}",
+                description=f"Fix CI failure #{attempt}",
+                phase=task.phase, parallel=False,
+                status=TaskStatus.RUNNING, line_num=0,
+                capabilities=task.capabilities,
+            )
+            _wait_for_subagent(fix_task, fix_prompt, f"Fix agent (attempt {attempt})",
+                               caps=task.capabilities)
+
+            attempt_record["status"] = "fix_applied"
+            state["attempts"].append(attempt_record)
+            state_file.write_text(json.dumps(state, indent=2))
+
+        # Exhausted attempts
+        ci_log(f"CI loop exhausted after {CI_LOOP_MAX_ATTEMPTS} attempts")
+        self.blocked_file.write_text(
+            f"# BLOCKED: {task.id} — CI loop exhausted\n\n"
+            f"CI failed {CI_LOOP_MAX_ATTEMPTS} times. See `{debug_dir}/` for full history.\n\n"
+            f"## What I need\n\nHuman review of the CI failures — the automated loop couldn't resolve them.\n\n"
+            f"## Context\n\nAll diagnosis and log files are in `{debug_dir}/`.\n"
+        )
 
     def _drain_agents(self):
         """Wait for all running agents to finish their current work.
@@ -2787,7 +3871,7 @@ def main():
     args = parser.parse_args()
 
     # ── Sandbox setup ──
-    global _sandbox_enabled, _bwrap_path, _proxy
+    global _sandbox_enabled, _bwrap_path
     if args.no_sandbox:
         _sandbox_enabled = False
         print("⚠ Sandbox DISABLED by --no-sandbox flag", file=sys.stderr)
@@ -2795,13 +3879,8 @@ def main():
         _bwrap_path = _detect_bwrap()
         if _bwrap_path:
             _sandbox_enabled = True
-            # Start the allowlist network proxy.
-            _proxy = _AllowlistProxy(allowlist=_NETWORK_ALLOWLIST)
-            _proxy.start()
             print(
-                f"🔒 Sandbox enabled (bwrap: {_bwrap_path})\n"
-                f"🌐 Network proxy on 127.0.0.1:{_proxy.port} "
-                f"(allowlist: {', '.join(_NETWORK_ALLOWLIST)})",
+                f"🔒 Sandbox enabled (bwrap: {_bwrap_path})",
                 file=sys.stderr,
             )
         else:
@@ -2821,10 +3900,28 @@ def main():
                 "  Re-entering inside nix develop shell...",
                 file=sys.stderr,
             )
-            os.execvp("nix", [
-                "nix", "develop", "--command",
-                sys.executable, *sys.argv,
-            ])
+            # Probe first — if the flake has unfree packages, retry with --impure
+            nix_cmd = ["nix", "develop", "--command"]
+            probe = subprocess.run(
+                nix_cmd + ["true"],
+                capture_output=True, timeout=120,
+            )
+            if probe.returncode != 0 and b"unfree" in probe.stderr:
+                print(
+                    "  Flake contains unfree packages — re-entering with NIXPKGS_ALLOW_UNFREE=1 --impure...",
+                    file=sys.stderr,
+                )
+                os.environ["NIXPKGS_ALLOW_UNFREE"] = "1"
+                nix_cmd = ["nix", "develop", "--impure", "--command"]
+            elif probe.returncode != 0:
+                print(
+                    f"  ⚠ nix develop failed (exit {probe.returncode}), continuing without nix shell.\n"
+                    f"  stderr: {probe.stderr.decode()[:300]}",
+                    file=sys.stderr,
+                )
+                nix_cmd = None
+            if nix_cmd is not None:
+                os.execvp("nix", nix_cmd + [sys.executable, *sys.argv])
 
     # Resolve spec dirs
     if args.spec_dir:
@@ -2845,11 +3942,7 @@ def main():
         max_parallel=args.max_parallel,
         layout=args.layout,
     )
-    try:
-        runner.run()
-    finally:
-        if _proxy:
-            _proxy.stop()
+    runner.run()
 
 
 if __name__ == "__main__":

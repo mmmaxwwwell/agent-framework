@@ -268,3 +268,46 @@ Key properties:
 - **Failure history accumulates on disk** in `validate/<phase>/` — nothing is lost between runs
 - **Tests are the spec** — fix the code, not the tests (unless a test is genuinely wrong)
 - **Structured test output** (`test-logs/summary.json` + `test-logs/<type>/<timestamp>/failures/`) is the primary feedback mechanism
+
+## Security scan validation in the fix-validate loop
+
+Security scanning is integrated into the same phase validation lifecycle as tests and lint. The validation agent runs **build → test → lint → security scan** as a single validation pass. If any step fails, the phase doesn't pass.
+
+### Validation command sequence
+
+The validation agent runs these in order (stopping on first failure category):
+
+1. **Build** — `go build ./...`, `npm run build`, etc.
+2. **Test** — `go test ./...`, `npm test`, etc. (writes to `test-logs/`)
+3. **Lint** — `golangci-lint run`, `npm run lint`, etc.
+4. **Security scan** — runs all project-relevant scanners (writes to `test-logs/security/`)
+
+If tests fail, the validation agent reports test failures — it doesn't also run security scans on broken code. Security scans run only after build + test + lint pass. This prevents noise from scanners flagging code that's about to be rewritten anyway.
+
+### Security scan output directory
+
+```
+test-logs/
+  security/
+    summary.json          # aggregated pass/fail + finding counts per scanner
+    trivy.json            # raw Trivy JSON output
+    semgrep.json          # raw Semgrep JSON output
+    gitleaks.json         # raw Gitleaks JSON output
+    govulncheck.json      # raw govulncheck JSON output
+    <ecosystem>.json      # npm-audit, pip-audit, cargo-audit, etc.
+```
+
+Fix agents read `summary.json` first to understand scope, then drill into individual scanner files for finding details (file path, line number, rule ID, severity, description).
+
+### Security fix-validate vs test fix-validate
+
+The mechanics are identical — same task appending, same iteration cap, same BLOCKED.md. The only difference is what the fix agent reads:
+
+| Failure type | Fix agent reads | Fix agent does |
+|-------------|----------------|----------------|
+| Test failure | `test-logs/<type>/<timestamp>/failures/*.log` | Fix code to pass tests |
+| Security finding | `test-logs/security/<scanner>.json` | Fix vulnerable code pattern or update dependency |
+
+Both types produce a validation record in `validate/<phase>/N.md` with PASS or FAIL. A phase passes validation only when ALL steps (build + test + lint + security) are clean.
+
+See `reference/security.md` for the full scanner command list and `reference/cicd.md` for how this integrates with CI SARIF uploads.

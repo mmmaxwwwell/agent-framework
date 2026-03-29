@@ -57,10 +57,10 @@ Validation runs at **phase boundaries**, not per-task. It is **enforced by the r
 
 1. Agents implement tasks T007, T008, T009 (all in Phase 3). Each agent marks its task done and commits.
 2. The runner detects that all Phase 3 tasks are complete and spawns a **validation agent**.
-3. The validation agent runs the project's build/test commands (from `CLAUDE.md` or the phase Checkpoint).
-4. **If validation passes** → the agent writes `specs/<feature>/validate/phase3/1.md` with `PASS`. The runner marks the phase as validated and allows downstream phases to start.
-5. **If validation fails** → the agent writes `specs/<feature>/validate/phase3/1.md` with `FAIL` (command, exit code, structured test output from `test-logs/`) and appends `- [ ] phase3-fix1 Fix phase validation failure: read validate/phase3/ for failure history` to `tasks.md`.
-6. **Next runner iteration** picks up `phase3-fix1` as a normal implementation task with fresh context — reads the full failure history from `validate/phase3/`, reads `test-logs/`, diagnoses and fixes.
+3. The validation agent runs the full validation sequence: **build → test → lint → security scan** (from `CLAUDE.md` or the phase Checkpoint). Security scans only run after build + test + lint pass — no point scanning broken code.
+4. **If validation passes** (all steps clean, zero security findings) → the agent writes `specs/<feature>/validate/phase3/1.md` with `PASS`. The runner marks the phase as validated and allows downstream phases to start.
+5. **If validation fails** (test failure, lint error, OR security finding) → the agent writes `specs/<feature>/validate/phase3/1.md` with `FAIL` (command, exit code, structured test output from `test-logs/`, security findings from `test-logs/security/`) and appends `- [ ] phase3-fix1 Fix phase validation failure: read validate/phase3/ for failure history` to `tasks.md`.
+6. **Next runner iteration** picks up `phase3-fix1` as a normal implementation task with fresh context — reads the full failure history from `validate/phase3/`, reads `test-logs/` and `test-logs/security/`, diagnoses and fixes.
 7. After the fix agent completes, the runner spawns another validation agent. If still failing → `validate/phase3/2.md`, appends `phase3-fix2`.
 8. After 10 failed fix attempts → validation agent writes `BLOCKED.md` and the runner stops.
 
@@ -73,7 +73,22 @@ Key properties:
 - **Each fix gets a fresh agent** with full context budget — no degradation from prior attempts
 - **Failure history accumulates on disk** in `validate/<phase>/` — nothing is lost between runs
 - **Tests are the spec** — fix the code, not the tests (unless a test is genuinely wrong)
+- **Security scans are part of validation** — a phase with security findings doesn't pass, same as a phase with test failures
 - **Structured test output** is the primary feedback mechanism — agents read these rather than parsing raw test runner output
+
+### Security scan in validation
+
+The validation agent runs security scanners **after** build + test + lint pass. This ordering prevents wasting scanner time on code that doesn't compile, and prevents noise from scanners flagging code that's about to be rewritten by a test-failure fix.
+
+**Scanner output**: Written to `test-logs/security/` in JSON format. The validation agent produces a `test-logs/security/summary.json` aggregating results across all scanners.
+
+**Fix agent behavior for security findings**:
+- Read `test-logs/security/summary.json` for scope (which scanners found issues, how many)
+- Read individual scanner JSON files for details (file, line, rule ID, severity, description)
+- Classify each finding: dependency vulnerability → update version; SAST pattern → fix code; secret → remove and rotate; false positive → suppress with justification
+- Never suppress without a justification comment. Record suppressions in `learnings.md`.
+
+See `reference/security.md` for the full scanner command list and finding classification table. See `reference/cicd.md` for how local security validation integrates with CI SARIF uploads.
 
 ### Structured test output format (critical for implementing agents)
 
@@ -122,7 +137,7 @@ A shared memory file in the spec directory that accumulates across runs. Each ag
 
 ### BLOCKED.md and auto-unblocking
 
-If the agent hits a blocker, it MUST NOT immediately write `BLOCKED.md`. Instead, it must first evaluate whether it can resolve the blocker autonomously. See "Auto-Unblocking" below for the full decision process. Only write `BLOCKED.md` for genuinely human-dependent blockers. When `BLOCKED.md` is written, the script stops. Edit the file with your answer, delete it, re-run.
+If the agent hits a blocker, it MUST NOT immediately write `BLOCKED.md`. Instead, it must first evaluate whether it can resolve the blocker autonomously. See "Auto-Unblocking" below for the full decision process. Only write `BLOCKED.md` for genuinely human-dependent blockers. When `BLOCKED.md` is written, the script stops. Edit BLOCKED.md with your answer, then re-run — the runner will consume the answer, clean up the file, and retry the blocked task.
 
 ### Rate limits
 
@@ -279,7 +294,7 @@ The smoke test loop uses a **fast-then-deep** strategy:
 When `BLOCKED.md` IS written (genuinely human-dependent), it MUST include:
 
 ```markdown
-# Blocked: [one-line summary]
+# BLOCKED: [TASK_ID] — [one-line summary]
 
 ## What I need
 [Specific question or action required from a human]
