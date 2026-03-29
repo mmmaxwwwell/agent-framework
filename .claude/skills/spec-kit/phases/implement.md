@@ -240,14 +240,33 @@ For each primary user flow from the spec:
 
 After local smoke passes:
 
+#### Step 1: Reproduce CI locally FIRST
+
+Before pushing, run the same checks CI would run — locally. Most CI failures are reproducible without a remote runner. Fix everything you can find before burning a push+CI cycle.
+
+**Nix projects** (if `flake.nix` exists):
+1. `nix flake check` — runs all flake checks (tests, linting, formatting, NixOS VM tests). This is what CI runs. Fix every failure.
+2. `nix build` (or `nix build .#<package>` for each package) — verify the package builds in a pure Nix sandbox (no dev shell, no impurities).
+3. `nix flake show` — verify all outputs are well-formed and nothing is broken by missing inputs.
+4. If the flake has NixOS tests (`checks.<system>.<name>`), they run as part of `nix flake check`. If any fail, read the test driver output and fix.
+5. `nix fmt -- --check` — verify formatting if a formatter is configured in the flake.
+
+**Non-Nix projects**:
+1. Read `.github/workflows/` (or `.gitlab-ci.yml`, etc.) to understand exactly what CI runs.
+2. Run each CI step locally in order: install deps, build, test, lint, security scan, package.
+3. If CI uses a different OS (e.g. Ubuntu), check for platform-specific assumptions: paths, system packages, shell syntax.
+
+**Fix-validate locally** until all commands pass. Only proceed to Step 2 when local CI reproduction is clean.
+
+#### Step 2: Push and monitor remote CI
+
 1. **Commit and push** to a feature branch
 2. **Monitor CI** — use `gh run list` and `gh run view` to watch the pipeline
-3. **When CI fails** — use `gh run view --log-failed` to read the failure logs. Diagnose and fix locally, push, repeat.
-4. **Common CI failures** that differ from local:
-   - Missing system packages (CI doesn't have your Nix flake — add install steps to the workflow)
-   - Different OS/arch (CI runs Ubuntu, you run NixOS — native extensions may differ)
-   - Missing secrets/tokens (add to repo secrets or use `--no-verify` for scanning tools that need them)
+3. **When CI fails** — use `gh run view --log-failed` to read the failure logs. **Reproduce the failure locally first** (re-run the failing command), fix locally, verify locally, then push. Do not push speculative fixes.
+4. **Failures that genuinely can't reproduce locally** (rare after Step 1):
+   - Missing secrets/tokens (add to repo secrets, or mock for CI)
    - Network restrictions (CI can't reach internal registries — use public mirrors or cache in the workflow)
+   - CI runner differences (older glibc, missing system libs not in Nix closure — add to flake `buildInputs`)
    - Timeout differences (CI runners are slower — increase test timeouts for integration tests)
 5. **No hard cap** — same rules as smoke test: keep going as long as there's forward progress. Only write `BLOCKED.md` if stuck in circles or genuinely blocked (missing secrets, permissions, etc.).
 
