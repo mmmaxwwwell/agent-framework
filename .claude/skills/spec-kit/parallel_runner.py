@@ -333,9 +333,18 @@ class Scheduler:
         return all(t.status in (TaskStatus.COMPLETE, TaskStatus.SKIPPED) for t in phase.tasks)
 
     def phase_complete(self, slug: str) -> bool:
-        """A phase is complete when validated and review is clean."""
+        """A phase is complete when validated and review is clean.
+
+        CI-loop phases are implicitly validated — CI passing IS the
+        validation, so no validate/<phase>/ files are needed.
+        """
         if not self.phase_tasks_complete(slug):
             return False
+        # CI-loop phases: all tasks have ci-loop capability and are complete.
+        # CI passing is the validation — no separate validate+review needed.
+        phase = self.phase_map.get(slug)
+        if phase and all("ci-loop" in t.capabilities for t in phase.tasks):
+            return True
         state = self._get_state(slug)
         return state.complete or slug in self.validated_phases
 
@@ -345,6 +354,10 @@ class Scheduler:
             return False
         if slug in self.validated_phases:
             return False  # Legacy: already fully complete
+        # CI-loop phases are self-validating — no VR agent needed
+        phase = self.phase_map.get(slug)
+        if phase and all("ci-loop" in t.capabilities for t in phase.tasks):
+            return False
         state = self._get_state(slug)
         if state.complete:
             return False
