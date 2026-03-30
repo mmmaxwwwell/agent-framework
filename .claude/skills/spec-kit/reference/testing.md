@@ -196,12 +196,13 @@ When a project uses NixOS VM tests (`nixpkgs.testers.nixosTest`) or relies on sy
 
 Required verification for every systemd service in a VM test:
 
-1. **Wait for the unit to be active**: Use `wait_for_unit("service-name.service")` — this waits for the unit to reach `active` state, but does NOT verify it stays there.
-2. **Verify the unit is still running after startup**: After `wait_for_unit` succeeds, add a brief delay (1-3 seconds), then check `systemctl is-active service-name.service` returns `active`. A service that crashes immediately after startup (e.g., missing config, invalid arguments, failed dependency) will have transitioned to `failed` by this point.
-3. **Check for fatal log messages**: After verifying the unit is active, grep the journal for fatal/error indicators: `journalctl -u service-name.service --no-pager -p err`. If there are error-level messages, the test should fail or at minimum log a warning.
-4. **Verify the service's functional readiness**: Don't just check the process is alive — verify it's actually serving. For a web server, hit its health endpoint. For a gRPC server, make a test RPC. For a coordination server (like headscale), verify its API responds. A process that is `active (running)` but stuck in a startup loop or missing critical config is not ready.
+1. **Wait for the unit with fail-fast crash detection**: Do NOT use bare `wait_for_unit` — its 900s default timeout means a crash-looping service wastes 15 minutes before the test fails. Instead, use a polling loop that detects the `failed` state immediately and dumps journal output for diagnosis.
+2. **Check for fatal log messages**: After verifying the unit is active, grep the journal for fatal/error indicators: `journalctl -u service-name.service --no-pager -p err`. If there are error-level messages, the test should fail or at minimum log a warning.
+3. **Verify the service's functional readiness**: Don't just check the process is alive — verify it's actually serving. For a web server, hit its health endpoint. For a gRPC server, make a test RPC. For a coordination server (like headscale), verify its API responds. A process that is `active (running)` but stuck in a startup loop or missing critical config is not ready.
+4. **Use short timeouts on `wait_for_open_port`**: If the service is confirmed active, the port should open within seconds. Use `timeout=30` instead of the 900s default.
 
 Common failure patterns this catches:
+- **Crash-loop restart**: Service starts, crashes, systemd restarts it — `wait_for_unit` sees `active` during the brief restart window and passes, but the service is never actually healthy. The fail-fast loop catches this because it sees `failed` state between restarts.
 - **Missing configuration**: Service starts, reads config, finds a required field empty (e.g., `initial DERPMap is empty`), logs `FTL`, and exits with code 1 — all within 1 second of starting
 - **Dependency ordering**: Service A starts before Service B is ready, fails to connect, and crashes
 - **Permission errors**: Service runs as wrong user, can't read its data directory, exits immediately
@@ -209,16 +210,37 @@ Common failure patterns this catches:
 
 NixOS VM test example (Python test script):
 ```python
-# BAD — only checks that systemd started the unit, not that it's healthy
+# BAD — waits 900s if the service crash-loops
 host.wait_for_unit("headscale.service")
+host.wait_for_open_port(8080)
 
-# GOOD — verifies the unit is still running after startup settles
+# ALSO BAD — sleep(2) can miss crash-loops where systemd restarts fast enough
 host.wait_for_unit("headscale.service")
-host.sleep(2)  # let crash-on-startup failures manifest
-host.succeed("systemctl is-active headscale.service")  # fails if unit crashed
-host.succeed("journalctl -u headscale.service --no-pager -p err | grep -v 'no error' | wc -l | grep '^0$'")  # no error-level messages
-host.succeed("curl -sf http://localhost:8080/health")  # functional readiness
+host.sleep(2)
+host.succeed("systemctl is-active headscale.service")
+
+# GOOD — fails fast on crash-loop, dumps journal for diagnosis
+host.succeed(
+    "for i in $(seq 1 30); do "
+    "  state=$(systemctl is-active my-service.service); "
+    "  if [ \"$state\" = \"active\" ]; then exit 0; fi; "
+    "  if [ \"$state\" = \"failed\" ]; then "
+    "    echo 'my-service.service entered failed state:'; "
+    "    journalctl -u my-service.service --no-pager -n 20; "
+    "    exit 1; "
+    "  fi; "
+    "  sleep 2; "
+    "done; "
+    "echo 'my-service.service did not become active within 60s'; "
+    "journalctl -u my-service.service --no-pager -n 20; "
+    "exit 1"
+)
+host.wait_for_open_port(8080, timeout=30)
+# Verify functional readiness
+host.succeed("curl -sf http://localhost:8080/health")
 ```
+
+**Why not `wait_for_unit` with a shorter timeout?** Because `wait_for_unit` polls for `active` state — and a crash-looping service IS `active` for a fraction of a second on each restart. It never returns `failed` to `wait_for_unit`, it just keeps restarting and hitting `active` briefly. The explicit `systemctl is-active` check catches the `failed` state between restart attempts.
 
 This pattern applies beyond NixOS — any test that starts a background service (Docker container, `systemctl start`, `supervisord`, background process) must verify the service is **alive and functional**, not just that the start command returned 0.
 
