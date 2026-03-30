@@ -419,7 +419,7 @@ stateDiagram-v2
 
     state LocalFixLoop {
         [*] --> Fix
-        Fix --> LocalValidate : fix applied (no push)
+        Fix --> LocalValidate : fix applied, fast checks passed (no push)
         LocalValidate --> LocalPassed : all CI commands pass locally
         LocalValidate --> Fix : validation failed, iteration < 20
         LocalValidate --> LocalExhausted : iteration >= 20
@@ -427,6 +427,8 @@ stateDiagram-v2
 
     LocalFixLoop --> Push : LocalPassed
     LocalFixLoop --> Push : LocalExhausted (push anyway)
+    CIFailed --> StuckCheck : same jobs failed N times
+    StuckCheck --> Exhausted : consecutive failures >= 5
     Push --> CheckDrainShutdown : pushed, next attempt
 
     CIError --> CheckDrainShutdown : next attempt
@@ -440,13 +442,17 @@ stateDiagram-v2
 
 ### Runner-Managed Local Fix-Validate Loop (mandatory)
 
-The runner manages a **structured fix-validate loop** before pushing. Instead of one agent that fixes and pushes, the runner alternates between separate fix and validation agents up to **20 local iterations** (`CI_LOCAL_MAX_ITERATIONS`). This prevents wasting 10-30 min CI cycles on code that doesn't compile or breaks tests locally.
+The runner manages a **structured fix-validate loop** before pushing. The fix and validation agents have distinct responsibilities — the fix agent handles quick checks, and the validation agent runs the full suite including slow commands. Up to **20 local iterations** (`CI_LOCAL_MAX_ITERATIONS`).
 
-| Agent | Job | Pushes? |
-|-------|-----|---------|
-| **Fix agent** | Reads diagnosis, applies fix, commits. Reads `.github/workflows/ci.yml` to understand what CI validates. | NO |
-| **Validation agent** | Runs the SAME commands CI runs locally, writes structured PASS/FAIL result. | NO |
-| **Runner** | Checks validation result. If PASS → push. If FAIL → spawn fix agent again. | YES (only after PASS) |
+| Agent | Job | Runs slow commands? | Pushes? |
+|-------|-----|---------------------|---------|
+| **Fix agent** | Reads diagnosis/validation result, applies fix, runs **fast checks only** (lint, build, unit tests with `-short`). Up to 3 quick iterations internally. Commits. | NO | NO |
+| **Validation agent** | Runs the SAME commands CI runs locally (including slow ones: VM tests, E2E, `nix flake check`), writes structured PASS/FAIL result. | YES | NO |
+| **Runner** | Checks validation result. If PASS → push. If FAIL → spawn fix agent again. | N/A | YES (only after PASS) |
+
+#### Why the split?
+
+Slow commands (NixOS VM tests, Docker E2E) take 10-20 minutes. If the fix agent runs these in its own inner loop, a single fix agent can burn hours. By limiting the fix agent to fast checks (<60s) and letting the validate agent handle slow commands, each cycle is: ~2 min fix + ~15 min validate = ~17 min total, with clean context separation.
 
 #### CI parity: validation commands are derived from the CI workflow
 
@@ -455,6 +461,10 @@ The validation agent reads `.github/workflows/ci.yml` to discover commands, rath
 - NixOS VM tests (`nix flake check --print-build-logs`)
 - Full test suites (not just `-short`)
 - Linters, formatters, and static analysis
+
+#### Repeated failure early exit
+
+If the same CI jobs fail **5 consecutive times** (`CI_REPEAT_FAILURE_THRESHOLD`), the loop stops and writes `BLOCKED.md` instead of continuing to burn tokens on a problem the automated loop can't solve. Cancelled and interrupted runs are skipped when counting consecutive failures.
 
 #### Validation result file format
 
