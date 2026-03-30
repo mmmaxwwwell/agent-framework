@@ -201,7 +201,7 @@ Progress stages: `startup` (<= 5 tools) | `reading_context` (6-15) | `exploring`
 
 ## 3. Phase Validation State Machine
 
-The validation agent runs a **four-step validation sequence**: build → test → lint → security scan. Each step must pass before the next runs. Security scans only execute after build + test + lint pass — no point scanning broken or unlinted code.
+The validation agent runs a **four-step validation sequence**: build → test → lint → security scan. Build failure short-circuits everything. Test failure still runs lint (so the fix agent gets both sets of errors in one pass). Security scans only run after build + test + lint all pass.
 
 ```mermaid
 stateDiagram-v2
@@ -213,17 +213,29 @@ stateDiagram-v2
 
     NeedsVR --> VRRunning : validate+review agent spawned (cycle N)
 
-    VRRunning --> BuildFailed : build fails
-    VRRunning --> TestsFailed : tests fail
-    VRRunning --> LintFailed : lint fails
-    VRRunning --> SecurityFailed : security scan has findings
-    VRRunning --> AllPassed_ReviewClean : all pass, review finds nothing
-    VRRunning --> AllPassed_ReviewFixes : all pass, review applied fixes
+    VRRunning --> RunBuild
+    RunBuild --> BuildFailed : build fails
+    RunBuild --> RunTest : build passes (or no build step)
 
-    BuildFailed --> TasksIncomplete : fix task appended to phase
-    TestsFailed --> TasksIncomplete : fix task appended to phase
-    LintFailed --> TasksIncomplete : fix task appended to phase
-    SecurityFailed --> TasksIncomplete : fix task appended to phase
+    RunTest --> RunLint_afterTestFail : test fails (still run lint)
+    RunTest --> RunLint : test passes
+
+    RunLint_afterTestFail --> TestAndLintFailed : lint also fails
+    RunLint_afterTestFail --> TestFailed : lint passes
+    RunLint --> LintFailed : lint fails
+    RunLint --> RunSecurity : lint passes
+
+    RunSecurity --> SecurityFailed : security scan has findings
+    RunSecurity --> AllPassed : all 4 steps clean
+
+    AllPassed --> AllPassed_ReviewClean : review finds nothing
+    AllPassed --> AllPassed_ReviewFixes : review applied fixes
+
+    BuildFailed --> TasksIncomplete : fix task appended (categorized FAIL record)
+    TestFailed --> TasksIncomplete : fix task appended (categorized FAIL record)
+    TestAndLintFailed --> TasksIncomplete : fix task appended (categorized FAIL record with both)
+    LintFailed --> TasksIncomplete : fix task appended (categorized FAIL record)
+    SecurityFailed --> TasksIncomplete : fix task appended (categorized FAIL record)
     AllPassed_ReviewClean --> PhaseComplete : REVIEW-CLEAN written
     AllPassed_ReviewFixes --> NeedsVR : needs re-validation of fixes (cycle N+1)
 
@@ -232,9 +244,13 @@ stateDiagram-v2
     PhaseComplete --> [*] : downstream phases unblocked
 ```
 
-### Validation sequence (ordered, short-circuit on failure)
+### Validation sequence (ordered, with short-circuit rules)
 
-The validation agent runs these steps in order. If any step fails, it writes FAIL and stops — subsequent steps don't run.
+The validation agent runs these steps in order with the following short-circuit rules:
+- **Build fails** → skip test, lint, security (nothing else is meaningful)
+- **Test fails** → still run lint (cheap, gives fix agent both error sets in one pass) → skip security
+- **Lint fails** (tests passed) → skip security
+- **Security fails** → write FAIL, done
 
 | Step | Command pattern | Output location | Fails when |
 |------|----------------|-----------------|------------|
@@ -280,36 +296,76 @@ The runner parses the **heading** of each file to determine state:
 - Validation files: scan for `PASS` or `FAIL` in the first `#` heading
 - Review files: scan for `REVIEW-CLEAN` or `REVIEW-FIXES` in the first `#` heading
 
-### Validation FAIL record format (with security findings)
+### Validation FAIL record format (categorized)
 
-When validation fails due to security findings, the FAIL record includes scanner output:
+Every FAIL record starts with a **failure categories** summary so fix agents can immediately see which steps failed without parsing raw output. The fix agent reads the latest record first, checks prior FAIL records to avoid repeating failed approaches, then runs build+test+lint locally before marking complete.
+
+**Example: test + lint both failed (test failure triggered lint to still run)**
 
 ```markdown
-# Phase core - Validation #2: FAIL
+# Phase core — Validation #2: FAIL
 
-## Step: security scan
-## Exit code: 1
+**Date**: 2026-03-29T14:30:00Z
 
-## Security findings summary
-- semgrep: 2 findings (1 HIGH, 1 MEDIUM)
-- trivy: 0 findings
-- gitleaks: 0 findings
+## Failure categories
+- **Build**: PASS
+- **Test**: FAIL (12 passed, 2 failed, 0 skipped)
+- **Lint**: FAIL (3 errors, 1 warning)
+- **Security**: SKIPPED
 
-## Finding details
-See test-logs/security/semgrep.json for full output.
+## Failed steps detail
 
-### semgrep finding 1 (HIGH)
-- Rule: go.lang.security.audit.database.string-formatted-query
-- File: internal/daemon/registry.go:45
-- Message: String-formatted SQL query detected. Use parameterized queries instead.
+### Test
+**Command**: `go test -json ./...`
+**Exit code**: 1
+**Root cause summary**: Two handler tests fail because the new middleware changes the context key name but the handlers still read the old key.
+**Failures**:
+- `internal/daemon/registry_test.go:45` — TestRegisterDevice: expected device ID in context, got nil
+- `internal/daemon/registry_test.go:78` — TestDeregisterDevice: expected auth token in context, got nil
 
-### semgrep finding 2 (MEDIUM)
-- Rule: go.lang.security.audit.net.formatted-command-string
-- File: internal/pairing/server.go:112
-- Message: Formatted string used in command execution.
+### Lint
+**Command**: `golangci-lint run`
+**Exit code**: 1
+**Root cause summary**: Unused parameter and missing error check introduced in the middleware refactor.
+**Failures**:
+- `internal/agent/handler.go:23` — `unused-parameter: 'ctx' is unused` (the new middleware passes context but handler ignores it)
+- `internal/pairing/server.go:112` — `errcheck: error return value not checked`
+- `internal/pairing/server.go:118` — `errcheck: error return value not checked`
+
+## Full output
+(relevant portions of stdout/stderr, organized by step)
 ```
 
-This structured format lets fix agents jump directly to the affected files and understand the issue without parsing raw JSON.
+**Example: security scan failed**
+
+```markdown
+# Phase core — Validation #3: FAIL
+
+**Date**: 2026-03-29T15:00:00Z
+
+## Failure categories
+- **Build**: PASS
+- **Test**: PASS (14 passed, 0 failed, 0 skipped)
+- **Lint**: PASS (0 errors, 0 warnings)
+- **Security**: FAIL (2 findings)
+
+## Failed steps detail
+
+### Security
+**Command**: `semgrep --config auto --json -o test-logs/security/semgrep.json .`
+**Exit code**: 1
+**Root cause summary**: SQL injection via string formatting and unsafe command execution.
+**Failures**:
+- `internal/daemon/registry.go:45` — semgrep HIGH: go.lang.security.audit.database.string-formatted-query — Use parameterized queries instead
+- `internal/pairing/server.go:112` — semgrep MEDIUM: go.lang.security.audit.net.formatted-command-string — Formatted string used in command execution
+
+See `test-logs/security/semgrep.json` for full scanner output.
+
+## Full output
+(relevant portions of stdout/stderr, organized by step)
+```
+
+This categorized format lets fix agents: (1) immediately see which steps failed, (2) read root cause summaries before diving into raw output, (3) address all failure categories in a single pass.
 
 ### Phase Dependency Resolution
 
@@ -519,4 +575,4 @@ stateDiagram-v2
 
 11. **CI loop resumability**: State persisted to `state.json` with attempt count, so interrupted loops resume on next run. In Temporal, this is inherent — the workflow picks up from where it left off after worker restart.
 
-12. **Security scan in validation**: Phase validation runs build → test → lint → security scan in order, short-circuiting on first failure category. Security scanners (Trivy, Semgrep, Gitleaks, ecosystem-specific tools) produce JSON to `test-logs/security/` — same structured output pattern as test failures. Security findings trigger the same fix-validate loop as test failures: fix task appended, fresh fix agent reads findings, patches code, re-validate. This means security issues are caught and fixed locally before any push, avoiding wasted CI cycles. In Temporal, security scanning is an additional activity in the phase validation child workflow.
+12. **Security scan in validation**: Phase validation runs build → test → lint → security scan in order. Build failure short-circuits everything; test failure still runs lint (so fix agents get both error sets in one pass); security only runs when build+test+lint all pass. FAIL records use a categorized format (Build/Test/Lint/Security each PASS/FAIL/SKIPPED with per-step root cause summaries). Fix agents check prior FAIL records to avoid repeating failed approaches, and run build+test+lint locally before marking complete. In Temporal, security scanning is an additional activity in the phase validation child workflow.
