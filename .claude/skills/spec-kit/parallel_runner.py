@@ -1418,6 +1418,13 @@ def build_validate_review_prompt(spec_dir: str, task_file: str, phase: Phase,
     if (Path.cwd() / "flake.nix").exists():
         nix_note = """
 **Environment**: This project uses Nix (`flake.nix`). Your PATH already includes all tools from the nix devshell — run commands directly (e.g. `node`, `npm`, `python3`, `pytest`, `uv`). Do NOT prefix commands with `nix develop --command`. If tests fail due to missing native libraries (e.g. `libstdc++.so.6`, shared objects), that is a `flake.nix` issue — report it as an environment problem, not a code bug. Do NOT create fix tasks for environment-only failures.
+
+**Nix sandbox commands**: You are inside a sandbox. For nix commands:
+- Set `NIX_REMOTE=daemon` and pass `--extra-experimental-features 'nix-command flakes'`
+- Write output to a file: `NIX_REMOTE=daemon nix --extra-experimental-features 'nix-command flakes' flake check --print-build-logs > /tmp/nix-flake-check.log 2>&1; echo "EXIT_CODE=$?" >> /tmp/nix-flake-check.log`
+- Never pipe through `head`/`tail` — write to file and read what you need after
+- VM tests take 10-20 min — use timeout ≥1800s, run in background with TaskOutput
+- On failure, read the last 200 lines and grep for `FTL`, `FAIL`, `error:` to find root cause
 """
 
     # Determine diff scope for the review portion
@@ -2496,6 +2503,7 @@ If dependencies can't be fetched (network issues), but the code looks correct:
 
 CI_LOOP_MAX_ATTEMPTS = 50
 CI_LOCAL_MAX_ITERATIONS = 20
+CI_REPEAT_FAILURE_THRESHOLD = 5  # Stop if same job fails this many consecutive times
 CI_LOOP_DIR = "ci-debug"
 
 
@@ -2843,8 +2851,27 @@ def build_ci_fix_prompt(task_id: str, attempt: int, debug_dir: Path,
     history_files = sorted(debug_dir.glob("attempt-*-diagnosis.md"))
 
     nix_note = ""
+    nix_commands_note = ""
     if (Path.cwd() / "flake.nix").exists():
         nix_note = "**Environment**: This project uses Nix. Your PATH includes all devshell tools.\n\n"
+        nix_commands_note = """
+### Nix-specific command instructions
+
+You are running inside a sandbox. To run nix commands that need the daemon:
+
+- **ALWAYS** set `NIX_REMOTE=daemon` when running nix commands
+- **ALWAYS** pass `--extra-experimental-features 'nix-command flakes'` to nix
+- **NEVER** pipe nix output through `head`, `tail`, or any truncation
+- **NEVER** use `nix develop --command` inside the sandbox — it will fail on store writes
+- `nix flake check --print-build-logs` runs NixOS VM tests that take **10-20 minutes**. Use a timeout of at least 1800 seconds (30 min). Run it in the background and use TaskOutput to wait for it.
+- **Write output to a file** so you can examine any portion after the command finishes:
+  ```
+  NIX_REMOTE=daemon nix --extra-experimental-features 'nix-command flakes' flake check --print-build-logs > /tmp/nix-flake-check.log 2>&1; echo "EXIT_CODE=$?" >> /tmp/nix-flake-check.log
+  ```
+- After the command finishes, read the exit code and the **last 200 lines** of `/tmp/nix-flake-check.log` — the critical errors (service crashes, test assertion failures, FTL messages) are always at the end.
+- If it failed, also search the log file for `FTL`, `FAIL`, `error:`, and `failed with` to find the root cause.
+
+"""
 
     return f"""You are a CI fix agent for task **{task_id}**, attempt #{attempt}.
 
@@ -2864,7 +2891,7 @@ def build_ci_fix_prompt(task_id: str, attempt: int, debug_dir: Path,
 - **Diagnosis**: `{diagnosis_file}` — read this to understand what to fix
 - **Prior attempts**: `{debug_dir}/` — contains logs and diagnoses from all attempts
 - **Learnings**: `{learnings_file}` — project-specific gotchas
-
+{nix_commands_note}
 ## Local validation (MANDATORY — CI parity)
 
 After applying your fix, you MUST run local validation. The goal is **CI parity** — run the
@@ -2923,6 +2950,7 @@ locally is if it literally cannot run (missing hardware, CI-only secrets, etc.).
   `{debug_dir}/attempt-{attempt}-fix-notes.md` before applying an alternative fix
 - Do NOT create PRs or merge anything — the runner handles that after CI passes
 - Do NOT read ROUTER.md or use the Skill tool
+- Do NOT truncate command output — write to files and read what you need
 - Append any CI-specific discoveries to `{learnings_file}`
 """
 
@@ -2936,8 +2964,28 @@ def build_ci_local_validate_prompt(task_id: str, attempt: int, local_iteration: 
     It does NOT fix anything — just validates and reports.
     """
     nix_note = ""
+    nix_commands_note = ""
     if (Path.cwd() / "flake.nix").exists():
         nix_note = "**Environment**: This project uses Nix. Your PATH includes all devshell tools.\n\n"
+        nix_commands_note = """
+### Nix-specific command instructions
+
+You are running inside a sandbox. To run nix commands that need the daemon:
+
+- **ALWAYS** set `NIX_REMOTE=daemon` when running nix commands
+- **ALWAYS** pass `--extra-experimental-features 'nix-command flakes'` to nix
+- **NEVER** pipe nix output through `head`, `tail`, or any truncation
+- **NEVER** use `nix develop --command` inside the sandbox — it will fail on store writes
+- `nix flake check --print-build-logs` runs NixOS VM tests that take **10-20 minutes**. Use a timeout of at least 1800 seconds (30 min). Run it in the background and use TaskOutput to wait for it.
+- **Write output to a file** so you can examine any portion after the command finishes:
+  ```
+  NIX_REMOTE=daemon nix --extra-experimental-features 'nix-command flakes' flake check --print-build-logs > /tmp/nix-flake-check.log 2>&1; echo "EXIT_CODE=$?" >> /tmp/nix-flake-check.log
+  ```
+- After the command finishes, read the exit code and the **last 200 lines** of `/tmp/nix-flake-check.log` — the critical errors (service crashes, test assertion failures, FTL messages) are always at the end.
+- If it failed, also search the log file for `FTL`, `FAIL`, `error:`, and `failed with` to find the root cause.
+- Include the relevant error output in your report — the fix agent needs to see the actual error messages, not just "exit code 1".
+
+"""
 
     prior_section = ""
     if prior_output:
@@ -2957,7 +3005,7 @@ address these failures. Re-run everything from scratch to verify.
 {nix_note}## Your job
 
 Run the SAME commands that CI runs and report the results. You do NOT fix anything.
-
+{nix_commands_note}
 ### Step 1: Discover CI commands
 
 Read `.github/workflows/ci.yml` (or scan `.github/workflows/` for the CI workflow). For each
@@ -2975,7 +3023,7 @@ Everything else MUST run. Pay special attention to:
 ### Step 2: Run ALL commands in order
 
 Run them in CI order (lint, build, test, integration/VM tests). For each command:
-- Run it and capture the full output
+- Run it and capture the **full output** (NEVER truncate with head/tail/pipes)
 - If it fails, continue to the next command (so we collect ALL failures in one pass,
   just like CI would)
 
@@ -3021,6 +3069,7 @@ Format:
 - Do NOT fix any code — just run commands and report
 - Do NOT push, commit, or modify source files
 - Do NOT read ROUTER.md or use the Skill tool
+- Do NOT truncate command output — capture it fully so failures can be diagnosed
 - Read `CLAUDE.md` for any project-specific commands
 - Read `{learnings_file}` for known gotchas
 """
@@ -4042,9 +4091,44 @@ class Runner:
                 # and the loop will continue to the next attempt.
                 continue
 
-            # ── Step 3: CI failed — download logs ──
+            # ── Step 3: CI failed — check for repeated failures ──
             failed_jobs = ', '.join(ci_result.get('failed_jobs', [])) or 'unknown'
             ci_log(f"CI failed (attempt {attempt}): {failed_jobs}")
+
+            # Check if the same jobs have been failing consecutively
+            recent_failures = []
+            for prev in reversed(state.get("attempts", [])):
+                prev_ci = prev.get("ci_result", {})
+                if prev_ci.get("status") == "fail":
+                    recent_failures.append(
+                        frozenset(prev_ci.get("failed_jobs", []))
+                    )
+                elif prev_ci.get("status") in ("pass", None):
+                    break  # stop at last pass or non-CI attempt
+                # skip cancelled/interrupted — they don't count
+            current_failed = frozenset(ci_result.get("failed_jobs", []))
+            consecutive_same = sum(
+                1 for rf in recent_failures if rf == current_failed
+            )
+            if consecutive_same >= CI_REPEAT_FAILURE_THRESHOLD:
+                ci_log(
+                    f"STUCK: same jobs ({failed_jobs}) failed {consecutive_same} "
+                    f"consecutive times — stopping CI loop"
+                )
+                attempt_record["status"] = "stuck_repeated_failure"
+                state["attempts"].append(attempt_record)
+                state_file.write_text(json.dumps(state, indent=2))
+                self.blocked_file.write_text(
+                    f"# BLOCKED: {task.id} — stuck on repeated CI failure\n\n"
+                    f"The same CI jobs ({failed_jobs}) have failed {consecutive_same} "
+                    f"consecutive times with fixes applied between each attempt.\n\n"
+                    f"## What I need\n\nHuman review — the automated fix loop is not "
+                    f"converging on a solution.\n\n"
+                    f"## Context\n\nAll diagnosis and log files are in `{debug_dir}/`.\n"
+                    f"Most recent CI run: {ci_result.get('url', 'N/A')}\n"
+                )
+                return
+
             log_file = debug_dir / f"attempt-{attempt}-logs.txt"
             if not _download_ci_logs(ci_result["run_id"], log_file):
                 ci_log("Failed to download CI logs")
