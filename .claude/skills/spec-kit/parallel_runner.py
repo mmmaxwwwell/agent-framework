@@ -2565,18 +2565,32 @@ def _ci_debug_dir(task_id: str) -> Path:
 
 
 def _poll_ci_run(branch: str, timeout_minutes: int = 30,
-                 stop_event: Optional[threading.Event] = None) -> dict:
+                 stop_event: Optional[threading.Event] = None,
+                 skip_run_ids: Optional[set[int]] = None) -> dict:
     """Poll GitHub Actions for the latest run on `branch` until it completes.
 
-    Returns a dict with keys: status ("pass"|"fail"|"timeout"|"error"),
+    Returns a dict with keys: status ("pass"|"fail"|"cancelled"|"timeout"|"error"),
     run_id, conclusion, url, and failed_jobs (list of job names).
 
     If stop_event is set during polling, returns early with status "interrupted".
+    skip_run_ids: set of run IDs to ignore (e.g. previously cancelled runs).
     """
     import time as _time
 
+    if skip_run_ids is None:
+        skip_run_ids = set()
+
     def _should_stop() -> bool:
         return stop_event is not None and stop_event.is_set()
+
+    # Get the current local HEAD so we can match against the right CI run
+    try:
+        local_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+    except Exception:
+        local_head = None
 
     # Wait a moment for GitHub to register the push
     for _ in range(10):
@@ -2584,24 +2598,65 @@ def _poll_ci_run(branch: str, timeout_minutes: int = 30,
             return {"status": "interrupted", "error": "drain/shutdown requested"}
         _time.sleep(1)
 
-    # Find the latest run for this branch
-    try:
-        result = subprocess.run(
-            ["gh", "run", "list", "--branch", branch, "--limit", "1", "--json",
-             "databaseId,status,conclusion,url,headSha"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0:
-            return {"status": "error", "error": f"gh run list failed: {result.stderr.strip()}"}
+    # Find the latest run for this branch that matches our HEAD
+    run_id = None
+    find_deadline = _time.time() + 120  # wait up to 2 min for GitHub to create the run
+    while _time.time() < find_deadline:
+        if _should_stop():
+            return {"status": "interrupted", "error": "drain/shutdown requested"}
+        try:
+            result = subprocess.run(
+                ["gh", "run", "list", "--branch", branch, "--limit", "5", "--json",
+                 "databaseId,status,conclusion,url,headSha"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                for _ in range(10):
+                    if _should_stop():
+                        return {"status": "interrupted", "error": "drain/shutdown requested"}
+                    _time.sleep(1)
+                continue
 
-        runs = json.loads(result.stdout)
-        if not runs:
-            return {"status": "error", "error": f"No CI runs found for branch {branch}"}
+            runs = json.loads(result.stdout)
+            for run in runs:
+                rid = run["databaseId"]
+                if rid in skip_run_ids:
+                    continue
+                # If we know local HEAD, prefer the run that matches it
+                if local_head and run.get("headSha", "").startswith(local_head[:12]):
+                    run_id = rid
+                    break
+                # Otherwise take the first non-skipped run
+                if not local_head:
+                    run_id = rid
+                    break
 
-        run = runs[0]
-        run_id = run["databaseId"]
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+            if run_id is not None:
+                break
+        except Exception:
+            pass
+
+        # GitHub hasn't created the run yet — wait and retry
+        for _ in range(10):
+            if _should_stop():
+                return {"status": "interrupted", "error": "drain/shutdown requested"}
+            _time.sleep(1)
+
+    if run_id is None:
+        # Fallback: take whatever is latest (even if HEAD doesn't match)
+        try:
+            result = subprocess.run(
+                ["gh", "run", "list", "--branch", branch, "--limit", "1", "--json",
+                 "databaseId,status,conclusion,url,headSha"],
+                capture_output=True, text=True, timeout=30,
+            )
+            runs = json.loads(result.stdout)
+            if runs and runs[0]["databaseId"] not in skip_run_ids:
+                run_id = runs[0]["databaseId"]
+            else:
+                return {"status": "error", "error": f"No matching CI run found for branch {branch} (HEAD: {local_head[:8] if local_head else '?'})"}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
 
     # Poll until complete
     deadline = _time.time() + timeout_minutes * 60
@@ -3826,6 +3881,8 @@ class Runner:
                 pass
 
         start_attempt = len(state["attempts"]) + 1
+        # Track cancelled run IDs so the poller skips them instead of re-finding them
+        skip_run_ids: set[int] = set()
         ci_log(f"Starting CI loop for {task.id} on branch {branch} (attempt {start_attempt})")
 
         for attempt in range(start_attempt, CI_LOOP_MAX_ATTEMPTS + 1):
@@ -3838,8 +3895,70 @@ class Runner:
 
             attempt_record = {"attempt": attempt, "started": datetime.now().isoformat()}
 
-            # ── Step 1: Push (first attempt only; subsequent attempts have fix agent push) ──
+            # ── Step 1: Local validation BEFORE pushing ──
+            # Always validate locally first — even on the first attempt. The task
+            # agent may have left broken code. Each wasted CI cycle costs 10-30 min.
             if attempt == start_attempt:
+                ci_log(f"Attempt {attempt}: running local validation before first push")
+                prior_validate_output = ""
+                local_passed = False
+
+                for local_iter in range(1, CI_LOCAL_MAX_ITERATIONS + 1):
+                    if self._shutdown.is_set() or self._draining.is_set():
+                        ci_log(f"CI loop stopping during initial validation — drain/shutdown")
+                        attempt_record["status"] = "interrupted_during_local_fix"
+                        state["attempts"].append(attempt_record)
+                        state_file.write_text(json.dumps(state, indent=2))
+                        return
+
+                    # Validate
+                    ci_log(f"Attempt {attempt}, initial validation {local_iter}/{CI_LOCAL_MAX_ITERATIONS}")
+                    validate_prompt = build_ci_local_validate_prompt(
+                        task.id, attempt, local_iter, debug_dir, learnings_file,
+                        prior_output=prior_validate_output,
+                    )
+                    validate_task = Task(
+                        id=f"{task.id}-init-validate-{local_iter}",
+                        description=f"Initial validation #{local_iter}",
+                        phase=task.phase, parallel=False,
+                        status=TaskStatus.RUNNING, line_num=0,
+                    )
+                    _wait_for_subagent(validate_task, validate_prompt,
+                                       f"Initial validation (iter {local_iter})")
+
+                    validate_file = debug_dir / f"attempt-{attempt}-local-{local_iter}.md"
+                    if validate_file.exists():
+                        content = validate_file.read_text()
+                        prior_validate_output = content
+                        if "## Result: PASS" in content:
+                            ci_log(f"Initial validation PASSED on iteration {local_iter}")
+                            local_passed = True
+                            break
+                        else:
+                            ci_log(f"Initial validation FAILED on iteration {local_iter} — spawning fix agent")
+                    else:
+                        ci_log(f"Validation agent didn't write result — treating as failure")
+                        prior_validate_output = "(no validation output)"
+
+                    if not local_passed and local_iter < CI_LOCAL_MAX_ITERATIONS:
+                        # Spawn fix agent to address validation failures
+                        fix_prompt = build_ci_fix_prompt(
+                            task.id, attempt, debug_dir, str(task_file), learnings_file,
+                        )
+                        fix_task = Task(
+                            id=f"{task.id}-init-fix-{local_iter}",
+                            description=f"Fix initial validation failure #{local_iter}",
+                            phase=task.phase, parallel=False,
+                            status=TaskStatus.RUNNING, line_num=0,
+                            capabilities=task.capabilities,
+                        )
+                        _wait_for_subagent(fix_task, fix_prompt,
+                                           f"Initial fix agent (iter {local_iter})",
+                                           caps=task.capabilities)
+
+                if not local_passed:
+                    ci_log(f"Initial validation failed after {CI_LOCAL_MAX_ITERATIONS} iterations — pushing anyway")
+
                 ci_log(f"Attempt {attempt}: pushing to {branch}")
                 try:
                     push_ok = _gh_push(branch, ci_log)
@@ -3865,7 +3984,7 @@ class Runner:
             watcher.start()
 
             ci_log(f"Attempt {attempt}: polling CI on {branch}...")
-            ci_result = _poll_ci_run(branch, stop_event=stop_event)
+            ci_result = _poll_ci_run(branch, stop_event=stop_event, skip_run_ids=skip_run_ids)
             stop_event.set()  # stop the watcher thread
             attempt_record["ci_result"] = ci_result
 
@@ -3910,22 +4029,17 @@ class Runner:
                 continue
 
             if ci_result["status"] == "cancelled":
-                ci_log(f"CI run was cancelled (attempt {attempt}) — creating empty commit to trigger fresh run")
+                cancelled_rid = ci_result.get("run_id")
+                ci_log(f"CI run {cancelled_rid} was cancelled (attempt {attempt}) — skipping, will re-poll")
+                if cancelled_rid:
+                    skip_run_ids.add(cancelled_rid)
                 attempt_record["status"] = "cancelled"
                 state["attempts"].append(attempt_record)
                 state_file.write_text(json.dumps(state, indent=2))
-                # Create an empty commit so the push actually triggers a new CI run.
-                # A bare re-push with no new commits won't create a new workflow run,
-                # and _poll_ci_run would just find the same cancelled run again.
-                try:
-                    subprocess.run(
-                        ["git", "commit", "--allow-empty", "-m",
-                         f"ci({task.id}): retry after cancelled run #{ci_result.get('run_id', '?')}"],
-                        capture_output=True, text=True, timeout=30,
-                    )
-                    _gh_push(branch, ci_log)
-                except subprocess.TimeoutExpired:
-                    ci_log("Retry commit/push timed out after cancellation")
+                # Don't push or create empty commits — just skip this run and
+                # re-poll to find the actual latest non-cancelled run.
+                # If there's no non-cancelled run, _poll_ci_run will return error
+                # and the loop will continue to the next attempt.
                 continue
 
             # ── Step 3: CI failed — download logs ──
