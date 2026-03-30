@@ -2855,21 +2855,11 @@ def build_ci_fix_prompt(task_id: str, attempt: int, debug_dir: Path,
     if (Path.cwd() / "flake.nix").exists():
         nix_note = "**Environment**: This project uses Nix. Your PATH includes all devshell tools.\n\n"
         nix_commands_note = """
-### Nix-specific command instructions
+### Nix note
 
-You are running inside a sandbox. To run nix commands that need the daemon:
-
-- **ALWAYS** set `NIX_REMOTE=daemon` when running nix commands
-- **ALWAYS** pass `--extra-experimental-features 'nix-command flakes'` to nix
-- **NEVER** pipe nix output through `head`, `tail`, or any truncation
-- **NEVER** use `nix develop --command` inside the sandbox — it will fail on store writes
-- `nix flake check --print-build-logs` runs NixOS VM tests that take **10-20 minutes**. Use a timeout of at least 1800 seconds (30 min). Run it in the background and use TaskOutput to wait for it.
-- **Write output to a file** so you can examine any portion after the command finishes:
-  ```
-  NIX_REMOTE=daemon nix --extra-experimental-features 'nix-command flakes' flake check --print-build-logs > /tmp/nix-flake-check.log 2>&1; echo "EXIT_CODE=$?" >> /tmp/nix-flake-check.log
-  ```
-- After the command finishes, read the exit code and the **last 200 lines** of `/tmp/nix-flake-check.log` — the critical errors (service crashes, test assertion failures, FTL messages) are always at the end.
-- If it failed, also search the log file for `FTL`, `FAIL`, `error:`, and `failed with` to find the root cause.
+You are inside a sandbox. Do NOT run `nix develop --command` (fails on store writes).
+Do NOT run `nix flake check` — it runs VM tests that take 10-20 min and the validate agent
+handles that. For `nixfmt --check`, run it directly (it's already in PATH).
 
 """
 
@@ -2879,73 +2869,49 @@ You are running inside a sandbox. To run nix commands that need the daemon:
 
 1. Read `CLAUDE.md` for the project's build, lint, and test commands
 2. Read the diagnosis at `{diagnosis_file}`
-3. Apply the recommended fix
-4. **Run local validation** — the SAME commands CI runs (see below)
-5. **Fix and re-validate in a loop** until ALL validation commands pass
+3. Read the latest local validation result in `{debug_dir}/` (the most recent `attempt-*-local-*.md` file)
+4. Apply the recommended fix
+5. Run **fast checks only** to verify your fix doesn't break the basics (see below)
 6. Commit your changes (but do NOT push — the runner handles pushing)
 
 ## Context files
 
 - **CLAUDE.md** — read this FIRST for build/test/lint commands
-- **CI workflow**: `.github/workflows/ci.yml` (or equivalent) — read this to discover EVERY command CI runs
+- **CI workflow**: `.github/workflows/ci.yml` (or equivalent) — reference for what CI runs
 - **Diagnosis**: `{diagnosis_file}` — read this to understand what to fix
-- **Prior attempts**: `{debug_dir}/` — contains logs and diagnoses from all attempts
+- **Prior attempts**: `{debug_dir}/` — contains logs, diagnoses, and validation results from all attempts
 - **Learnings**: `{learnings_file}` — project-specific gotchas
+
+## Fast checks (MANDATORY after applying fix)
+
+After applying your fix, run ONLY fast commands to sanity-check your changes. The runner has
+a separate validate agent that runs the full suite (including slow commands) — you do NOT
+need to duplicate that work.
+
+**Fast commands** (run these — typically <60s each):
+- Lint: `golangci-lint run`, `eslint`, `ruff check`, `nixfmt --check`, etc.
+- Build: `go build ./...`, `npm run build`, `cargo build`, etc.
+- Unit tests: `go test -short ./...`, `npm test`, `pytest -x`, etc.
+  - Use `-short` flag or equivalent to skip integration tests
+  - For Go: `go test -short ./...` (NOT `-race -count=1` — that's for the full suite)
+
+**Slow commands** (do NOT run these — the validate agent handles them):
+- `nix flake check` / `nix build` (NixOS VM tests — 10-20 min)
+- Docker-based integration tests
+- E2E tests that boot infrastructure
+- Full test suites with `-race -count=1` (use `-short` instead)
+- Any command that takes more than ~60 seconds
+
+If a fast check fails after your fix, fix it and re-run. You have up to **3 iterations** of
+fast checks. If fast checks still fail after 3 tries, commit what you have and document the
+remaining issues in `{debug_dir}/attempt-{attempt}-fix-notes.md`.
 {nix_commands_note}
-## Local validation (MANDATORY — CI parity)
-
-After applying your fix, you MUST run local validation. The goal is **CI parity** — run the
-same commands CI runs so you catch failures locally instead of wasting 10-30 min CI cycles.
-
-### Step 1: Discover CI commands
-
-Read `.github/workflows/ci.yml` (or `.github/workflows/` directory). For each job, extract
-every `run:` command. These are your local validation commands. Skip only:
-- GitHub Actions-specific steps (`uses: actions/checkout`, `uses: actions/upload-artifact`, etc.)
-- Steps that require CI-only secrets (e.g., `SNYK_TOKEN`, `SONAR_TOKEN`, `CACHIX_AUTH_TOKEN`)
-- SARIF uploads and artifact uploads
-- Job summary generation steps
-
-Everything else MUST run locally. Common examples of commands you MUST run:
-- `go build ./...`, `go test ./...`, `golangci-lint run`
-- `nix flake check --print-build-logs` (runs NixOS VM tests — these catch systemd service
-  failures, network topology issues, and integration bugs that unit tests miss)
-- `npm run build`, `npm test`, `npm run lint`
-- Any project-specific test commands
-
-### Step 2: Run ALL discovered commands
-
-Run them in the same order CI does. For each command:
-- If it **passes** → proceed to the next command
-- If it **fails** → fix the failure, then **re-run from the beginning** (not just the failed
-  command, because your fix may have broken something earlier in the chain)
-
-### Step 3: Fix-validate loop
-
-Repeat Step 2 until ALL commands pass in a single run. You have up to **20 local iterations**.
-If after 20 iterations some commands still fail, commit what you have and document the
-remaining failures in `{debug_dir}/attempt-{attempt}-fix-notes.md`.
-
-**Read the output carefully.** When a command fails:
-- Read the FULL output, not just the exit code
-- A process that starts and then crashes is a failure (e.g., a systemd unit that exits
-  with status 1 after startup)
-- A test that is cancelled or interrupted by the user is NOT the same as a test that failed
-  on its own — if YOU cancelled it, that's not a CI failure to diagnose
-- Look for the actual error message, not just "process exited with code 1"
-
-### What NOT to skip
-
-Do NOT skip integration tests or VM tests that are available locally. The whole point of local
-validation is to catch what CI would catch. If CI runs `nix flake check` and you skip it locally,
-you're guaranteeing another failed CI cycle. The only acceptable reason to skip a CI command
-locally is if it literally cannot run (missing hardware, CI-only secrets, etc.).
-
 ## Rules
 
 - Fix ONLY what the diagnosis identifies — do not refactor or improve other code
 - Commit with message: `fix({task_id}): [description of CI fix]`
 - Do NOT push — the runner validates your fix and pushes after confirming local validation passed
+- Do NOT run slow commands (VM tests, nix flake check, E2E tests) — the validate agent does that
 - If the diagnosis is unclear or you disagree with it, write your reasoning to
   `{debug_dir}/attempt-{attempt}-fix-notes.md` before applying an alternative fix
 - Do NOT create PRs or merge anything — the runner handles that after CI passes
