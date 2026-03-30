@@ -272,6 +272,304 @@ When a user-flow test fails, the failure log MUST include:
 
 This is why structured test output matters — the fix-validate agent needs to see the chain, not just "expected X, got Y."
 
+## Concurrency safety verification
+
+Race conditions are the highest-impact bugs that normal testing misses — they cause silent data corruption, intermittent crashes, and security vulnerabilities that only manifest under production load. Every project with concurrent code (goroutines, threads, async tasks, coroutines) MUST enable runtime race detection in CI.
+
+### When race detection is mandatory
+
+Enable race detection for any project that:
+- Handles concurrent requests (servers, daemons, agents)
+- Spawns goroutines, threads, or async tasks
+- Uses shared mutable state (maps, registries, connection pools, caches)
+- Has shutdown/cleanup logic that races with in-flight operations
+
+### Language-specific tools
+
+**Go — `-race` flag (zero false positives):**
+
+```bash
+# CI command — always use -count=1 to disable caching of race-detected runs
+GORACE="halt_on_error=1 atexit_sleep_ms=0 history_size=2" \
+  go test -race -count=1 -timeout 10m ./...
+```
+
+| GORACE option | Value | Why |
+|--------------|-------|-----|
+| `halt_on_error` | `1` | Fail immediately on first race — don't accumulate |
+| `atexit_sleep_ms` | `0` | Skip the 1s post-test sleep (saves time in CI) |
+| `history_size` | `2` | Doubles memory for stack traces — reduces "failed to restore the stack" errors |
+
+Performance overhead is 2-20x CPU and 5-10x memory. This is acceptable in CI. Never ship a `-race`-instrumented binary. Split CI into parallel jobs if the slowdown is prohibitive:
+
+```yaml
+jobs:
+  test-unit-race:
+    steps:
+      - run: go test -race -short -count=1 ./...
+  test-integration-race:
+    steps:
+      - run: go test -race -run Integration -count=1 -timeout 10m ./...
+```
+
+Go's race detector uses ThreadSanitizer under the hood and requires `CGO_ENABLED=1`. If your project builds with `CGO_ENABLED=0`, you still MUST run tests with CGO enabled for race detection.
+
+**Rust — choose by scenario:**
+
+| Scenario | Tool | Command |
+|----------|------|---------|
+| `unsafe` code, single-threaded UB | Miri | `cargo +nightly miri test` |
+| Lock-free data structures, custom sync | Loom | `RUSTFLAGS="--cfg loom" cargo test --release` |
+| FFI / C interop with threads | ThreadSanitizer | `RUSTFLAGS="-Z sanitizer=thread" cargo +nightly test --target x86_64-unknown-linux-gnu` |
+| Safe Rust with `Mutex`/`RwLock` only | Compiler prevents data races | Loom for logical correctness if complex |
+
+Always pass `--target` explicitly with ThreadSanitizer to prevent sanitizer flags from applying to build scripts and proc macros.
+
+**Java/Kotlin/Android — static analysis:**
+
+Use Facebook's Infer/RacerD for static race detection: `infer run --racerd-only -- ./gradlew assembleDebug`. Annotate concurrent code with `@GuardedBy` and `@ThreadSafe` to improve analysis accuracy. No mature dynamic race detector exists for Kotlin coroutines — `@GuardedBy` annotations and RacerD are the best static option.
+
+### Common race patterns in daemon/server code
+
+These patterns are especially relevant to long-running services:
+
+- **Shutdown vs. in-flight requests** — `Close()` sets a flag and closes listeners while goroutines still read shared state. Fix: `context.Context` cancellation + `sync.WaitGroup`.
+- **Hot config reload** — daemon reads config on startup, a goroutine reloads it periodically. Readers see partially-updated config. Fix: `atomic.Value` or copy-on-write with a mutex.
+- **Connection pool/registry mutations** — adding/removing entries from a shared map during concurrent request handling. Fix: `sync.RWMutex` or channel-based serialization.
+- **Lazy initialization** — singleton initialized on first use without synchronization. Fix: `sync.Once`.
+- **Test-only races** — parallel subtests sharing setup variables or writing to `*testing.T` from the wrong goroutine.
+
+### Plan phase requirements
+
+During the plan phase, for every project with concurrent code:
+1. Add `-race` (or equivalent) to the default test command in the Makefile/CI config
+2. Document the expected overhead and whether to split CI jobs
+3. If the project has lock-free or wait-free data structures, plan Loom (Rust) or stress tests with high goroutine counts (Go)
+
+## Adversarial flow tests
+
+User-flow integration tests verify that the system works correctly for legitimate users. **Adversarial flow tests** verify that the system correctly *rejects* illegitimate users. This is a distinct test category because the gap between "code checks the cert" and "the deployed system rejects the connection" is where real security breaches occur.
+
+### Why unit-level security tests are insufficient
+
+Unit tests validate **code logic**. Adversarial E2E tests validate **deployed configuration**. Common gaps:
+
+- **TLS library defaults** — Go's `crypto/tls` defaults to `NoClientCert`. A `VerifyPeerCertificate` callback is never called if `ClientAuth` isn't set to `RequireAndVerifyClientCert`. A unit test mocking the TLS layer can't catch this.
+- **Middleware ordering** — a health-check endpoint registered before an auth interceptor bypasses mTLS. Only an E2E test hitting that endpoint from a rogue node catches this.
+- **Firewall rules** — a daemon that should only accept connections on a Tailscale interface might also be reachable on a raw network interface. Unit tests can't verify firewall configuration.
+- **systemd sandboxing** — `PrivateNetwork=true`, `ProtectSystem=strict` only apply when the service is started via systemd, not when launched manually in tests.
+- **Certificate chain validation** — TLS implementations frequently disagree on whether mutant certificates should be accepted (Frankencerts research, IEEE S&P 2014). The full deployed TLS stack must be tested.
+
+### Adversarial test scenarios
+
+For every security boundary in the spec, plan an E2E test that verifies rejection from the **outside**:
+
+**Certificate validity attacks:**
+
+| Scenario | What to generate | Expected result |
+|----------|-----------------|-----------------|
+| Expired client cert | Cert with `NotAfter` in the past | TLS handshake fails |
+| Not-yet-valid cert | Cert with `NotBefore` in the future | TLS handshake fails |
+| Self-signed, not in trust store | `openssl req -x509 ...` | TLS handshake fails |
+| Cert signed by different CA | Second CA signs cert | TLS handshake fails |
+| Valid CA, wrong CN/SAN | Correct CA, wrong identity | Handshake OK, identity check rejects |
+| Cert pinning bypass | Valid cert, different SPKI hash | Application-layer rejection |
+| Wrong EKU | Server EKU instead of client EKU | TLS handshake fails |
+
+**Infrastructure attacks:**
+
+- **Non-Tailscale interface access** — connect via raw `eth0` IP instead of Tailscale overlay. Must be rejected by firewall or bind address.
+- **Unpaired device connection** — a device on the same network but without paired state attempts to use the service.
+- **Token replay after consumption** — reuse a one-time pairing token. Must get 401 or connection refused.
+- **Connection reuse after cert rotation** — long-lived connections must be re-authenticated after certificate changes.
+
+### Structuring adversarial tests in VM environments
+
+**Pattern: Add a `rogue` node alongside legitimate nodes.** In NixOS VM tests, each `nodes.<name>` is a separate QEMU VM on the same virtual network — a genuinely separate machine, not a mock.
+
+Key principles:
+- Use `host.fail(...)` (not `succeed`) for adversarial assertions — you're testing that connections are **rejected**
+- **Enable the firewall** in adversarial tests (unlike functional tests that may disable it for convenience) to verify only expected ports accept traffic
+- **Test via systemd** for at least one scenario to validate sandboxing (`PrivateNetwork`, `ProtectSystem`, socket permissions)
+- **Pre-generate adversarial cert fixtures** deterministically (in `test/fixtures/gen/`) rather than generating certs inside VMs at test time
+- **Verify error opacity** — when a rogue connection is rejected, assert that the error leaks no internal details
+
+### Plan phase requirements
+
+During the plan phase, for every project with security boundaries (mTLS, auth tokens, network ACLs):
+1. Identify all trust boundaries from the spec's security requirements
+2. For each boundary, plan at least one adversarial E2E test with a rogue actor
+3. Plan deterministic adversarial cert fixture generation (expired, wrong-CA, wrong-SAN, wrong-EKU)
+4. Decide whether to test via systemd or manual launch — at least one adversarial test should use the real systemd service
+
+## Hardware-dependent and emulator-gated test coverage
+
+When a test suite requires hardware or an emulator (Android instrumented tests, iOS simulator tests, hardware token tests), running it on every PR may be impractical. This creates a coverage gap that must be explicitly managed — not silently ignored.
+
+### The problem
+
+Some test suites physically cannot run in standard CI: Android instrumented tests need an emulator, iOS tests need a simulator, hardware security tests need a physical token, GPU compute tests need a GPU. These environments are slow to boot, flaky, and resource-intensive. Many teams skip them entirely, leaving critical layers untested in CI. This is acceptable **only** if the gap is documented, mitigated, and tracked.
+
+### Architecture for testability
+
+The most impactful mitigation is separating pure logic from platform-dependent code:
+
+1. **Shared libraries** (e.g., cross-platform code compiled for multiple targets) — test with standard language tooling on the host. Full coverage achievable with no device/emulator.
+2. **Platform-independent layers** (ViewModels, repositories, state management, business logic) — test with platform stubs that run on the host (Robolectric for Android, XCTest without simulator for iOS, mock HAL for embedded). 10x faster than device tests.
+3. **Thin platform wrappers** (hardware keystore, biometrics, NFC, camera, GPU, sensors) — define interfaces, keep implementations to 5-10 lines per method. Test via fakes in unit tests. The real implementations are the coverage gap.
+
+### CI strategy tiers
+
+| Tier | When to run | What to run | Coverage tool |
+|------|-------------|-------------|---------------|
+| Every PR | Always | Host-side tests + platform stubs + unit tests | Standard coverage tools for each language |
+| Nightly/weekly | Schedule | Device/emulator instrumented tests | Platform-specific coverage (JaCoCo, xcresult, etc.) |
+| On-demand | Manual or release | Physical device / hardware tests | Device-specific coverage or manual checklist |
+
+For mobile emulator-in-CI: use KVM-accelerated runners (GitHub Actions ubuntu-latest supports this since 2024), cache device snapshots, use lightweight test images (ATD for Android). For hardware tests: consider cloud device farms (Firebase Test Lab, AWS Device Farm) on a scheduled basis.
+
+### Coverage gap documentation
+
+Maintain an explicit record of what is and isn't tested in CI. This can live in `specs/` or the plan:
+
+```
+## Coverage Boundaries
+
+### Fully tested in CI (every PR)
+- Host-side daemon/server (unit + integration): target 85%
+- Shared cross-platform library: target 85%
+- Platform-independent layers (via stubs): target 70%
+
+### Tested on schedule only (nightly/weekly)
+- Device/emulator instrumented tests
+- Hardware-dependent integration (real crypto hardware, real network stack)
+
+### Not tested in CI (manual only)
+- Hardware-specific operations (secure enclave, biometrics, NFC)
+- Physical device connectivity
+- Platform-specific edge cases requiring real hardware
+
+### Mitigations for untestable code
+- Hardware operations behind interfaces (tested via fakes)
+- Protocol tested end-to-end in shared library tests
+- Manual test checklist in specs/manual-test-plan.md
+```
+
+### Multi-language coverage merging
+
+For projects with multiple tech stacks (Go + Kotlin, Rust + TypeScript, etc.), track coverage per language with separate flags/components. Use Codecov flags or separate `coverage/<language>/` directories. Set different thresholds per component — don't block PRs on emulator-gated coverage:
+
+- **Host-side / primary language**: target 85%, hard gate
+- **Secondary language unit tests (platform stubs)**: target 70%, hard gate
+- **Device/emulator instrumented tests**: informational only (use `carryforward: true` in Codecov to retain data between scheduled runs)
+
+### Plan phase requirements
+
+During the plan phase, for every project with hardware-dependent tests:
+1. Identify which test suites require hardware/emulator
+2. Choose a CI tier for each (every PR, scheduled, manual)
+3. Plan the interface boundaries that make platform code testable via fakes
+4. Create a coverage gap document with explicit boundaries and mitigations
+5. Configure per-component coverage thresholds that reflect what actually runs in CI
+
+## Performance and benchmark testing
+
+When the spec defines performance goals (latency budgets, throughput targets, resource limits), those goals must be encoded as tests — not just documented and hoped for. Two layers of testing serve different purposes.
+
+### Layer 1: E2E latency assertions (system-level)
+
+These are regular test functions (not benchmarks) that assert the spec's hard requirements against the real system:
+
+```go
+func TestSignRequestLatency(t *testing.T) {
+    if testing.Short() {
+        t.Skip("skipping latency test in short mode")
+    }
+
+    const specBudget = 2 * time.Second
+    const runs = 20
+
+    var durations []time.Duration
+    for i := 0; i < runs; i++ {
+        start := time.Now()
+        _, err := client.Sign(ctx, signRequest)
+        elapsed := time.Since(start)
+        require.NoError(t, err)
+        durations = append(durations, elapsed)
+    }
+
+    sort.Slice(durations, func(i, j int) bool {
+        return durations[i] < durations[j]
+    })
+    p95 := durations[int(float64(len(durations))*0.95)]
+
+    t.Logf("p50=%v p95=%v max=%v",
+        durations[len(durations)/2], p95, durations[len(durations)-1])
+
+    require.Less(t, p95, specBudget,
+        "p95 sign latency %v exceeds spec budget %v", p95, specBudget)
+}
+```
+
+Key design choices:
+- Use `*testing.T` (not `*testing.B`) — this asserts a hard requirement, not a relative comparison
+- Run multiple iterations and assert on p95, not a single sample
+- Add headroom for CI runner noise (if spec says 2s, test might use 2.5s in CI but log actual values)
+- Skip with `-short` for fast local iteration; run in CI
+
+### Layer 2: Microbenchmarks (component-level)
+
+These track performance characteristics over time, catching regressions before they compound into a spec violation:
+
+```go
+func BenchmarkSigningOperation(b *testing.B) {
+    signer := setupTestSigner(b)
+    payload := generateTestPayload()
+    b.ResetTimer()
+    for b.Loop() {
+        _, err := signer.Sign(payload)
+        if err != nil {
+            b.Fatal(err)
+        }
+    }
+}
+```
+
+Microbenchmarks detect *relative* regressions via baseline comparison. Use `benchstat` (Go), `criterion` (Rust), or `pytest-benchmark` (Python) for statistical rigor — run with `-count=10` or more for significance.
+
+### CI integration
+
+| Signal | Action | Rationale |
+|--------|--------|-----------|
+| E2E latency exceeds spec budget | **Fail the build** | Spec contract violated |
+| Microbenchmark regresses >150% | **Warn via PR comment** | Could be noise; needs human judgment |
+| Microbenchmark regresses >300% | **Fail the build** | Catastrophic regression, unlikely noise |
+
+For continuous tracking, use `github-action-benchmark` (supports Go, Rust, Python, JS — stores results on `gh-pages`, configurable alert thresholds) or `benchstat` with cached baselines.
+
+### Budget decomposition
+
+When the spec defines a single end-to-end budget (e.g., "sign request < 2 seconds"), decompose it into sub-budgets per component during the plan phase:
+
+| Component | Sub-budget | Measured by |
+|-----------|-----------|-------------|
+| mTLS handshake | < 200ms | Microbenchmark |
+| gRPC round-trip overhead | < 100ms | Microbenchmark |
+| Phone signing operation | < 1500ms | E2E (includes phone simulator) |
+| Margin | 200ms | — |
+
+Each sub-budget becomes its own test assertion, making it clear *where* time is being spent when the overall budget is at risk.
+
+### Plan phase requirements
+
+During the plan phase, for every project with performance goals in the spec:
+1. Identify all latency/throughput/resource targets from the spec
+2. Decompose end-to-end budgets into per-component sub-budgets
+3. Plan E2E latency assertion tests for each spec target (`*testing.T` style)
+4. Plan microbenchmarks for performance-critical components (`*testing.B` style)
+5. Choose a CI benchmarking tool and configure regression thresholds
+6. Decide whether microbenchmark regressions block merges or just warn
+
 ## E2E test harness requirements
 
 E2E tests are the most infrastructure-heavy tests in a project. They fail most often not because of code bugs but because of missing infrastructure: an APK that wasn't built, an emulator that wasn't configured, a UI interaction that can't be automated. Every E2E test MUST have its prerequisites decomposed into separate, independently testable tasks.

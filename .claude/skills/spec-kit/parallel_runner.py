@@ -45,6 +45,7 @@ class TaskStatus(Enum):
     COMPLETE = "complete"
     SKIPPED = "skipped"
     BLOCKED = "blocked"
+    REWORK = "rework"
     FAILED = "failed"
 
 
@@ -88,7 +89,7 @@ class AgentSlot:
 # ── Task file parser ───────────────────────────────────────────────────
 
 TASK_RE = re.compile(
-    r'^- \[(?P<check>[ x~?])\]\s+'
+    r'^- \[(?P<check>[ x~?!])\]\s+'
     r'(?:(?P<id>[A-Za-z0-9_-]+(?:-fix\d+)?)\s+)?'
     r'(?:\[P\]\s+)?'
     r'(?P<desc>.+)$'
@@ -221,6 +222,8 @@ def parse_task_file(path: Path) -> tuple[list[Phase], dict[str, list[str]]]:
                 status = TaskStatus.SKIPPED
             elif check == '?':
                 status = TaskStatus.BLOCKED
+            elif check == '!':
+                status = TaskStatus.REWORK
             else:
                 status = TaskStatus.PENDING
 
@@ -374,7 +377,7 @@ class Scheduler:
 
                 is_incomplete = (
                     task.id in running_ids
-                    or task.status == TaskStatus.PENDING
+                    or task.status in (TaskStatus.PENDING, TaskStatus.REWORK)
                     or task.status == TaskStatus.BLOCKED
                 )
 
@@ -385,14 +388,14 @@ class Scheduler:
                         has_incomplete_sequential_above = True
                     continue
 
-                if task.status != TaskStatus.PENDING:
+                if task.status not in (TaskStatus.PENDING, TaskStatus.REWORK):
                     # Blocked or other non-ready state
                     has_incomplete_above = True
                     if not task.parallel:
                         has_incomplete_sequential_above = True
                     continue
 
-                # Task is PENDING and not running
+                # Task is PENDING/REWORK and not running
                 if not task.parallel:
                     # Sequential task: must wait for ALL preceding tasks
                     if has_incomplete_above:
@@ -422,7 +425,7 @@ class Scheduler:
     def remaining_count(self) -> int:
         return sum(
             1 for p in self.phases for t in p.tasks
-            if t.status == TaskStatus.PENDING
+            if t.status in (TaskStatus.PENDING, TaskStatus.REWORK)
         )
 
     def completed_count(self) -> int:
@@ -545,6 +548,7 @@ STATUS_SYMBOLS = {
     TaskStatus.SKIPPED:  "⊘",
     TaskStatus.BLOCKED:  "⊗",
     TaskStatus.FAILED:   "✗",
+    TaskStatus.REWORK:   "↻",
 }
 
 STATUS_COLORS = {
@@ -554,6 +558,7 @@ STATUS_COLORS = {
     TaskStatus.SKIPPED:  "\033[90m",      # gray
     TaskStatus.BLOCKED:  "\033[31m",      # red
     TaskStatus.FAILED:   "\033[31;1m",    # bold red
+    TaskStatus.REWORK:   "\033[35m",      # magenta
 }
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -583,12 +588,15 @@ def render_dependency_graph(phases: list[Phase], phase_deps: dict[str, list[str]
     running_tasks = sum(1 for p in phases for t in p.tasks if t.id in running_ids)
     failed_tasks = sum(1 for p in phases for t in p.tasks if t.status == TaskStatus.FAILED)
     blocked_tasks = sum(1 for p in phases for t in p.tasks if t.status == TaskStatus.BLOCKED)
+    rework_tasks = sum(1 for p in phases for t in p.tasks if t.status == TaskStatus.REWORK)
 
     summary_parts = [f"{BOLD}TASKS{RESET} {done_tasks}/{total_tasks}"]
     if draining:
         summary_parts.append(f"\033[33;1m⏻ DRAINING — no new tasks, waiting for agents to finish{RESET}")
     if running_tasks:
         summary_parts.append(f"{STATUS_COLORS[TaskStatus.RUNNING]}◉ {running_tasks} running{RESET}")
+    if rework_tasks:
+        summary_parts.append(f"{STATUS_COLORS[TaskStatus.REWORK]}↻ {rework_tasks} rework{RESET}")
     if failed_tasks:
         summary_parts.append(f"{STATUS_COLORS[TaskStatus.FAILED]}✗ {failed_tasks} failed{RESET}")
     if blocked_tasks:
@@ -598,7 +606,7 @@ def render_dependency_graph(phases: list[Phase], phase_deps: dict[str, list[str]
     # Legend (compact)
     legend_parts = []
     for s in [TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.COMPLETE,
-              TaskStatus.SKIPPED, TaskStatus.BLOCKED, TaskStatus.FAILED]:
+              TaskStatus.SKIPPED, TaskStatus.BLOCKED, TaskStatus.FAILED, TaskStatus.REWORK]:
         legend_parts.append(f"{STATUS_COLORS[s]}{STATUS_SYMBOLS[s]} {s.value}{RESET}")
     header.append(" " + " ".join(legend_parts))
 
@@ -2769,8 +2777,9 @@ def build_ci_diagnose_prompt(task_id: str, attempt: int, debug_dir: Path,
     """
     log_file = debug_dir / f"attempt-{attempt}-logs.txt"
     history_files = sorted(debug_dir.glob("attempt-*-diagnosis.md"))
+    sanity_files = sorted(debug_dir.glob("attempt-*-sanity-check-fail.md"))
     prior_section = ""
-    if history_files:
+    if history_files or sanity_files:
         prior_section = f"""## Prior diagnosis history
 
 These files contain diagnoses from previous CI attempts. Read them to understand
@@ -2779,6 +2788,8 @@ what was already tried and avoid repeating failed fixes:
 """
         for hf in history_files:
             prior_section += f"- `{hf}`\n"
+        for sf in sanity_files:
+            prior_section += f"- `{sf}` (**sanity-check failure** — CI passed but results were suspicious)\n"
         prior_section += "\n"
 
     nix_note = ""
@@ -3030,6 +3041,26 @@ Format:
 - Do not confuse a user-cancelled run with a genuine test failure
 - Include the actual error messages, not just "exit code 1"
 
+## Sanity check: results must make sense
+
+After running all commands, sanity-check the results **semantically** before writing your report.
+A command can exit 0 but still indicate a broken setup. Treat ALL of the following as **FAIL**:
+
+- **Zero tests ran**: a test runner exits 0 but reports 0 passed / 0 failed — something is misconfigured
+  (missing test runner binary, wrong working directory, no test files found, build failed silently before tests)
+- **Phantom passes**: test count is dramatically lower than the number of test files/functions on disk
+  (e.g., 50 test functions exist but only 2 ran — likely a filter or compilation error hiding tests)
+- **Missing artifacts**: a build or test step claims success but expected output files are absent
+  (e.g., no JUnit XML in `build/test-results/`, no binary produced by `go build`, no coverage data)
+- **Silent tool failures**: a tool like `./gradlew`, `cargo`, or `npm` was not found or crashed on
+  startup — even if the pipeline continued, this is a FAIL
+- **Empty output**: a step that normally produces substantial output produced nothing (e.g., linter
+  ran in 0.01s with no output — it likely didn't find any files to lint)
+
+To verify: cross-reference the number of tests reported against the actual test source files on disk.
+Use `find` or `glob` to count test files/functions, then compare with the runner's reported count.
+If they diverge significantly, investigate and report it as a failure with details.
+
 ## Rules
 
 - Do NOT fix any code — just run commands and report
@@ -3053,7 +3084,41 @@ def build_ci_finalize_prompt(task_id: str, task_file: str, debug_dir: Path,
 
     return f"""You are a CI finalization agent for task **{task_id}**.
 
-{nix_note}CI has passed. Complete the task:
+{nix_note}CI has passed. Before finalizing, you MUST sanity-check the results.
+
+## Step 0: Sanity-check CI results
+
+Download the CI run summary and job details:
+```bash
+gh run list --branch "$(git branch --show-current)" --limit 1 --json databaseId,conclusion --jq '.[0]'
+# then for each job:
+gh run view <run_id> --json jobs --jq '.jobs[] | {{name, conclusion, status}}'
+```
+
+Then read `.github/workflows/ci.yml` to understand what each job SHOULD produce.
+
+For every job that runs tests, verify the results are plausible:
+- **Download the job logs**: `gh run view <run_id> --log` and search for test counts,
+  "0 passed", "0 tests", "no such file", "not found", or empty output sections
+- **Cross-reference test counts against source**: count the test files/functions on disk
+  (e.g. `find . -name '*_test.go' | wc -l`, `find . -name '*Test.kt' | wc -l`) and compare
+  with the number of tests the CI runner reported. If CI reports 0 tests but test files exist,
+  or reports dramatically fewer tests than exist, something is broken.
+- **Check for silent failures**: a job can exit 0 while its key step failed if the step output
+  is piped (e.g. `cmd | tee`), if errors are swallowed by `|| true`, or if a `continue-on-error`
+  masks the failure. Look at the actual step output, not just the job conclusion.
+- **Check for missing artifacts**: if a test step should produce XML results, coverage reports,
+  or binaries, verify they appear in the logs or artifact list.
+
+**If any sanity check fails**: do NOT finalize. Instead:
+1. Write a diagnosis to `{debug_dir}/sanity-check-fail.md` explaining what's wrong
+2. Do NOT mark the task complete — leave `- [ ]` unchanged in `{task_file}`
+3. Do NOT commit
+4. Exit — the runner will re-schedule the task for fixing
+
+**If all sanity checks pass**: proceed to finalization below.
+
+## Steps 1-5: Finalize
 
 1. Read the task description in `{task_file}` for {task_id}
 2. If the task says to create a PR: create it with `gh pr create`
@@ -3086,6 +3151,7 @@ class Runner:
         self.skills_dir = self.script_dir.parent
         self.blocked_file = Path("BLOCKED.md")
         self._blocked_answers: dict[str, str] = {}  # task_id -> user's answer from BLOCKED.md
+        self._amendment_dir: Optional[Path] = None  # set per-feature to specs/<feature>/
         self.log_dir = Path("logs")
         self.log_dir.mkdir(exist_ok=True)
         self.timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -3268,6 +3334,7 @@ class Runner:
 
     def _run_feature(self, spec_dir: str):
         self._current_spec_dir = spec_dir  # for _poll_agents attempt tracking
+        self._amendment_dir = Path(spec_dir)
         task_file = Path(spec_dir) / "tasks.md"
         learnings_file = Path(spec_dir) / "learnings.md"
         constitution = Path(".specify/memory/constitution.md")
@@ -3426,6 +3493,23 @@ class Runner:
                         self.tui.stop()
                     print(f"\n=== BLOCKED ===\n{blocked_text}")
                     print("Edit BLOCKED.md with your answer, then re-run. The runner will clean up the file.")
+                    sys.exit(2)
+
+            # Check for AMENDMENT-*.md files — pause and prompt for human approval
+            if self._amendment_dir:
+                amendments = list(self._amendment_dir.glob("AMENDMENT-*.md"))
+                if amendments:
+                    amend_file = amendments[0]
+                    amend_text = amend_file.read_text()
+                    self.log(f"AMENDMENT found: {amend_file.name}")
+                    if self.tui:
+                        self.tui.stop()
+                    print(f"\n=== SPEC AMENDMENT ===\n{amend_text}")
+                    print("\nReview the amendment above. To approve:")
+                    print("  1. Update spec.md with the amendment (append to ## Amendments section)")
+                    print("  2. Update tasks.md — mark affected completed tasks with [!] for rework if needed")
+                    print(f"  3. Delete {amend_file.name}")
+                    print("  4. Re-run the runner")
                     sys.exit(2)
 
             # Get running task IDs
@@ -3671,7 +3755,7 @@ class Runner:
                         f"{p.slug} (needs: {', '.join(d for d in phase_deps.get(p.slug, []) if not scheduler.phase_complete(d))})"
                         for p in phases
                         if not scheduler.phase_deps_met(p.slug)
-                        and any(t.status == TaskStatus.PENDING for t in p.tasks)
+                        and any(t.status in (TaskStatus.PENDING, TaskStatus.REWORK) for t in p.tasks)
                     ]
                     if unmet:
                         self.log(f"  Blocked by unmet deps: {', '.join(unmet)}")
@@ -4019,7 +4103,7 @@ class Runner:
                 state["attempts"].append(attempt_record)
                 state_file.write_text(json.dumps(state, indent=2))
 
-                # ── Finalize: create PR, mark complete ──
+                # ── Finalize: sanity-check CI results, then create PR + mark complete ──
                 prompt = build_ci_finalize_prompt(
                     task.id, str(task_file), debug_dir, learnings_file
                 )
@@ -4032,7 +4116,26 @@ class Runner:
                 )
                 _wait_for_subagent(finalize_task, prompt, "Finalize agent",
                                    caps=task.capabilities)
-                return
+
+                # Check if sanity-check failed — finalize agent writes this file
+                # instead of marking the task complete when CI results look wrong
+                sanity_fail = debug_dir / "sanity-check-fail.md"
+                if sanity_fail.exists():
+                    ci_log(f"Sanity check failed — CI passed but results are suspicious. "
+                           f"See {sanity_fail}")
+                    # Treat as a CI failure: enter the diagnosis/fix loop
+                    # Rewrite the attempt status so the fix loop picks it up
+                    attempt_record["status"] = "sanity_check_fail"
+                    attempt_record["sanity_fail"] = sanity_fail.read_text()[:2000]
+                    state["attempts"][-1] = attempt_record
+                    state_file.write_text(json.dumps(state, indent=2))
+                    # Rename so the next finalize attempt gets a clean slate
+                    sanity_fail.rename(
+                        debug_dir / f"attempt-{attempt}-sanity-check-fail.md"
+                    )
+                    # Fall through to diagnosis/fix below instead of returning
+                else:
+                    return
 
             if ci_result["status"] in ("error", "timeout"):
                 ci_log(f"CI {ci_result['status']}: {ci_result.get('error', 'timed out')}")
@@ -4057,22 +4160,28 @@ class Runner:
                 # and the loop will continue to the next attempt.
                 continue
 
-            # ── Step 3: CI failed — check for repeated failures ──
-            failed_jobs = ', '.join(ci_result.get('failed_jobs', [])) or 'unknown'
-            ci_log(f"CI failed (attempt {attempt}): {failed_jobs}")
+            # ── Step 3: CI failed (or sanity check failed) — check for repeated failures ──
+            is_sanity_fail = attempt_record.get("status") == "sanity_check_fail"
+            failed_jobs = ', '.join(ci_result.get('failed_jobs', [])) or ('sanity-check' if is_sanity_fail else 'unknown')
+            if is_sanity_fail:
+                ci_log(f"Sanity check failed (attempt {attempt}): CI passed but results are suspicious")
+            else:
+                ci_log(f"CI failed (attempt {attempt}): {failed_jobs}")
 
             # Check if the same jobs have been failing consecutively
             recent_failures = []
             for prev in reversed(state.get("attempts", [])):
                 prev_ci = prev.get("ci_result", {})
-                if prev_ci.get("status") == "fail":
-                    recent_failures.append(
-                        frozenset(prev_ci.get("failed_jobs", []))
-                    )
-                elif prev_ci.get("status") in ("pass", None):
-                    break  # stop at last pass or non-CI attempt
+                prev_status = prev.get("status", "")
+                if prev_ci.get("status") == "fail" or prev_status == "sanity_check_fail":
+                    fail_key = frozenset(["sanity-check"]) if prev_status == "sanity_check_fail" \
+                        else frozenset(prev_ci.get("failed_jobs", []))
+                    recent_failures.append(fail_key)
+                elif prev_ci.get("status") in ("pass", None) and prev_status != "sanity_check_fail":
+                    break  # stop at last clean pass or non-CI attempt
                 # skip cancelled/interrupted — they don't count
-            current_failed = frozenset(ci_result.get("failed_jobs", []))
+            current_failed = frozenset(["sanity-check"]) if is_sanity_fail \
+                else frozenset(ci_result.get("failed_jobs", []))
             consecutive_same = sum(
                 1 for rf in recent_failures if rf == current_failed
             )
@@ -4095,24 +4204,35 @@ class Runner:
                 )
                 return
 
-            log_file = debug_dir / f"attempt-{attempt}-logs.txt"
-            if not _download_ci_logs(ci_result["run_id"], log_file):
-                ci_log("Failed to download CI logs")
-                log_file.write_text(f"Failed to download logs for run {ci_result['run_id']}")
+            if is_sanity_fail:
+                # Sanity-check failures already have a diagnosis (the sanity-check-fail file).
+                # The finalize agent already analyzed the CI results semantically.
+                # Skip log download and diagnosis agent — go straight to fix-validate.
+                ci_log(f"Using sanity-check diagnosis as basis for fix (skipping CI log download)")
+                # Write a diagnosis file so the fix agent can read it
+                sanity_diag = debug_dir / f"attempt-{attempt}-sanity-check-fail.md"
+                diag_file = debug_dir / f"attempt-{attempt}-diagnosis.md"
+                if sanity_diag.exists() and not diag_file.exists():
+                    diag_file.write_text(sanity_diag.read_text())
+            else:
+                log_file = debug_dir / f"attempt-{attempt}-logs.txt"
+                if not _download_ci_logs(ci_result["run_id"], log_file):
+                    ci_log("Failed to download CI logs")
+                    log_file.write_text(f"Failed to download logs for run {ci_result['run_id']}")
 
-            _download_ci_artifact(ci_result["run_id"], "ci-summary", debug_dir)
+                _download_ci_artifact(ci_result["run_id"], "ci-summary", debug_dir)
 
-            # ── Step 4: Diagnose ──
-            diag_prompt = build_ci_diagnose_prompt(
-                task.id, attempt, debug_dir, ci_result, learnings_file,
-            )
-            diag_task = Task(
-                id=f"{task.id}-diag-{attempt}",
-                description=f"Diagnose CI failure #{attempt}",
-                phase=task.phase, parallel=False,
-                status=TaskStatus.RUNNING, line_num=0,
-            )
-            _wait_for_subagent(diag_task, diag_prompt, f"Diagnosis agent (attempt {attempt})")
+                # ── Step 4: Diagnose ──
+                diag_prompt = build_ci_diagnose_prompt(
+                    task.id, attempt, debug_dir, ci_result, learnings_file,
+                )
+                diag_task = Task(
+                    id=f"{task.id}-diag-{attempt}",
+                    description=f"Diagnose CI failure #{attempt}",
+                    phase=task.phase, parallel=False,
+                    status=TaskStatus.RUNNING, line_num=0,
+                )
+                _wait_for_subagent(diag_task, diag_prompt, f"Diagnosis agent (attempt {attempt})")
 
             diag_file = debug_dir / f"attempt-{attempt}-diagnosis.md"
             if not diag_file.exists():

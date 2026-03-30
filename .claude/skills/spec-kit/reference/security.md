@@ -199,3 +199,142 @@ These tools offer full-featured free plans for public repositories. Include them
 | Containers | **Grype** (image vuln scanner), **Syft** (SBOM generator), **Dockle** (CIS benchmark linter), **Hadolint** (Dockerfile linter) |
 | IaC | **Checkov** (Terraform, K8s, Docker, CloudFormation — 2400+ policies), **KICS** (multi-framework IaC scanner) |
 | Fuzzing | **OSS-Fuzz / CIFuzz** (free for accepted OSS projects), **ClusterFuzzLite** (self-hosted) |
+
+## Fuzz testing
+
+Fuzz testing explores the *unknown unknowns* — input combinations no developer anticipated. Unit tests cover expected inputs and known edge cases. SAST finds pattern-matched anti-patterns. Fuzzing generates millions of semi-random inputs and catches crashes, hangs, and correctness violations that neither approach finds.
+
+### When fuzz testing is warranted
+
+A component is a fuzz target when it: (a) accepts `[]byte` or `string` from an external source, (b) has branching logic based on input content, and (c) a crash or corruption would be a security or reliability issue.
+
+**High-value targets (always fuzz):**
+- **Wire protocol parsers** — anything that reads bytes off a network (gRPC, SSH agent protocol, TLS handshake, custom binary formats). These cross trust boundaries and accept attacker-controlled input.
+- **Binary format deserializers** — protobuf, msgpack, CBOR, ASN.1, certificate parsers (PEM/DER). Structured input with length fields and type tags is where off-by-one and integer overflow bugs live.
+- **Cryptographic surrounding code** — not the algorithms themselves (use known-answer tests), but certificate chain validation, key parsing, signature verification dispatch, nonce handling.
+- **Input validators and sanitizers** — URL parsers, path canonicalization, anything that applies security policy based on string parsing.
+
+**Secondary targets (fuzz when practical):**
+- State machines with complex transition logic (connection negotiators, auth flows)
+- Encoding/decoding round-trips (`decode(encode(x)) == x` properties)
+- Configuration file parsers
+- Any function where the expected behavior is "don't crash on any input"
+
+### Language-specific tools
+
+**Go — native fuzzing (`testing.F`):**
+
+```go
+func FuzzParseMessage(f *testing.F) {
+    // Seed corpus from existing test cases
+    f.Add([]byte("\x00\x01\x02"), uint8(1))
+    f.Add([]byte("valid-msg"), uint8(0))
+
+    f.Fuzz(func(t *testing.T, data []byte, msgType uint8) {
+        msg, err := ParseMessage(data, msgType)
+        if err != nil {
+            return // invalid input is fine — just don't crash
+        }
+        // Property: re-encoding should round-trip
+        encoded := msg.Encode()
+        msg2, err := ParseMessage(encoded, msgType)
+        if err != nil {
+            t.Fatalf("round-trip failed: %v", err)
+        }
+        if !msg.Equal(msg2) {
+            t.Fatalf("round-trip mismatch")
+        }
+    })
+}
+```
+
+Corpus management:
+- `f.Add(...)` provides inline seeds; file-based seeds go in `testdata/fuzz/FuzzXxx/`
+- Without `-fuzz`, `go test` runs seed corpus as fast regression tests (deterministic)
+- With `-fuzz` and `-fuzztime`, you get time-boxed generative fuzzing
+- Commit `testdata/fuzz/` to the repo as regression corpus
+
+**Rust — `cargo-fuzz` with libFuzzer:**
+
+```rust
+#![no_main]
+use libfuzzer_sys::fuzz_target;
+
+fuzz_target!(|data: &[u8]| {
+    let _ = parse_message(data);
+});
+```
+
+Use `arbitrary::Arbitrary` derive for structure-aware fuzzing. Run with `cargo +nightly fuzz run target -- -max_total_time=300`. Use `--sanitizer none` for pure safe Rust (much faster). Corpus in `fuzz/corpus/`.
+
+**C/C++ — AFL++ or libFuzzer:** Instrument with `afl-clang-fast`, run with `afl-fuzz -V 3600 -i seeds/ -o findings/ -- ./target @@`. Use dictionaries for protocol fuzzing.
+
+### CI integration strategy
+
+The key constraint: fuzzing is open-ended. CI must be time-boxed.
+
+| Trigger | Mode | Duration | Purpose |
+|---------|------|----------|---------|
+| Every PR | Regression only | Seconds | Run seed corpus — catch known-bad inputs |
+| Every PR | Code-change fuzz | 5-10 min | Short generative run on changed code |
+| Nightly | Generative fuzz | 30-60 min | Find new bugs with longer runs |
+| Weekly | Deep fuzz | 2-8 hours | Thorough exploration, corpus growth |
+
+**Go CI example:**
+```yaml
+jobs:
+  fuzz-regression:
+    # Runs seed corpus only — fast, deterministic
+    steps:
+      - run: go test ./...
+
+  fuzz-generative:
+    # Time-boxed generative fuzzing
+    if: github.event_name == 'schedule'
+    steps:
+      - run: |
+          for pkg in $(go list ./...); do
+            fuzz_funcs=$(go test -list 'Fuzz.*' "$pkg" 2>/dev/null | grep '^Fuzz' || true)
+            for func in $fuzz_funcs; do
+              go test "$pkg" -fuzz="^${func}$" -fuzztime=60s
+            done
+          done
+```
+
+**ClusterFuzzLite (any language, self-hosted):**
+```yaml
+- uses: google/clusterfuzzlite/actions/run_fuzzers@v1
+  with:
+    fuzz-seconds: 600
+    mode: code-change  # only fuzz code changed in the PR
+```
+
+### Crash handling
+
+When a fuzzer finds a crash:
+1. The failing input is saved automatically (`testdata/fuzz/` for Go, `fuzz/artifacts/` for Rust, `findings/crashes/` for AFL++)
+2. In Go, the input becomes a regression test automatically — `go test` re-runs it on every future test run
+3. Minimize the crashing input (`cargo fuzz tmin`, `afl-tmin`) before committing
+4. Fix the bug, verify the regression test passes, commit the minimized input as a permanent regression test
+
+### What fuzzing catches that other testing misses
+
+Real-world examples from OSS-Fuzz, cargo-fuzz, and AFL++:
+- **Integer overflows** in size calculations (length fields, allocation sizes)
+- **Off-by-one errors** in buffer boundary checks
+- **Unhandled enum/tag values** in binary format parsers
+- **Denial of service** via algorithmic complexity (quadratic parsing, hash collision)
+- **Memory safety at FFI boundaries** (Rust `unsafe`, Go CGo)
+- **Round-trip correctness failures** (`decode(encode(x)) != x`)
+- **Silent data corruption** in protocol parsers that accept malformed input without error
+
+Google's AI-enhanced OSS-Fuzz found CVE-2024-9143 in OpenSSL — an out-of-bounds write present for ~20 years that "wouldn't have been discoverable with existing fuzz targets written by humans."
+
+### Plan phase requirements
+
+During the plan phase:
+1. Identify all components that parse untrusted input at system boundaries
+2. For each, decide: is it a fuzz target? Apply the criteria above.
+3. Plan fuzz target functions alongside unit tests for each target component
+4. Configure CI: regression corpus on every PR, time-boxed generative on schedule
+5. Add `testdata/fuzz/` (Go) or `fuzz/corpus/` (Rust) to the project structure

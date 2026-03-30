@@ -400,8 +400,10 @@ stateDiagram-v2
     PollCI --> CIError : gh API error
     PollCI --> CITimeout : poll exceeded 30 min
 
-    CIPassed --> Finalize : spawn finalize agent
-    Finalize --> [*] : PR created, task marked complete
+    CIPassed --> Finalize : spawn finalize agent (includes sanity check)
+    Finalize --> SanityCheck : agent checks CI results semantically
+    SanityCheck --> [*] : results plausible → PR created, task marked complete
+    SanityCheck --> CIFailed : results suspicious (0 tests, missing artifacts, etc.)
 
     CICancelled --> EmptyCommit : create empty commit (bare re-push won't trigger new run)
     EmptyCommit --> Push : push new HEAD
