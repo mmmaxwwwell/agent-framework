@@ -403,7 +403,8 @@ stateDiagram-v2
     CIPassed --> Finalize : spawn finalize agent
     Finalize --> [*] : PR created, task marked complete
 
-    CICancelled --> Push : re-push, do NOT diagnose/fix
+    CICancelled --> EmptyCommit : create empty commit (bare re-push won't trigger new run)
+    EmptyCommit --> Push : push new HEAD
     Push --> PollCI : fresh CI run triggered
 
     CIFailed --> DownloadLogs : download failed job logs
