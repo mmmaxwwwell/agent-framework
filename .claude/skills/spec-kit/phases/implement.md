@@ -57,7 +57,31 @@ Validation runs at **phase boundaries**, not per-task. It is **enforced by the r
 
 1. Agents implement tasks T007, T008, T009 (all in Phase 3). Each agent marks its task done and commits.
 2. The runner detects that all Phase 3 tasks are complete and spawns a **validation agent**.
-3. The validation agent runs a four-step sequence: **build → test → lint → security scan** (from `CLAUDE.md` or the phase Checkpoint). Build failure skips all later steps. Test failure still runs lint (so the fix agent can address both in one pass). Security scans only run if build and test pass.
+3. The validation agent runs a four-step sequence: **build → test → lint → security scan**. Build failure skips all later steps. Test failure still runs lint (so the fix agent can address both in one pass). Security scans only run if build and test pass.
+
+#### Multi-build-system discovery (MANDATORY)
+
+The validation agent MUST NOT assume there is a single build command. Before running validation, it discovers ALL build systems in the project by scanning for build manifests:
+
+| Manifest | Build system | Build command | Test command |
+|----------|-------------|---------------|-------------|
+| `go.mod` | Go | `go build ./...` | `go test ./...` |
+| `build.gradle.kts` / `build.gradle` | Gradle | `./gradlew assemble` | `./gradlew test` |
+| `Cargo.toml` | Cargo | `cargo build` | `cargo test` |
+| `package.json` | npm/pnpm/yarn | `npm run build` | `npm test` |
+| `pyproject.toml` / `setup.py` | Python | `python -m build` | `pytest` |
+| `CMakeLists.txt` | CMake | `cmake --build build/` | `ctest --test-dir build/` |
+| `flake.nix` | Nix | `nix build` | `nix flake check` |
+| `Makefile` | Make | `make build` | `make test` |
+
+**Discovery rules:**
+1. Scan the project root AND immediate subdirectories (e.g., `android/build.gradle.kts` in a Go+Android project)
+2. For each manifest found, add its build and test commands to the validation sequence
+3. If `CLAUDE.md` lists explicit build/test commands, those take precedence over auto-discovered defaults for that build system
+4. Run ALL discovered build commands — a project with `go.mod` at root and `build.gradle.kts` in `android/` must build BOTH
+5. A phase passes validation only if ALL build systems pass. One failing build system = phase FAIL.
+
+**Why this matters:** In multi-language projects (Go+Kotlin, Rust+TypeScript, Python+C++), agents routinely validate only the primary language's build. The secondary language's build fails silently, and the agent declares the phase "done." This rule makes secondary builds structurally un-skippable.
 4. **If validation passes** (all steps clean, zero security findings) → the agent writes `specs/<feature>/validate/phase3/1.md` with `PASS`. The runner marks the phase as validated and allows downstream phases to start.
 5. **If validation fails** (test failure, lint error, OR security finding) → the agent writes `specs/<feature>/validate/phase3/1.md` with `FAIL` including a **failure categories** summary (Build: PASS/FAIL, Test: PASS/FAIL, Lint: PASS/FAIL, Security: PASS/FAIL) plus per-step details (command, exit code, root cause summary, individual failures with file/line). This structured record lets the fix agent immediately see which steps failed without parsing raw output.
 6. **Next runner iteration** picks up `phase3-fix1` as a normal implementation task with fresh context — reads the full failure history from `validate/phase3/` (including structured failure categories), reads `test-logs/` and `test-logs/security/`, checks prior fix attempts to avoid repeating failed approaches, diagnoses and fixes. The fix agent runs build+test+lint locally before marking complete to catch cascading issues in a single pass.
@@ -65,6 +89,22 @@ Validation runs at **phase boundaries**, not per-task. It is **enforced by the r
 8. After 10 failed fix attempts → validation agent writes `BLOCKED.md` and the runner stops.
 
 **Why a dedicated validation agent?** Implementation agents used to be responsible for running validation when they were the last task in a phase. In practice, agents skipped this step — especially with parallel tasks where no agent could reliably detect it was "last". Moving validation to a dedicated agent spawned by the runner makes it structural and un-skippable.
+
+### No "expected failure" rationalization (MANDATORY)
+
+Agents MUST NEVER classify a build, test, lint, or security failure as "expected," "work in progress," "known issue," or "will be fixed later." If a command fails, the agent fixes it — period. There are exactly TWO valid responses to a validation failure:
+
+1. **Fix the code** so the command passes
+2. **Write BLOCKED.md** if the failure genuinely requires human input (missing credentials, design ambiguity, hardware)
+
+The following rationalizations are PROHIBITED:
+- "The Android/frontend/secondary-language build is still a work in progress" — if tasks.md includes tasks for that component, its build must pass
+- "This test is flaky" — fix the flake or add retry logic, don't skip it
+- "This security finding is not relevant to our use case" — suppress with an inline justification comment (see security scan rules), don't ignore it
+- "CI will catch this later" — local validation exists precisely to catch it NOW
+- "The Gradle/Cargo/npm failure is expected because we haven't implemented X yet" — if X is in the task list and the phase depends on it, the phase must not pass until X works
+
+**Why this rule exists:** Agents are trained to be helpful and accommodating. When faced with a failing build they can't easily fix, the path of least resistance is to explain why it's OK and move on. This is the single most common cause of broken releases — the agent rationalizes a failure, marks the phase done, and the broken build propagates to CI where it fails in front of humans. The rule is absolute: failures are fixed or blocked, never rationalized.
 
 Key properties:
 - **Runner-enforced** — validation is triggered by the scheduler, not by agent discretion
@@ -264,11 +304,33 @@ After ALL implementation phases pass their automated tests and code reviews, the
 
 This phase exists because automated tests — even good integration tests — miss an entire class of bugs that only surface when you actually run the finished product. Packaging manifests exclude files. Dev-only paths break. Native libraries aren't linked. First-run downloads fail. Loading states are missing. The agent troubleshoots these exactly like a human developer would, except it doesn't give up after the first error.
 
-### Phase 1: Build and Install
+### Phase 1: Build and Install ALL Artifacts
 
-1. **Build the distributable artifact** — run the project's build/package command (`npm run package`, `python -m build`, `cargo build --release`, `docker build`, etc.)
-2. **Install in a clean-ish environment** — NOT the dev workspace. For extensions: install the packaged artifact via the platform's CLI (`code --install-extension *.vsix`). For packages: install in a fresh venv/node_modules. For binaries: copy to a temp dir and run from there. For containers: `docker run` with no volume mounts to the source tree.
-3. **Verify the artifact contains everything it needs** — list the contents of the package and check against the project's runtime dependencies. If files are missing (source code, models, config templates, native libs), fix the packaging manifest and rebuild.
+**MANDATORY: Build EVERY distributable artifact the project produces, not just the primary one.**
+
+1. **Discover all artifacts** — scan the project for every build output that users or CI would produce:
+   - Check `CLAUDE.md` / `Makefile` for build targets
+   - Check CI workflow files (`.github/workflows/`) for build jobs — every `upload-artifact` step implies an artifact that must be buildable
+   - Check for platform-specific build directories (`android/`, `ios/`, `desktop/`, `web/`)
+   - Check `flake.nix` for package outputs (`packages.<system>.*`)
+
+2. **Build each artifact** — run each build command and verify it succeeds:
+
+   | Artifact type | Build command examples | Verify |
+   |--------------|----------------------|--------|
+   | Go binary | `go build`, `nix build` | Binary exists, runs `--version` |
+   | Android APK | `./gradlew assembleDebug`, `./gradlew assembleRelease` | APK exists at expected path |
+   | Python package | `python -m build` | `.whl` and `.tar.gz` exist in `dist/` |
+   | npm package | `npm pack` | `.tgz` exists |
+   | Container image | `docker build` | Image exists in local registry |
+   | VS Code extension | `vsce package` | `.vsix` exists |
+   | Nix package | `nix build .#<pkg>` | `result/` symlink exists |
+
+3. **Install in a clean-ish environment** — NOT the dev workspace. For extensions: install the packaged artifact via the platform's CLI (`code --install-extension *.vsix`). For packages: install in a fresh venv/node_modules. For binaries: copy to a temp dir and run from there. For containers: `docker run` with no volume mounts to the source tree. For APKs: install on emulator (`adb install`).
+
+4. **Verify each artifact contains everything it needs** — list the contents of the package and check against the project's runtime dependencies. If files are missing (source code, models, config templates, native libs), fix the packaging manifest and rebuild.
+
+5. **Cross-reference with CI release workflow** — for every artifact that the release workflow uploads (e.g., `gh release upload`), verify that the local build produces the same artifact at the same path. If the release workflow renames the artifact (e.g., `app-release.apk` → `nix-key-{version}.apk`), verify the rename logic works.
 
 ### Phase 2: User Flow Smoke Test (fix-validate loop)
 
@@ -299,6 +361,14 @@ Before pushing, run the same checks CI would run — locally. Most CI failures a
 1. Read `.github/workflows/` (or `.gitlab-ci.yml`, etc.) to understand exactly what CI runs.
 2. Run each CI step locally in order: install deps, build, test, lint, security scan, package.
 3. If CI uses a different OS (e.g. Ubuntu), check for platform-specific assumptions: paths, system packages, shell syntax.
+
+**ALL workflow files, not just CI** (applies to both Nix and non-Nix projects):
+1. Read EVERY workflow file in `.github/workflows/` — not just `ci.yml`. Release workflows, E2E workflows, and scheduled workflows all contain build/test commands that must work.
+2. For each workflow, identify every `run:` step and every build job. Categorize each as:
+   - **Locally reproducible** — run it now (build commands, test commands, lint, security scans)
+   - **CI-only but verifiable** — can't run the action but can verify the inputs exist (SARIF files for upload, artifacts at expected paths, workflow YAML syntax)
+   - **CI-only and opaque** — requires CI secrets or infrastructure (Snyk with token, SonarCloud, deploy steps). Skip but verify the `continue-on-error` / conditional logic is correct.
+3. For release workflows specifically: verify that every artifact the release workflow builds and uploads can be built locally. If the release workflow runs `./gradlew assembleRelease` and uploads the APK, that command must succeed locally.
 
 **Fix-validate locally** until all commands pass. Only proceed to Step 2 when local CI reproduction is clean.
 

@@ -153,6 +153,34 @@ Every CI run MUST produce:
 - Code coverage report (if applicable)
 - Build artifacts (if applicable)
 
+### Pre-release artifact availability (develop/feature branches)
+
+Every distributable artifact that the release workflow builds MUST also be buildable on non-release branches (develop, feature branches, PRs). This means:
+
+1. **The CI workflow (`ci.yml` or equivalent) must build ALL artifacts** — not just run tests. If the release workflow builds a Go binary and an Android APK, the CI workflow must also build both (debug variants are fine — the point is verifying the build succeeds, not producing release-quality artifacts).
+2. **Upload debug artifacts as GitHub Actions artifacts** on every PR/push to develop. This gives developers installable builds for manual testing without waiting for a release.
+3. **The release workflow should ONLY add signing, versioning, and upload** — not be the first place an artifact is built. If an artifact only builds in the release workflow, build failures are discovered at release time instead of during development.
+
+**Why:** If the APK only builds in the release workflow (triggered by push to main), a broken Gradle build goes undetected through the entire develop → PR → merge cycle. By the time someone tries to release, the build has been broken for weeks and the fix requires archaeology.
+
+**Implementation pattern:**
+```yaml
+# In ci.yml (runs on every PR and push to develop)
+build-artifacts:
+  steps:
+    - name: Build Go binary
+      run: go build -o nix-key ./cmd/nix-key
+    - name: Build Android APK (debug)
+      run: cd android && ./gradlew assembleDebug
+    - name: Upload debug APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: debug-apk
+        path: android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+This is language-agnostic — adapt the build commands to the project's tech stack. The principle is: **if it's built in the release workflow, it must also be built in the CI workflow.**
+
 ## Local security scan validation (fix-validate loop)
 
 Security scanning is part of the phase validation lifecycle — not a separate workflow. When the runner spawns a validation agent at a phase boundary, that agent runs **build → test → lint → security scan**. If any scanner finds issues, the standard fix-validate loop kicks in: the validation agent writes a FAIL record, a fix task is appended, a fresh fix agent reads the findings and patches the code, and the runner re-validates.
@@ -248,12 +276,15 @@ Tasks that push code and iterate on CI failures MUST be tagged `[needs: gh, ci-l
 
 ### CI parity in local validation
 
-The validation agent reads `.github/workflows/ci.yml` to discover commands rather than using a hardcoded list. It runs every `run:` command from the CI workflow, skipping only GitHub Actions-specific steps and CI-only secrets. This ensures local validation catches the same failures CI would, including:
+The validation agent reads ALL workflow files in `.github/workflows/` (not just `ci.yml`) to discover commands. It runs every `run:` command from every workflow, skipping only GitHub Actions-specific steps (action uses, SARIF uploads) and CI-only secrets. This ensures local validation catches the same failures CI would, including:
 
 - NixOS VM tests (`nix flake check --print-build-logs`)
 - Full test suites with race detection (`go test -race`)
 - Linters and formatters (`golangci-lint`, `nixfmt`)
 - Security scanners (when available locally)
+- **ALL build commands from ALL workflows** — including release workflows. If `release.yml` runs `./gradlew assembleRelease`, the validation agent runs it locally too. A build command that only exists in the release workflow and has never been validated locally is a ticking time bomb.
+
+**Multi-build-system rule:** The validation agent discovers build manifests in the project (see `phases/implement.md § Multi-build-system discovery`) and runs every build system's build+test commands. A project with `go.mod` and `android/build.gradle.kts` must pass both `go build ./...` AND `./gradlew assemble` — skipping either is a validation failure.
 
 ### Artifact directory
 

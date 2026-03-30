@@ -168,6 +168,8 @@ Before finalizing the task list, perform an explicit gap analysis on the E2E and
 #### Artifact build tasks
 - [ ] Is there a task to **build the distributable artifact** (APK, binary, container, VSIX) in a reproducible way before the E2E test installs it? Don't assume the dev build output works — the E2E test should install the same artifact that users get.
 - [ ] If the project has multiple artifacts (e.g., Go binary + Android APK), is there a build task for EACH one?
+- [ ] Does the **CI workflow** (not just the release workflow) build ALL artifacts? Every artifact that the release workflow produces must also be built on PR/develop branches to catch build failures early. Debug variants are fine — the point is that the build command succeeds. See `reference/cicd.md § Pre-release artifact availability`.
+- [ ] Are debug artifacts **uploaded as CI artifacts** on develop/PR branches so developers can install and test them without a release?
 
 #### Test environment infrastructure tasks
 - [ ] Is there a task to **set up the test environment** (emulator, VM, container, sandbox) as a reusable Nix expression or script? Don't make the E2E test task also responsible for creating its own environment — that's two things at once.
