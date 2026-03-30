@@ -28,6 +28,7 @@
 
 **Still ask about**:
 - Core functionality, API surface design, use cases
+- Non-goals — "anything this library should deliberately NOT do?" Critical for libraries where scope creep bloats the public API surface.
 - Target consumers (who will use this? what environments? Node, browser, both? Python 3.9+? Rust stable?)
 - Target registries (npm, PyPI, crates.io, GitHub Packages)
 - Bundling strategy (ESM, CJS, UMD, dual-publish? tree-shakeable?)
@@ -42,6 +43,9 @@
 ## Spec phase overrides
 
 - **FR/SC numbering**: required
+- **Examples on FRs**: mandatory on any FR flagged during analyze; encouraged on public API methods (examples serve double duty as documentation)
+- **Non-Goals section**: required — critical for libraries to document what's out of scope of the public API
+- **Operational workflows**: skip (not applicable to libraries)
 - **Enterprise Infrastructure section**: include for: error handling (errors are public API), config (options validation). Skip: logging infra, auth, CORS, security headers, rate limiting, graceful shutdown, health checks, observability.
 - **Edge Cases & Failure Modes**: full coverage for: invalid input to every public API method, type misuse, concurrent usage, version mismatches, missing peer dependencies, environment-specific failures (Node vs browser), resource cleanup (memory leaks, event listener cleanup, connection pooling).
 - **Testing section**: full — unit tests for every public API method, integration tests for complex workflows, compatibility tests across target environments/versions. Include: error case testing (every documented error code has a test), edge case testing for API misuse, benchmark tests for performance-sensitive APIs.
@@ -57,6 +61,10 @@
 - **API contract depth**: critical — this IS the product. Full request/response (input/output) schemas for every public method, all parameter types, return types, error cases, side effects.
 - **Complexity Tracking**: required — libraries should be especially simple since consumers inherit your complexity
 - **Phase Dependencies**: required
+- **Interface contracts**: include if the library has internal modules that share state. Skip for pure-function libraries.
+- **Runtime state machines**: include if the library manages stateful objects (connection pools, state machines, caches). Skip for stateless utilities.
+- **Critical path (user perspective)**: required — identify the consumer's first-use flow (install, import, call, get result)
+- **Test plan matrix**: required — map every SC to test tier and target environment matrix
 
 ### Library-specific plan sections
 
@@ -71,10 +79,15 @@
 
 - **Fix-validate loop**: required — per phase, runner-enforced
 - **`[P]` parallel markers**: include where applicable
+- **Done criteria**: required on every task
+- **Interface contract tags**: include where applicable
+- **Critical path checkpoints**: required
 - **FR/Story traceability**: required on every task
+- **Non-goals awareness**: reference in approach note
+- **Spec amendment process**: supported
 - **learnings.md**: required
 - **Code review**: full — auto-implement necessary fixes, write REVIEW-TODO.md, run fix-validate loop after. API surface review is especially important — look for: inconsistent naming, missing error cases, undocumented behavior, accidental public exports.
-- **Approach note**: `Approach: TDD with fix-validate loop per phase. Full CI/CD with publish pipeline and Tier 1 security scanning. Enterprise-grade test infrastructure across target environments. Public API is the product — every export documented, every error tested, strict semver.`
+- **Approach note**: `Approach: TDD with fix-validate loop per phase. Full CI/CD with publish pipeline and Tier 1 security scanning. Enterprise-grade test infrastructure across target environments. Public API is the product — every export documented, every error tested, strict semver. See Non-Goals for intentional API scope boundaries.`
 
 ## What the agent should still know
 

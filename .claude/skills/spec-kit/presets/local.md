@@ -26,17 +26,22 @@
 
 **Still ask about**:
 - Core functionality, user workflows, data model
+- Non-goals — "anything this tool should deliberately NOT do?" Important for local tools where scope creep adds unnecessary complexity.
 - Edge cases for data loss scenarios (local tools can't recover from cloud backup)
 - Persistence strategy (SQLite, filesystem, in-memory)
 - CLI UX (flags, subcommands, interactive prompts, output formatting)
 - Platform compatibility (Linux only? macOS? Windows?)
 - Process architecture (single process? spawns child processes? watch mode? daemon?)
+- Operational workflows — for daemons and long-running tools: day-1 setup, day-2 operations (add/remove/restart/debug), failure recovery, admin processes. Skip for pure run-and-exit CLIs.
 
 **Interview style**: 5-10 questions. Focus on UX, data integrity, and workflows. Propose sensible defaults and confirm.
 
 ## Spec phase overrides
 
 - **FR/SC numbering**: required
+- **Examples on FRs**: mandatory on any FR flagged during analyze; optional on clear FRs
+- **Non-Goals section**: required — document intentional omissions with rationale
+- **Operational workflows**: required for daemons/long-running tools; skip for pure CLIs
 - **Enterprise Infrastructure section**: include for: logging, error handling, config, graceful shutdown (if applicable), CI/CD. Skip: auth, CORS, security headers, rate limiting, observability infrastructure.
 - **Edge Cases & Failure Modes**: full coverage for: data loss, corrupt state, concurrent access, file system errors, invalid input, resource exhaustion (disk full, OOM), interrupted operations (Ctrl-C mid-write). Skip network/auth/rate-limit categories.
 - **Testing section**: full — unit tests for core logic, integration tests for data persistence and CLI behavior, edge case tests for failure modes. Security scanning is handled by CI (Tier 1 tools), not custom security tests. Skip contract/e2e unless the tool has an IPC/plugin API or a UI.
@@ -51,15 +56,24 @@
 - **API contract depth**: skip unless the tool has an IPC/plugin API or CLI subcommand interface complex enough to warrant formal contracts
 - **Complexity Tracking**: required — local tools should stay simple; track every abstraction
 - **Phase Dependencies**: required — with dependency graph and parallelization strategy
+- **Interface contracts**: required for projects with 2+ tasks sharing state. Load `reference/interface-contracts.md`.
+- **Runtime state machines**: required if the project has daemons, protocol handshakes, or connection management. Skip for pure CLIs.
+- **Critical path (user perspective)**: required — identify the day-1 user flow and incremental integration checkpoints
+- **Test plan matrix**: required — map every SC-xxx to test tier, fixture, assertion, infrastructure
 
 ## Task phase overrides
 
 - **Fix-validate loop**: required — per phase, runner-enforced
 - **`[P]` parallel markers**: include where applicable
+- **Done criteria**: required on every task — verifiable, additive, 1-3 bullets
+- **Interface contract tags**: required — `[produces: IC-xxx]` / `[consumes: IC-xxx]` on tasks that share state
+- **Critical path checkpoints**: required — growing integration test tasks at critical-path phase boundaries
 - **FR/Story traceability**: required on every task
+- **Non-goals awareness**: reference spec's Non-Goals in approach note
+- **Spec amendment process**: supported — agents write AMENDMENT files when spec premises are wrong
 - **learnings.md**: required
 - **Code review**: full — auto-implement necessary fixes, write REVIEW-TODO.md, run fix-validate loop after
-- **Approach note**: `Approach: TDD with fix-validate loop per phase. Full CI/CD with Tier 1 security scanning. Enterprise-grade test infrastructure, structured logging, comprehensive error handling. No auth, no network hardening — local single-user tool.`
+- **Approach note**: `Approach: TDD with fix-validate loop per phase. Full CI/CD with Tier 1 security scanning. Enterprise-grade test infrastructure, structured logging, comprehensive error handling. No auth, no network hardening — local single-user tool. See Non-Goals for intentional omissions.`
 
 ## What the agent should still know
 

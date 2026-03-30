@@ -32,6 +32,7 @@
 - Core functionality, user workflows, data model
 - API design and real-time requirements (if applicable)
 - UI flows (if applicable)
+- Non-goals — ask "anything this should deliberately NOT do?" One or two exclusions prevent scope creep even in a POC.
 - Edge cases for core happy-path flows — ask "what should happen when X fails?" for each major flow. Skip exhaustive failure mode enumeration, but don't skip edge cases entirely — agents need these answers when they encounter ambiguity during implementation.
 
 **Interview style**: 3-5 questions max. Propose aggressively — suggest the simplest viable architecture and ask "does this work?" rather than exploring options. Default to the user's stack if stated, otherwise pick the most productive stack for the domain.
@@ -39,7 +40,10 @@
 ## Spec phase overrides
 
 - **FR/SC numbering**: use it — costs nothing, prevents agents from guessing which requirement a task serves
+- **Non-Goals section**: include (lightweight — 1-3 items max). Prevents agents from building adjacent features.
+- **Examples on FRs**: optional — only if the FR is ambiguous after a first pass
 - **No Enterprise Infrastructure section** — omit entirely
+- **Operational workflows**: skip
 - **Edge Cases & Failure Modes**: include a lightweight version — one-liner per major flow describing the expected behavior on failure. Skip the full 11-category enumeration. Agents need *something* to reference when they hit an edge case during implementation, otherwise they guess or write BLOCKED.md.
 - **Testing section**: minimal — list what the happy-path tests should cover, skip contract/e2e/security test requirements
 - **UI_FLOW.md**: skip — too much overhead for a POC. If the project has a UI, just document screens in the spec.
@@ -54,6 +58,10 @@
 - **No API contract depth requirements** — endpoint list with example request/response is enough
 - **No Complexity Tracking table**
 - **No Phase Dependencies section** — run everything serially
+- **No interface contracts** — tasks run serially and can read each other's code
+- **No runtime state machines** — document state informally in the plan if needed
+- **No critical path section** — only one path through the code
+- **No test plan matrix** — basic tests only
 - **Phases**: Setup → Feature implementation → Basic smoke tests
 - **Testing strategy**: basic tests that prove core flows work. No TDD requirement. Tests can be written after implementation.
 
@@ -61,10 +69,13 @@
 
 - **No fix-validate loop** — just implement and test at the end
 - **No `[P]` parallel markers needed** — everything runs serially
+- **No done criteria on tasks** — task descriptions are sufficient for a POC
+- **No interface contract tags** — no IC references needed
+- **No spec amendment process** — just edit spec.md directly if something changes
 - **FR/Story traceability**: include — costs nothing (just a `[FR-001]` suffix on each task), but lets agents look up *why* a task exists when they encounter ambiguity during implementation
 - **learnings.md**: include — each agent appends gotchas and decisions. Without this, later agents rediscover the same issues, wasting runs. The file is tiny and the write cost is near-zero.
 - **No code review task** — skip automatic code review entirely. Ship it.
-- **Approach note**: `Approach: Implement core features, then add basic tests to verify happy paths. Lightweight traceability (FR IDs + learnings.md) to keep agents informed.`
+- **Approach note**: `Approach: Implement core features, then add basic tests to verify happy paths. Lightweight traceability (FR IDs + learnings.md) to keep agents informed. See Non-Goals for intentional omissions.`
 
 ## What the agent should still know
 

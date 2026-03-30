@@ -55,6 +55,18 @@ Present these in order. Skip items marked N/A in the spec.
 - **Build tooling** — Compiler, bundler, dev server. Evaluate startup time, watch mode quality, and whether it's a single `flake.nix` entry.
 - **Framework** (if any) — Present alternatives with trade-offs. Include DX friction: how many config files, how fast is cold start, does it have a good dev server with HMR?
 - **DX friction summary** — After evaluating all tools, present a brief "setup cost" summary: what `flake.nix` provides, what needs config files, what needs env vars or tokens. Goal: `git clone && nix develop && npm run dev` works with zero manual steps beyond filling in `.env`.
+- **Tool environment inventory** — For every build/test/lint command the project will use, produce a concrete inventory mapping command → tool → Nix package. This catches "Gradle isn't in nixpkgs" or "Android SDK needs a custom derivation" at plan time, not after 3 failed fix-validate cycles. For multi-language projects (e.g., Go host + Kotlin Android app), enumerate tools for EVERY tech stack:
+
+  Example (adapt columns to the project's actual stacks):
+
+  | Command | Tool | Nix package | Notes |
+  |---------|------|-------------|-------|
+  | `<build cmd>` | Compiler/runtime | `<pkg>` | Direct nixpkgs availability |
+  | `<wrapper script>` | Build tool wrapper | Self-bootstraps | Needs runtime (JDK, SDK, etc.) provided by env |
+  | `<device test cmd>` | Test runner + device | `<pkg>` + device/emulator | KVM or hardware required |
+  | `<lint cmd>` | Linter | `<pkg>` | In nixpkgs |
+
+  If a tool has no straightforward Nix package (e.g., proprietary SDKs, tools requiring license acceptance, platform-specific toolchains), document the derivation strategy in `research.md` and create a dedicated task for it in Phase 1. Do not leave "we'll figure it out later" as implicit — it will block every task that needs that tool.
 
 ### Data layer
 - **Storage backend** — Database, filesystem, in-memory, hybrid
@@ -67,6 +79,22 @@ Present these in order. Skip items marked N/A in the spec.
 - **API style** — REST, GraphQL, RPC, hybrid
 - **Serialization** — JSON, Protocol Buffers, MessagePack
 - **Real-time** — WebSocket library, SSE, polling strategy
+
+### Runtime state machines
+If the project has non-trivial runtime state (daemons, protocol handshakes, connection management, device lifecycles), present a formal state machine for each stateful subsystem. This is DISTINCT from:
+- **data-model.md state transitions** — which cover *persistent entity* lifecycle (database records with status fields)
+- **UI_FLOW.md state machines** — which cover *UI domain objects* (only for UI projects)
+
+Runtime state machines cover **process/protocol state in flight**: daemon lifecycles, protocol handshakes, connection management, concurrent subsystem coordination. For each state machine, define:
+1. **States** (including initial, terminal, and composite/nested where needed)
+2. **Transitions** (from → to)
+3. **Triggers** (signal, event, message, timeout)
+4. **Guards** (conditions — e.g., "mTLS handshake complete")
+5. **Actions** (side effects on transition — e.g., "emit SSH_AGENT_SUCCESS")
+
+Use Mermaid `stateDiagram-v2` format (renders natively in GitHub Markdown). Link each state machine to the edge-cases section: for every state, the edge cases should cover crash-in-state, concurrent access, and timeout behavior.
+
+Skip this section for stateless request/response services, pure-function libraries, and run-and-exit CLIs.
 
 ### Infrastructure decisions
 - **Logging** — Confirm library from interview, present any adjustments
@@ -84,16 +112,31 @@ Present these in order. Skip items marked N/A in the spec.
 - **Custom reporter** — For structured test output (required by fix-validate loop)
 - **Test tiers** — Unit, integration (per-boundary), user-flow integration (end-to-end chain), contract — what goes where
 - **User-flow test plan** — For each primary user flow in the spec, identify: the chain of boundaries crossed, the injectable seams for deterministic input (fixture files, pre-cached resources, test data), and the observable output to verify. See `reference/testing.md` § "User-flow integration tests". This plan ensures implementing agents know WHAT flows to test and HOW to make them deterministic.
+- **Test plan matrix** — Map every SC-xxx to a specific test shape. This bridges the gap between success criteria (what to verify) and implementation (how to verify it). For each SC:
+
+  | SC | Test Tier | Fixture Requirements | Assertion | Infrastructure |
+  |----|-----------|---------------------|-----------|----------------|
+  | SC-001 | Integration (user-flow) | Valid mTLS client cert, running daemon | Connection accepted, sign response returned | Tailscale test network |
+  | SC-002 | Integration (adversarial) | Expired cert, wrong-CA cert | TLS handshake rejected for all variants | Same as SC-001 |
+  | SC-003 | Unit | Mock signer, test keypair | Signature matches expected output | None |
+
+  Place this matrix after the user-flow test plan in the Testing Strategy section. Reference flow names from the user-flow plan where applicable (e.g., "see Flow 2: sign request") rather than re-describing the boundary chain. The matrix adds tier/fixture/assertion; the user-flow plan provides boundary chain detail.
 - **Test fixtures** — Real servers, test databases, audio/media fixtures, pre-cached model files — whatever the user-flow tests need for deterministic input without mocking boundaries
 - **First-run testing** — Plan how to test cold-start scenarios (empty caches, no downloaded resources, first-time config creation). Identify which flows have first-run behavior and what fixtures/cleanup is needed.
 - **Packaging tests** — If the project produces a distributable artifact: plan how to install-and-test in a clean environment. Identify files that must be bundled, dependencies that must be declared, and paths that must be relative (not absolute dev paths). See Pattern 7 in `reference/testing.md`.
 - **Dependency compatibility** — If the project uses ML models, versioned binary assets, or native extensions: plan version pinning strategy and interface verification tests. Identify which dependencies have breaking changes across versions (model input schemas, removed APIs, missing wheels). See Pattern 8.
 - **Cross-application integration** — If the project integrates with another app: identify the real delivery mechanism (public API, clipboard, IPC, file system) and plan tests for it. Document sandbox limitations early — don't discover them during implementation. See Pattern 9.
+- **Concurrency safety** — If the project has concurrent code (goroutines, threads, async tasks): plan race detection in CI (`go test -race`, Rust ThreadSanitizer/Miri/Loom, Infer/RacerD for Android). Decide whether to split CI into race-enabled and non-race jobs for performance. See `reference/testing.md` § "Concurrency safety verification".
+- **Adversarial security tests** — For every security boundary (mTLS, auth tokens, network ACLs): plan at least one E2E test with a rogue actor that verifies rejection. Plan adversarial cert fixtures (expired, wrong-CA, wrong-SAN). Decide whether to test via systemd-managed service (validates sandboxing) or manual launch. See `reference/testing.md` § "Adversarial flow tests".
+- **Hardware-dependent test coverage** — If any test suite requires hardware or an emulator (Android instrumented, hardware tokens, physical devices): choose a CI tier for each (every PR, scheduled, manual). Plan interface boundaries that make platform code testable via fakes. Create a coverage gap document with boundaries and mitigations. See `reference/testing.md` § "Hardware-dependent and emulator-gated test coverage".
+- **Performance benchmarks** — If the spec has performance goals (latency budgets, throughput targets): decompose end-to-end budgets into per-component sub-budgets. Plan E2E latency assertion tests (`*testing.T` style with p95 assertions) and microbenchmarks (`*testing.B` style with `benchstat` comparison). Choose a CI benchmarking tool and regression thresholds. See `reference/testing.md` § "Performance and benchmark testing".
+- **Fuzz testing** — If the project parses untrusted input at system boundaries (wire protocols, binary formats, cert parsing): identify fuzz targets, plan fuzz functions alongside unit tests, configure CI with regression corpus on every PR and time-boxed generative fuzzing on schedule. See `reference/security.md` § "Fuzz testing".
 - **Concurrency** — Parallel unit tests, sequential integration tests, sequential user-flow tests
 
 ### CI/CD
 - **Pipeline structure** — Confirm stages from interview
 - **Security scanning tools** — Confirm tier selection. For each tool, note: does it need a token (and how to get one), or is it zero-config? Prefer zero-config tools. Document token setup instructions for the README (per `reference/cicd.md` CI credential section).
+- **Security success criteria → task mapping** — For each security-related success criterion (SC-*) in the spec, confirm there's a corresponding scanning task, Makefile target, and CI gate. If the spec says "zero critical vulnerabilities", the plan must include the specific scanners, their commands, and the CI step that enforces it. Don't let security SCs exist without implementation tasks.
 - **Quality gates** — What blocks merges
 - **Agentic CI feedback** — How agents access CI logs, auto-push policy
 - **SBOM format** — CycloneDX or SPDX
@@ -118,6 +161,30 @@ Present these in order. Skip items marked N/A in the spec.
 - **API versioning** — Confirm URL path versioning + latest alias
 - **Semver policy** — How agents determine patch/minor/major
 - **Changelog** — Auto-generated or manual
+
+### Interface contracts (internal)
+Load `reference/interface-contracts.md` before writing this section. For any project with 2+ tasks that share state (file paths, socket paths, data formats, env vars), define the contracts between producer and consumer tasks:
+
+| IC | Name | Producer | Consumer(s) | Specification |
+|----|------|----------|-------------|---------------|
+| IC-001 | Cert store layout | T005 | T008, T033 | Dir: `~/.config/app/certs/`, CA: `ca.pem`, format: PEM X.509, permissions: 0600 |
+
+Each contract specifies: location, format, permissions, and lifecycle. Task descriptions in `tasks.md` reference contracts with `[produces: IC-xxx]` / `[consumes: IC-xxx]` tags.
+
+This section covers *internal* shared state between tasks. External APIs/protocols are covered by `reference/api-contracts.md`. Persistent data schemas are covered by `data-model.md`.
+
+### Critical path (user perspective)
+Identify the minimal end-to-end flow a user exercises on day 1 — the "walking skeleton" that proves the system works. This is NOT a reordering of phases (technical dependencies still govern order), but an annotation that makes the user-visible integration path explicit:
+
+1. **The day-1 user flow** — the minimal chain from first user action to first meaningful result (e.g., "scan QR code → pair phone → attempt SSH sign → see signature succeed")
+2. **Phase mapping** — which phases contribute components to this flow, in order
+3. **Incremental integration checkpoints** — for each phase on the critical path, a growing integration test that exercises the chain built so far:
+   - Phase 2 done: "agent socket opens"
+   - Phase 3 done: "agent socket opens, accepts connection, returns key list"
+   - Phase 4 done: "full pairing + sign flow works"
+4. **First testable user result** — which phase delivers the first result a user would recognize as "it works"
+
+This fills the gap between per-phase user-flow tests (within-phase only) and the post-implementation E2E validation (too late). Each critical-path checkpoint becomes a task in `tasks.md`.
 
 ### Post-implementation validation strategy
 - **Build and install command** — The exact command to build the distributable artifact and install it outside the dev workspace. This must be documented so the smoke test agent can execute it.
@@ -145,6 +212,11 @@ After all decisions are made but before writing the plan:
 |-------------|---------------|---------------------|
 | Test infrastructure / fix-validate strategy | `reference/testing.md` | Phase 1 plan section |
 | User-flow integration test plan | `reference/testing.md` § "User-flow integration tests" | Testing strategy section — map each user flow to its boundary chain, injectable seams, and observable output |
+| Concurrency safety / race detection | `reference/testing.md` § "Concurrency safety verification" | Testing strategy — race detector flags, CI job splitting |
+| Adversarial security tests | `reference/testing.md` § "Adversarial flow tests" | Testing strategy — rogue-actor E2E tests, adversarial cert fixtures |
+| Hardware-dependent coverage gaps | `reference/testing.md` § "Hardware-dependent and emulator-gated test coverage" | Testing strategy — CI tiers, coverage gap document |
+| Performance benchmarks | `reference/testing.md` § "Performance and benchmark testing" | Testing strategy — budget decomposition, benchmark CI |
+| Fuzz testing targets | `reference/security.md` § "Fuzz testing" | Testing strategy — fuzz target identification, CI time-boxing |
 | Foundational infrastructure: logging | `reference/logging.md` | Phase 2 logging task description |
 | Foundational infrastructure: error handling | `reference/errors.md` | Phase 2 error handling task description |
 | Foundational infrastructure: config | `reference/config.md` | Phase 2 config task description |
@@ -160,6 +232,7 @@ After all decisions are made but before writing the plan:
 | Idempotency & readiness | `reference/idempotency.md` | Setup task descriptions |
 | Edge case → test mapping | `reference/edge-cases.md` | Mapping enumerated edge cases to test scenarios |
 | Traceability | `reference/traceability.md` | Grouping plan by user story/FR for downstream task traceability |
+| Interface contracts (internal) | `reference/interface-contracts.md` | Defining shared data formats, file paths, and protocols between tasks |
 
 **Conditional loads — check the spec and load only if applicable:**
 - **If the project has a UI**: load `reference/ui-flow.md` before planning UI phases. Include UI_FLOW.md creation as an early task and incremental updates per phase.

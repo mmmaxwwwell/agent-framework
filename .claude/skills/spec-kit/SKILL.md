@@ -36,8 +36,9 @@ reference/           # Enterprise knowledge base — loaded on demand by phase f
   dx.md              # Developer experience tooling
   ui-flow.md         # UI_FLOW.md spec
   data-model.md      # Data model depth
-  api-contracts.md   # API contract depth
-  traceability.md    # FR numbering, SC, learnings format
+  api-contracts.md   # API contract depth (external interfaces)
+  interface-contracts.md # Internal interface contracts between tasks (file paths, formats, protocols)
+  traceability.md    # FR numbering, SC, learnings format, test plan matrix, done criteria, IC tags
   idempotency.md     # Idempotency & readiness checks
   edge-cases.md      # Edge case enumeration
   complexity.md      # Complexity tracking

@@ -42,6 +42,23 @@ Probe every one of these areas. Mark each as covered, deferred (with reason), or
 - API design (if applicable)
 - Real-time requirements (WebSocket, SSE, polling)
 
+### Non-goals
+Before moving to edge cases, explicitly ask: **"Is there anything this system deliberately should NOT do, even though users might reasonably expect it?"** Probe for:
+- Adjacent features the user wants to explicitly exclude (e.g., "no cloud sync", "no Windows support", "no plugin system")
+- Automation the system should NOT perform (e.g., "never auto-rotate expired certs — fail and tell the user")
+- Scale/scope boundaries (e.g., "single device only", "no multi-user", "no offline mode")
+
+Non-goals are things that *could reasonably be goals* but are intentionally excluded. They are NOT negated goals ("the system shouldn't crash") — those are edge cases. Document each non-goal with a one-sentence rationale.
+
+### Operational workflows
+For daemons, servers, long-running tools, and CLI tools with stateful operations, probe for day-to-day usage scenarios that inform DX scripts, error messages, and admin commands:
+- **Day-1 setup**: "Walk me through a new user's first 10 minutes. What do they install, configure, and verify? What tells them it's working?"
+- **Day-2 operations**: "What administrative tasks happen after initial setup? (Add/remove devices, rotate credentials, check status, view logs, update config.) How often?"
+- **Failure recovery**: "When something goes wrong, what does the user do first? What commands do they run? What logs do they check? How do they restart/reset?"
+- **Admin processes** (12-factor XII): "Are there one-off maintenance tasks? (Data migration, cache clearing, re-pairing, certificate renewal.) Should they be subcommands, scripts, or manual procedures?"
+
+These scenarios surface functional requirements (status commands, log subcommands, health checks) that wouldn't otherwise be captured until implementation. Skip for pure run-and-exit CLIs with no stateful operations.
+
 ### Process architecture & statefulness
 - **Stateless processes**: Should the app follow share-nothing architecture where processes are stateless and all persistent state lives in backing services (databases, caches, queues)? This is the 12-factor default and enables horizontal scaling, but some apps (embedded systems, desktop tools, single-user apps) are legitimately stateful.
 - **Session state**: If the app has user sessions, where does session state live? Recommend external stores (Redis, database) over in-memory/sticky sessions. Warn: "In-memory sessions break horizontal scaling — if you add a second server instance, users get logged out when their request hits the other instance."
@@ -140,20 +157,27 @@ For each topic below, present the enterprise-grade default, let the user accept 
 Every spec MUST include all of the following. Do not skip any:
 
 - [ ] Every requirement has a unique `FR-xxx` ID
+- [ ] Ambiguous FRs have inline `Example:` showing concrete input/output
+- [ ] Non-Goals section lists intentional omissions with rationale
 - [ ] Testing section with functional requirements for integration tests
 - [ ] Edge Cases & Failure Modes section with expected behavior for every major flow
 - [ ] Every setup flow is idempotent (see `reference/idempotency.md`)
 - [ ] Enterprise infrastructure decisions are documented (if applicable per preset)
 - [ ] If UI: UI flow requirements are included (see `reference/ui-flow.md`)
+- [ ] If daemon/server/stateful tool: Operational workflows documented (day-1 setup, day-2 ops, failure recovery)
 
 When writing `spec.md`, use these structural requirements:
 
 ### Functional requirement numbering
-Every requirement gets a unique `FR-xxx` ID:
+Every requirement gets a unique `FR-xxx` ID. When an FR is ambiguous — especially for user-visible behavior — add an inline `Example:` showing concrete input/output:
 ```
 FR-001: System MUST validate all API request bodies against JSON schema before processing
 FR-002: System MUST return 400 with error details when validation fails
+  Example: missing "name" field -> 400 {"error": "validation_failed", "details": [{"field": "name", "message": "required"}]}
+FR-007: System MUST reject expired certificates with a descriptive error
+  Example: cert with notAfter=2024-01-01 -> error "certificate expired: valid until 2024-01-01"
 ```
+Examples are optional on clear FRs, but MANDATORY on any FR flagged `[NEEDS CLARIFICATION]` during Phase 4 (analyze) — the example IS the clarification. Do not add pseudocode or ASCII mockups here; those belong in `plan.md` or `UI_FLOW.md`.
 
 ### Success criteria
 Include a Success Criteria section with `SC-xxx` IDs mapped to requirements:

@@ -22,6 +22,29 @@ Every task in `tasks.md` MUST reference the user story or functional requirement
 - Format: `[Story 3]` or `[FR-015]` suffix on the task description
 - Enables bidirectional traceability: from requirement → task → test
 
+## SC-to-test traceability (Test Plan Matrix)
+
+Every success criterion in `spec.md` MUST map to a specific test shape in the plan's **Test Plan Matrix**:
+- Format: SC-xxx → test tier (unit/integration/user-flow/adversarial) + fixture requirements + assertion + infrastructure needs
+- This bridges the gap between success criteria (what to verify) and implementation (how to verify it)
+- The matrix is defined in `plan.md` and referenced by implementing agents when writing tests
+- Traceability chain: FR-xxx → SC-xxx → Test Plan Matrix → task → test implementation
+
+## Task done criteria
+
+Every task MUST include a `Done when:` line — a concrete, verifiable stop-signal:
+- Must be checkable by looking at code/test output (not subjective)
+- Must add information beyond the task title (not a restatement)
+- 1-3 bullet points max
+- Traceability chain: FR → SC → Test Plan Matrix → task (with done criteria) → implementation → fix-validate
+
+## Interface contract traceability
+
+Tasks that share state reference interface contracts with `[produces: IC-xxx]` / `[consumes: IC-xxx]` tags:
+- Contracts are defined in `plan.md` § Interface Contracts (Internal)
+- See `reference/interface-contracts.md` for the full format
+- Traceability chain: plan decision → IC-xxx → producing task → consuming task
+
 ## Structured learnings format
 
 `learnings.md` MUST be structured by task ID. Each entry captures: what was discovered, which task revealed it, and actionable implications for later tasks. This creates a pre-validation oracle — agents implementing T015 can read T001-T014's learnings first.

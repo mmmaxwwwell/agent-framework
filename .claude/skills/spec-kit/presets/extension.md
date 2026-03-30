@@ -26,6 +26,7 @@
 
 **Still ask about**:
 - Core functionality, user workflows
+- Non-goals — "anything this extension should deliberately NOT do?" Important for extensions where permission scope and store review are at stake.
 - Target platform(s) (Chrome, Firefox, Safari, Edge? VS Code, JetBrains? Multiple?)
 - Manifest version / API version (Manifest V3 for Chrome, VS Code engine version, etc.)
 - Required permissions — enumerate each permission and justify it. Store reviewers scrutinize this.
@@ -40,6 +41,9 @@
 ## Spec phase overrides
 
 - **FR/SC numbering**: required
+- **Examples on FRs**: mandatory on any FR flagged during analyze; optional on clear FRs
+- **Non-Goals section**: required — important for extensions to document what permissions are NOT requested and what the extension does NOT do (store reviewers look for this)
+- **Operational workflows**: skip (host platform handles lifecycle)
 - **Enterprise Infrastructure section**: include for: error handling, config (settings API), storage (platform storage APIs), CI/CD. Include a **Permissions** section documenting every requested permission with justification — this is unique to extensions and critical for store review. Skip: logging infra, auth (unless connecting to external services), CORS, security headers, rate limiting, graceful shutdown, health checks, observability.
 - **Edge Cases & Failure Modes**: full coverage for: host platform API deprecation, permission revocation, storage quota exhaustion, network offline, multi-window/multi-tab conflicts, extension update with incompatible stored data, content script injection failures (page CSP blocks it), service worker termination mid-operation, host platform version incompatibility.
 - **Testing section**: full — unit tests for core logic, integration tests against the host platform's test API (VS Code `@vscode/test-electron`, browser extension testing with Puppeteer/Playwright). Include: permission boundary tests (verify extension works when optional permissions are denied), storage migration tests, cross-platform tests if targeting multiple browsers/IDEs.
@@ -54,6 +58,10 @@
 - **API contract depth**: include if the extension exposes an API to other extensions (VS Code `contributes.api`, browser extension messaging). Skip for self-contained extensions.
 - **Complexity Tracking**: required — extensions should be lean; every abstraction adds to bundle size and review surface
 - **Phase Dependencies**: required
+- **Interface contracts**: include if the extension has multiple communication channels (content script ↔ background, webview ↔ host)
+- **Runtime state machines**: include if the extension manages stateful objects (connection state, sync state, service worker lifecycle)
+- **Critical path (user perspective)**: required — identify the install → first-use → first-result flow
+- **Test plan matrix**: required
 
 ### Extension-specific plan sections
 
@@ -69,10 +77,15 @@
 
 - **Fix-validate loop**: required — per phase, runner-enforced
 - **`[P]` parallel markers**: include where applicable
+- **Done criteria**: required on every task
+- **Interface contract tags**: include where applicable
+- **Critical path checkpoints**: required
 - **FR/Story traceability**: required on every task
+- **Non-goals awareness**: reference in approach note
+- **Spec amendment process**: supported
 - **learnings.md**: required
 - **Code review**: full — auto-implement necessary fixes, write REVIEW-TODO.md, run fix-validate loop after. Extension-specific review focus: permission scope creep (are we requesting more than needed?), storage schema backwards compatibility, bundle size regression, CSP compliance.
-- **Approach note**: `Approach: TDD with fix-validate loop per phase. Full CI/CD with store publish pipeline and Tier 1 security scanning. Enterprise-grade test infrastructure with host platform test harness. Permissions follow least-privilege — every permission justified and documented.`
+- **Approach note**: `Approach: TDD with fix-validate loop per phase. Full CI/CD with store publish pipeline and Tier 1 security scanning. Enterprise-grade test infrastructure with host platform test harness. Permissions follow least-privilege — every permission justified and documented. See Non-Goals for intentional scope boundaries.`
 
 ## What the agent should still know
 

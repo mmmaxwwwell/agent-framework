@@ -29,18 +29,23 @@
 
 **Still ask about**:
 - Core functionality, user workflows, data model
+- Non-goals — "anything this should deliberately NOT do?" Critical for public-facing apps where scope creep adds attack surface.
 - API design and real-time requirements
 - UI flows (if applicable)
 - Edge cases — focus on: invalid input, injection attempts, network failure, resource exhaustion, duplicate operations, crash recovery
 - Persistence strategy and backup approach (single user = data loss is catastrophic)
 - Deployment target (VPS, container, serverless)
 - Domain and HTTPS strategy (Let's Encrypt, Cloudflare, etc.)
+- Operational workflows — day-1 setup, day-2 operations, failure recovery for the deployed service
 
 **Interview style**: 8-12 questions. Focus on core features, security posture, and data durability. Present security defaults as non-negotiable ("since this is public-facing, I'm including X") and let the user push back if they want.
 
 ## Spec phase overrides
 
 - **FR/SC numbering**: required
+- **Examples on FRs**: mandatory on any FR flagged during analyze; optional on clear FRs
+- **Non-Goals section**: required
+- **Operational workflows**: required
 - **Enterprise Infrastructure section**: full for: logging, error handling, config, security (headers + input validation + scanning), rate limiting, graceful shutdown, health check, CI/CD. Skip: observability infrastructure, process architecture.
 - **Edge Cases & Failure Modes**: full coverage — public-facing apps encounter hostile input. Include: invalid input, injection attempts (SQL, XSS, command), timeout, crash recovery, resource exhaustion, duplicate operations, file upload abuse, malformed requests.
 - **Testing section**: full — unit, integration, and contract tests. Include input validation tests and security header verification. Skip e2e unless the project has a UI. Skip dedicated security penetration tests (CI scanning covers this).
@@ -56,15 +61,24 @@
 - **API contract depth**: full — public APIs need clear contracts with request/response schemas, status codes, error cases, rate limit headers
 - **Complexity Tracking**: required
 - **Phase Dependencies**: required — with dependency graph and parallelization strategy
+- **Interface contracts**: required for projects with shared state between tasks
+- **Runtime state machines**: required if the project has daemons, protocol handshakes, or connection management
+- **Critical path (user perspective)**: required
+- **Test plan matrix**: required
 
 ## Task phase overrides
 
 - **Fix-validate loop**: required — per phase, runner-enforced
 - **`[P]` parallel markers**: include where applicable
+- **Done criteria**: required on every task
+- **Interface contract tags**: required
+- **Critical path checkpoints**: required
 - **FR/Story traceability**: required on every task
+- **Non-goals awareness**: reference in approach note
+- **Spec amendment process**: supported
 - **learnings.md**: required
 - **Code review**: full — auto-implement necessary fixes, write REVIEW-TODO.md, run fix-validate loop after. Security findings are especially important for public-facing apps.
-- **Approach note**: `Approach: TDD with fix-validate loop per phase. Full CI/CD with Tier 1 + Tier 1.5 security scanning. Public-facing hardening: input validation, security headers, rate limiting, sanitized error responses. Enterprise-grade test infrastructure and documentation. Single-user, no multi-user auth.`
+- **Approach note**: `Approach: TDD with fix-validate loop per phase. Full CI/CD with Tier 1 + Tier 1.5 security scanning. Public-facing hardening: input validation, security headers, rate limiting, sanitized error responses. Enterprise-grade test infrastructure and documentation. Single-user, no multi-user auth. See Non-Goals for intentional omissions.`
 
 ## What the agent should still know
 

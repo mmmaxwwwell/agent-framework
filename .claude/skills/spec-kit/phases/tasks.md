@@ -20,7 +20,25 @@ These documents contain all the decisions from the interview and planning phases
 - Tasks marked `[P]` can be parallelized.
 - Tasks marked `[needs: gh]` are granted GitHub CLI access (GH_TOKEN) at runtime. Use this for tasks that call `gh` commands (push, PR creation, CI monitoring). **NEVER combine `[needs: gh]` with tasks that run package install commands** (npm install, pip install, go install, etc.) — this prevents supply-chain attacks from exfiltrating credentials.
 - Tasks marked `[needs: gh, ci-loop]` use a runner-managed CI debug cycle instead of a single agent. The runner pushes, polls CI, and spawns separate diagnosis/fix sub-agents in a loop. See `reference/cicd.md`.
+- Tasks that share state reference interface contracts: `[produces: IC-xxx]` / `[consumes: IC-xxx]`. See `reference/interface-contracts.md`.
 - Phases: Setup → Foundational → User Stories (P1-P3) → Polish.
+
+### Task done criteria
+
+Every task MUST include a `Done when:` line — a concrete, verifiable completion statement that tells the implementing agent when to stop. This fills the gap between FR traceability (why the task exists) and the fix-validate loop (phase-level quality gate).
+
+**Rules for done criteria:**
+1. **Must be verifiable** — not "implement mTLS" but "mutual TLS handshake succeeds with test certs; connection rejected with expired cert; both paths have unit tests"
+2. **Must add information beyond the task title** — if the done criterion just restates the description, omit it and write a better task description instead
+3. **Keep to 1-3 bullet points** — not a mini-spec. The FR in `spec.md` is the full spec; `Done when:` is the agent's stop-signal
+
+Example:
+```markdown
+- [ ] T015 Implement mTLS handshake [FR-007] [consumes: IC-001]
+  Done when: handshake succeeds with valid test certs (fixture);
+  connection rejected with expired/wrong-CA cert returns SSH_AGENT_FAILURE;
+  both paths have integration tests; logged at INFO with correlation ID
+```
 
 ## Required task patterns (subject to preset overrides)
 
@@ -83,6 +101,9 @@ Task list MUST follow the fix-validate loop pattern. Load `reference/testing.md`
 ### Traceability
 Every task MUST reference the user story or functional requirement it implements (e.g., `[Story 3]` or `[FR-015]`). Load `reference/traceability.md` for the structured learnings format and CLAUDE.md auto-generation requirements.
 
+### Non-goals awareness
+If the spec has a `## Non-Goals` section, reference it in the approach note so implementing agents know what NOT to build. Agents encountering an unlisted scenario should check Non-Goals before implementing — if it's listed there, skip it. If it's genuinely ambiguous and not in Non-Goals, proceed or write BLOCKED.md.
+
 ### UI tasks (if the project has a UI)
 Load `reference/ui-flow.md` before writing UI tasks. The first UI phase MUST include a task to create `UI_FLOW.md`. Each subsequent UI phase MUST include a task to update `UI_FLOW.md`. A late-phase task MUST verify all UI_FLOW.md flows have corresponding e2e tests.
 
@@ -114,8 +135,31 @@ Load `reference/testing.md` § "User-flow integration tests" before writing thes
 - **If the project integrates with another application** (IDE host, browser, third-party service): include a cross-application test that exercises the real delivery path and documents any sandbox limitations. See Pattern 9.
 - These tests go AFTER per-boundary tests in the same phase, not in a separate phase
 
+### Critical path integration checkpoints
+If the plan includes a `## Critical Path (User Perspective)` section, add a growing integration test task at the end of each critical-path phase. Each checkpoint exercises the chain built so far — not just the current phase's features:
+
+```markdown
+- [ ] T0XX Critical path checkpoint (Phase 3): verify agent socket opens, accepts connection, returns key list [Critical Path]
+  Done when: integration test exercises the chain from Phase 2 + Phase 3 components together; test passes
+```
+
+These checkpoints fill the gap between per-phase user-flow tests (within-phase only) and the late E2E phase. They catch cross-phase integration failures incrementally rather than in a big-bang at the end.
+
 ### End-to-end validation phase
 Include a late-phase task that runs ALL user-flow integration tests together after all per-phase tests pass. This catches cross-feature interactions and cascade failures that per-phase testing misses. The test should exercise every primary user flow from the spec in sequence.
+
+### Build environment gap analysis (MANDATORY)
+
+Before the E2E gap analysis, verify that every tech stack in the project has its build tools accounted for in Phase 1 (test infrastructure / flake setup). Multi-language projects are the most common source of "command not found" blockers — the Nix flake covers the primary language but silently omits secondary stacks.
+
+#### Tool availability per tech stack
+- [ ] Does the plan's tool environment inventory list every build/test/lint command for every language in the project?
+- [ ] For each tool, is there a Phase 1 task that adds it to `flake.nix` (or equivalent environment setup)?
+- [ ] If a tool requires a non-trivial Nix derivation (e.g., mobile SDKs, proprietary CLIs, tools that need license acceptance), is there a dedicated task for creating/importing that derivation — not just a line in the flake?
+- [ ] If a tool self-bootstraps (e.g., wrapper scripts that download their own toolchain), does it still need a JDK, SDK, or runtime provided by the environment? Check transitive dependencies.
+- [ ] Is there a Phase 1 task that runs `<build-command> --version` (or equivalent) for every build tool to verify availability after flake setup?
+
+If ANY of these checks fail, add the missing task(s) to Phase 1 with explicit dependencies from every later phase that uses the missing tool.
 
 ### E2E test harness gap analysis (MANDATORY)
 

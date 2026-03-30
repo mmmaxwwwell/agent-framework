@@ -22,6 +22,8 @@ Spec-kit's plan phase produces `data-model.md`. The skill mandates a minimum lev
 
    Include: all valid transitions, triggers, guard conditions, and terminal states.
 
+   **Note:** These state transitions cover *persistent entity* lifecycles (database records, stored objects). For *runtime/process* state machines (daemon lifecycles, protocol handshakes, connection management), see the `## Runtime State Machines` section in `plan.md`. The two are complementary — data-model covers state at rest; runtime state machines cover state in flight.
+
 4. **Cross-entity constraints**:
    - Uniqueness (e.g., "only one active session per project")
    - Mutual exclusion (e.g., "a user can be either admin or member, not both")

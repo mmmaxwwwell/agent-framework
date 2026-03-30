@@ -153,6 +153,50 @@ When the user has completed planning (tasks.md exists) and asks to start or run 
 
 ---
 
+## Environment preflight verification
+
+Before the first implementation task begins, the runner or the Phase 1 agent MUST verify that the development environment provides every tool the project needs. This catches "command not found" errors at the start — not after 3 fix-validate cycles on Phase 4.
+
+### What to verify
+
+For every build/test/lint command listed in `CLAUDE.md` or the plan's tool environment inventory:
+
+1. **Check tool availability** — run `command -v <tool>` (or `<tool> --version`) inside the dev environment (`nix develop`, or whatever the project uses). If the tool is missing, the environment is incomplete.
+2. **Check transitive dependencies** — wrapper scripts (e.g., `./gradlew`, `./mvnw`) self-bootstrap their tool but often need a runtime (JDK, SDK, .NET runtime) provided by the environment. Verify the runtime is present, not just the wrapper.
+3. **Check platform-specific requirements** — if any tool needs KVM, a display server, or a specific kernel module, verify it's available (e.g., `test -w /dev/kvm` for emulator tests).
+
+### When to run
+
+- **Phase 1 (test infrastructure / flake setup)**: After writing `flake.nix` and entering the dev shell, run the full preflight check. If any tool is missing, fix `flake.nix` before proceeding. This is the cheapest time to catch environment gaps.
+- **Phase validation**: Before the build step in the validation sequence, run a lightweight tool availability check. This catches tools that were added to later phases but not to the environment.
+
+### Preflight script pattern
+
+The Phase 1 agent should create a `scripts/preflight.sh` (or equivalent Makefile target) that verifies all tools:
+
+```bash
+#!/usr/bin/env bash
+# Generated from plan's tool environment inventory — customize per project
+set -euo pipefail
+missing=0
+# Add every tool from the plan's inventory:
+for cmd in <tool1> <tool2> <tool3>; do
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "MISSING: $cmd — add to flake.nix devShell"
+    missing=1
+  fi
+done
+exit $missing
+```
+
+The exact tool list comes from the plan's tool environment inventory. This script runs in seconds and gives a clear error message per missing tool — far better than a cryptic build failure 10 minutes into a phase.
+
+### Multi-language project trap
+
+The most common environment gap is in multi-language projects: the primary language's tools are in the flake, but secondary languages are forgotten. The plan's tool environment inventory exists to enumerate all tools across all stacks — but the Phase 1 agent must actually add them all to `flake.nix` and verify with the preflight check.
+
+The plan's tool environment inventory (see `phases/plan.md` § Technology stack) exists to prevent this. The preflight check verifies it.
+
 ## Auto-Unblocking
 
 Agents MUST NOT write `BLOCKED.md` as a first resort. Many blockers — especially environment setup, tool installation, and dependency configuration — are things the agent can and should resolve autonomously. Writing `BLOCKED.md` for a solvable problem wastes a human's time and stalls the entire pipeline.
@@ -308,7 +352,85 @@ The smoke test loop uses a **fast-then-deep** strategy:
 
 ---
 
-### BLOCKED.md format
+## Mid-Implementation Spec Amendment
+
+During implementation, agents (or the user) may discover that a spec decision was wrong — not a blocker that needs human input, but a fundamental assumption that needs to change and may affect other tasks. This is distinct from BLOCKED.md (which means "I can't proceed") — an amendment means "I CAN proceed but the spec premise is wrong and other tasks will be affected."
+
+### When to write an amendment (not BLOCKED.md)
+
+Write `AMENDMENT-<task_id>.md` when:
+- A spec requirement contradicts what's technically possible (e.g., "FR-012 says use HMAC, but the phone's keystore only supports ECDSA")
+- An interface contract proves unworkable (e.g., "IC-003 specifies Unix socket, but the daemon needs TCP for cross-host access")
+- An architectural assumption in `research.md` is provably wrong (e.g., "research.md says library X supports streaming, but it doesn't")
+- A completed task's output doesn't match what downstream tasks expect, and fixing it requires changing the spec (not just the code)
+
+Do NOT write an amendment for:
+- Build failures, missing tools, or environment issues (these are auto-resolvable — see Auto-Unblocking)
+- Test failures within the current task (fix the code, not the spec)
+- Ambiguity that can be resolved by reading `interview-notes.md` or `research.md`
+
+### Amendment file format
+
+```markdown
+# AMENDMENT: [TASK_ID] — [one-line summary]
+
+## What the spec says
+[Quote the specific FR, SC, or plan decision that needs to change]
+
+## What reality requires
+[What the agent discovered and why the spec is wrong]
+
+## Affected tasks
+[List task IDs that depend on the incorrect assumption — both completed and pending]
+
+## Proposed change
+[Specific text change to spec.md and/or plan.md]
+
+## Evidence
+[Error messages, documentation links, test output proving the spec is wrong]
+```
+
+### How the runner handles amendments
+
+1. Agent writes `AMENDMENT-<task_id>.md` to the spec directory
+2. Runner detects the file (same mechanism as BLOCKED.md detection)
+3. Runner pauses only the affected downstream tasks listed in the amendment (not all tasks)
+4. Runner presents the amendment to the human for approval
+5. Human approves, modifies, or rejects the amendment
+
+### After human approval
+
+1. **Update `spec.md`** — append an amendment section (ADR-style, append-only with date) rather than silently editing the original text. This preserves decision history:
+   ```markdown
+   ## Amendments
+
+   ### AMD-001 (2026-03-30): ECDSA instead of HMAC for phone signing [T015]
+   **Original**: FR-012 specified HMAC-SHA256 for signature operations
+   **Amended to**: FR-012 now specifies ECDSA-P256, matching the phone keystore's hardware-backed keys
+   **Reason**: Android hardware keystore does not support HMAC for asymmetric operations
+   **Affected**: T015 (current), T018 (verification), T033 (daemon sign handler)
+   ```
+
+2. **Update `plan.md` and `research.md`** if the amendment affects architecture decisions
+
+3. **Evaluate completed tasks** — for each affected completed task, the human decides:
+   - **No rework needed** — the amendment is cosmetic or the completed task's output is still valid
+   - **Rework needed** — uncheck the task in `tasks.md` (mark `[ ]` again). The runner re-parses and schedules it as a normal pending task with amendment context
+
+4. **Record in `learnings.md`** — so downstream agents understand why the change was made
+
+5. **Runner resumes** — re-parses `tasks.md`, picks up any reopened tasks and unpaused pending tasks
+
+### Design principles
+
+- **Lightweight** — writing an amendment should be as easy as BLOCKED.md. If it's harder, agents will use BLOCKED.md instead and the propagation benefit is lost.
+- **Append-only spec changes** — never silently edit spec.md. The amendment trail helps future agents understand why decisions changed.
+- **Surgical pausing** — only affected tasks are paused, not the entire pipeline. Unrelated parallel work continues.
+- **Human approval required** — agents don't unilaterally change the spec. The human validates the amendment and decides on rework scope.
+
+---
+
+## BLOCKED.md format
 
 When `BLOCKED.md` IS written (genuinely human-dependent), it MUST include:
 
