@@ -2495,6 +2495,7 @@ If dependencies can't be fetched (network issues), but the code looks correct:
 # history without inflating their own context.
 
 CI_LOOP_MAX_ATTEMPTS = 50
+CI_LOCAL_MAX_ITERATIONS = 20
 CI_LOOP_DIR = "ci-debug"
 
 
@@ -2628,8 +2629,14 @@ def _poll_ci_run(branch: str, timeout_minutes: int = 30,
                     j["name"] for j in data.get("jobs", [])
                     if j.get("conclusion") not in ("success", "skipped", None)
                 ]
+                if conclusion == "success":
+                    status = "pass"
+                elif conclusion == "cancelled":
+                    status = "cancelled"
+                else:
+                    status = "fail"
                 return {
-                    "status": "pass" if conclusion == "success" else "fail",
+                    "status": status,
                     "run_id": run_id,
                     "conclusion": conclusion,
                     "url": data.get("url", ""),
@@ -2774,7 +2781,8 @@ def build_ci_fix_prompt(task_id: str, attempt: int, debug_dir: Path,
                         task_file: str, learnings_file: str) -> str:
     """Build prompt for the CI fix sub-agent.
 
-    This agent reads the diagnosis and applies the fix + pushes.
+    This agent reads the diagnosis, applies the fix, and runs local validation.
+    It does NOT push — the runner manages the push after local validation passes.
     """
     diagnosis_file = debug_dir / f"attempt-{attempt}-diagnosis.md"
     history_files = sorted(debug_dir.glob("attempt-*-diagnosis.md"))
@@ -2790,42 +2798,176 @@ def build_ci_fix_prompt(task_id: str, attempt: int, debug_dir: Path,
 1. Read `CLAUDE.md` for the project's build, lint, and test commands
 2. Read the diagnosis at `{diagnosis_file}`
 3. Apply the recommended fix
-4. **Run local validation before pushing** (see below)
-5. Commit and push to the current branch
+4. **Run local validation** — the SAME commands CI runs (see below)
+5. **Fix and re-validate in a loop** until ALL validation commands pass
+6. Commit your changes (but do NOT push — the runner handles pushing)
 
 ## Context files
 
 - **CLAUDE.md** — read this FIRST for build/test/lint commands
+- **CI workflow**: `.github/workflows/ci.yml` (or equivalent) — read this to discover EVERY command CI runs
 - **Diagnosis**: `{diagnosis_file}` — read this to understand what to fix
 - **Prior attempts**: `{debug_dir}/` — contains logs and diagnoses from all attempts
 - **Learnings**: `{learnings_file}` — project-specific gotchas
 
-## Local validation (MANDATORY)
+## Local validation (MANDATORY — CI parity)
 
-After applying your fix, you MUST run local validation before pushing. Each wasted CI cycle costs 10-30 minutes of polling — catching regressions locally is critical.
+After applying your fix, you MUST run local validation. The goal is **CI parity** — run the
+same commands CI runs so you catch failures locally instead of wasting 10-30 min CI cycles.
 
-1. **Build**: Run the project's build command (e.g. `go build ./...`, `npm run build`, `cargo build`). If it fails, fix the build error before proceeding.
-2. **Lint**: Run the project's linter (e.g. `golangci-lint run`, `npm run lint`, `cargo clippy`). Fix any lint errors your changes introduced.
-3. **Unit tests**: Run the project's test suite with the short/unit flag (e.g. `go test -short ./...`, `npm test`, `pytest -x`). If tests fail, determine whether:
-   - Your fix caused the failure → fix it before pushing
-   - The failure is pre-existing (unrelated to your changes) → note it in `{debug_dir}/attempt-{attempt}-fix-notes.md` and proceed
-4. **Integration tests** (if available and fast): Run integration tests if the project has them and they complete in under 5 minutes. Skip if they require external services not available locally.
+### Step 1: Discover CI commands
 
-**Only push after build + lint + tests pass** (or after confirming failures are pre-existing). If your fix doesn't compile or breaks tests, fix it — do NOT push broken code and wait 30 minutes for CI to tell you what you already could have caught locally.
+Read `.github/workflows/ci.yml` (or `.github/workflows/` directory). For each job, extract
+every `run:` command. These are your local validation commands. Skip only:
+- GitHub Actions-specific steps (`uses: actions/checkout`, `uses: actions/upload-artifact`, etc.)
+- Steps that require CI-only secrets (e.g., `SNYK_TOKEN`, `SONAR_TOKEN`, `CACHIX_AUTH_TOKEN`)
+- SARIF uploads and artifact uploads
+- Job summary generation steps
 
-If ALL local validation commands fail to run (e.g. missing toolchain, no test infrastructure), document why in `{debug_dir}/attempt-{attempt}-fix-notes.md` and push anyway — but this should be rare.
+Everything else MUST run locally. Common examples of commands you MUST run:
+- `go build ./...`, `go test ./...`, `golangci-lint run`
+- `nix flake check --print-build-logs` (runs NixOS VM tests — these catch systemd service
+  failures, network topology issues, and integration bugs that unit tests miss)
+- `npm run build`, `npm test`, `npm run lint`
+- Any project-specific test commands
+
+### Step 2: Run ALL discovered commands
+
+Run them in the same order CI does. For each command:
+- If it **passes** → proceed to the next command
+- If it **fails** → fix the failure, then **re-run from the beginning** (not just the failed
+  command, because your fix may have broken something earlier in the chain)
+
+### Step 3: Fix-validate loop
+
+Repeat Step 2 until ALL commands pass in a single run. You have up to **20 local iterations**.
+If after 20 iterations some commands still fail, commit what you have and document the
+remaining failures in `{debug_dir}/attempt-{attempt}-fix-notes.md`.
+
+**Read the output carefully.** When a command fails:
+- Read the FULL output, not just the exit code
+- A process that starts and then crashes is a failure (e.g., a systemd unit that exits
+  with status 1 after startup)
+- A test that is cancelled or interrupted by the user is NOT the same as a test that failed
+  on its own — if YOU cancelled it, that's not a CI failure to diagnose
+- Look for the actual error message, not just "process exited with code 1"
+
+### What NOT to skip
+
+Do NOT skip integration tests or VM tests that are available locally. The whole point of local
+validation is to catch what CI would catch. If CI runs `nix flake check` and you skip it locally,
+you're guaranteeing another failed CI cycle. The only acceptable reason to skip a CI command
+locally is if it literally cannot run (missing hardware, CI-only secrets, etc.).
 
 ## Rules
 
 - Fix ONLY what the diagnosis identifies — do not refactor or improve other code
 - Commit with message: `fix({task_id}): [description of CI fix]`
-- Push to the current branch using HTTPS (not SSH) to avoid hardware key prompts:
-  `git push https://github.com/<owner>/<repo>.git <branch>` — the `GH_TOKEN` env var handles auth automatically
+- Do NOT push — the runner validates your fix and pushes after confirming local validation passed
 - If the diagnosis is unclear or you disagree with it, write your reasoning to
   `{debug_dir}/attempt-{attempt}-fix-notes.md` before applying an alternative fix
 - Do NOT create PRs or merge anything — the runner handles that after CI passes
 - Do NOT read ROUTER.md or use the Skill tool
 - Append any CI-specific discoveries to `{learnings_file}`
+"""
+
+
+def build_ci_local_validate_prompt(task_id: str, attempt: int, local_iteration: int,
+                                   debug_dir: Path, learnings_file: str,
+                                   prior_output: str = "") -> str:
+    """Build prompt for the local validation sub-agent.
+
+    This agent runs the same commands CI would run and reports pass/fail.
+    It does NOT fix anything — just validates and reports.
+    """
+    nix_note = ""
+    if (Path.cwd() / "flake.nix").exists():
+        nix_note = "**Environment**: This project uses Nix. Your PATH includes all devshell tools.\n\n"
+
+    prior_section = ""
+    if prior_output:
+        prior_section = f"""## Prior validation output (iteration {local_iteration - 1})
+
+The previous local validation failed with this output — the fix agent has attempted to
+address these failures. Re-run everything from scratch to verify.
+
+```
+{prior_output[-3000:]}
+```
+
+"""
+
+    return f"""You are a local validation agent for task **{task_id}**, CI attempt #{attempt}, local iteration #{local_iteration}.
+
+{nix_note}## Your job
+
+Run the SAME commands that CI runs and report the results. You do NOT fix anything.
+
+### Step 1: Discover CI commands
+
+Read `.github/workflows/ci.yml` (or scan `.github/workflows/` for the CI workflow). For each
+job, extract every `run:` command. Skip only:
+- GitHub Actions `uses:` steps (checkout, upload-artifact, setup-java, install-nix, cachix, etc.)
+- Steps gated on CI-only secrets (`SNYK_TOKEN`, `SONAR_TOKEN`, `CACHIX_AUTH_TOKEN`)
+- SARIF uploads, artifact uploads, job summary generation
+- Steps in `if: always()` blocks that only generate reports
+
+Everything else MUST run. Pay special attention to:
+- `nix flake check --print-build-logs` — this runs NixOS VM tests
+- `go test -json -race -count=1 ./...` — full test suite, not just `-short`
+- Linters: `golangci-lint run`, `nixfmt --check`, etc.
+
+### Step 2: Run ALL commands in order
+
+Run them in CI order (lint, build, test, integration/VM tests). For each command:
+- Run it and capture the full output
+- If it fails, continue to the next command (so we collect ALL failures in one pass,
+  just like CI would)
+
+### Step 3: Report results
+
+After running all commands, write a validation result file to:
+`{debug_dir}/attempt-{attempt}-local-{local_iteration}.md`
+
+Format:
+```markdown
+# Local Validation — Attempt {attempt}, Iteration {local_iteration}
+
+## Result: PASS or FAIL
+
+## Commands run
+| Command | Exit code | Status |
+|---------|-----------|--------|
+| `go build ./...` | 0 | PASS |
+| `golangci-lint run` | 0 | PASS |
+| `go test -json -race ./...` | 1 | FAIL |
+| `nix flake check` | 1 | FAIL |
+
+## Failure details
+(For each failed command: the key error output, file paths, line numbers.
+ Be specific — a fix agent will read this to understand what to fix.)
+
+### Command: `go test -json -race ./...`
+(relevant error output)
+
+### Command: `nix flake check --print-build-logs`
+(relevant error output — include systemd unit failures, service crash logs, etc.)
+```
+
+{prior_section}## Critical: reading output carefully
+
+- A systemd unit that starts and then exits with status 1 is a **FAILURE** — report it
+- A process that logs `FTL` (fatal) or `ERR` (error) before exiting is a **FAILURE**
+- Do not confuse a user-cancelled run with a genuine test failure
+- Include the actual error messages, not just "exit code 1"
+
+## Rules
+
+- Do NOT fix any code — just run commands and report
+- Do NOT push, commit, or modify source files
+- Do NOT read ROUTER.md or use the Skill tool
+- Read `CLAUDE.md` for any project-specific commands
+- Read `{learnings_file}` for known gotchas
 """
 
 
@@ -3767,6 +3909,18 @@ class Runner:
                     return
                 continue
 
+            if ci_result["status"] == "cancelled":
+                ci_log(f"CI run was cancelled (attempt {attempt}) — re-pushing and re-polling")
+                attempt_record["status"] = "cancelled"
+                state["attempts"].append(attempt_record)
+                state_file.write_text(json.dumps(state, indent=2))
+                # Re-push to trigger a fresh CI run — don't diagnose or fix
+                try:
+                    _gh_push(branch, ci_log)
+                except subprocess.TimeoutExpired:
+                    ci_log("Re-push timed out after cancellation")
+                continue
+
             # ── Step 3: CI failed — download logs ──
             failed_jobs = ', '.join(ci_result.get('failed_jobs', [])) or 'unknown'
             ci_log(f"CI failed (attempt {attempt}): {failed_jobs}")
@@ -3805,21 +3959,99 @@ class Runner:
                 state_file.write_text(json.dumps(state, indent=2))
                 return
 
-            # ── Step 5: Fix + push ──
-            fix_prompt = build_ci_fix_prompt(
-                task.id, attempt, debug_dir, str(task_file), learnings_file,
-            )
-            fix_task = Task(
-                id=f"{task.id}-fix-{attempt}",
-                description=f"Fix CI failure #{attempt}",
-                phase=task.phase, parallel=False,
-                status=TaskStatus.RUNNING, line_num=0,
-                capabilities=task.capabilities,
-            )
-            _wait_for_subagent(fix_task, fix_prompt, f"Fix agent (attempt {attempt})",
-                               caps=task.capabilities)
+            # ── Step 5: Local fix-validate loop ──
+            # Run fix → validate → fix → validate locally up to CI_LOCAL_MAX_ITERATIONS
+            # times before pushing. This catches failures that would waste CI cycles.
+            prior_validate_output = ""
+            local_passed = False
 
-            attempt_record["status"] = "fix_applied"
+            for local_iter in range(1, CI_LOCAL_MAX_ITERATIONS + 1):
+                if self._shutdown.is_set() or self._draining.is_set():
+                    ci_log(f"CI loop stopping during local fix-validate — drain/shutdown")
+                    attempt_record["status"] = "interrupted_during_local_fix"
+                    state["attempts"].append(attempt_record)
+                    state_file.write_text(json.dumps(state, indent=2))
+                    return
+
+                # ─��� 5a: Fix agent (applies fix, does NOT push) ──
+                ci_log(f"Attempt {attempt}, local iteration {local_iter}/{CI_LOCAL_MAX_ITERATIONS}: spawning fix agent")
+                fix_prompt = build_ci_fix_prompt(
+                    task.id, attempt, debug_dir, str(task_file), learnings_file,
+                )
+                fix_task = Task(
+                    id=f"{task.id}-fix-{attempt}-{local_iter}",
+                    description=f"Fix CI failure #{attempt} (local iter {local_iter})",
+                    phase=task.phase, parallel=False,
+                    status=TaskStatus.RUNNING, line_num=0,
+                    capabilities=task.capabilities,
+                )
+                _wait_for_subagent(fix_task, fix_prompt,
+                                   f"Fix agent (attempt {attempt}, local {local_iter})",
+                                   caps=task.capabilities)
+
+                if self._shutdown.is_set() or self._draining.is_set():
+                    ci_log(f"CI loop stopping after fix — drain/shutdown")
+                    attempt_record["status"] = "interrupted_during_local_fix"
+                    state["attempts"].append(attempt_record)
+                    state_file.write_text(json.dumps(state, indent=2))
+                    return
+
+                # ── 5b: Validate agent (runs CI commands locally, does NOT fix) ──
+                ci_log(f"Attempt {attempt}, local iteration {local_iter}/{CI_LOCAL_MAX_ITERATIONS}: spawning validation agent")
+                validate_prompt = build_ci_local_validate_prompt(
+                    task.id, attempt, local_iter, debug_dir, learnings_file,
+                    prior_output=prior_validate_output,
+                )
+                validate_task = Task(
+                    id=f"{task.id}-validate-{attempt}-{local_iter}",
+                    description=f"Local validation #{attempt}.{local_iter}",
+                    phase=task.phase, parallel=False,
+                    status=TaskStatus.RUNNING, line_num=0,
+                )
+                _wait_for_subagent(validate_task, validate_prompt,
+                                   f"Validation agent (attempt {attempt}, local {local_iter})")
+
+                # Check validation result
+                validate_file = debug_dir / f"attempt-{attempt}-local-{local_iter}.md"
+                if validate_file.exists():
+                    content = validate_file.read_text()
+                    prior_validate_output = content
+                    # Check for PASS in the result heading
+                    if "## Result: PASS" in content:
+                        ci_log(f"Local validation PASSED on iteration {local_iter}")
+                        local_passed = True
+                        break
+                    else:
+                        ci_log(f"Local validation FAILED on iteration {local_iter} — looping")
+                else:
+                    ci_log(f"Validation agent didn't write result file — treating as failure")
+                    prior_validate_output = "(no validation output — agent didn't write result file)"
+
+            # ── 5c: Push only after local validation passes ──
+            if local_passed:
+                ci_log(f"Local validation passed — pushing to {branch}")
+                try:
+                    push_ok = _gh_push(branch, ci_log)
+                    if not push_ok:
+                        ci_log("Push failed after local validation")
+                        attempt_record["status"] = "push_failed_after_local"
+                        state["attempts"].append(attempt_record)
+                        state_file.write_text(json.dumps(state, indent=2))
+                        continue
+                except subprocess.TimeoutExpired:
+                    ci_log("Push timed out after local validation")
+                    continue
+                attempt_record["status"] = "fix_applied"
+                attempt_record["local_iterations"] = local_iter
+            else:
+                ci_log(f"Local validation failed after {CI_LOCAL_MAX_ITERATIONS} iterations — pushing anyway (CI will catch remaining issues)")
+                try:
+                    _gh_push(branch, ci_log)
+                except subprocess.TimeoutExpired:
+                    ci_log("Push timed out")
+                attempt_record["status"] = "fix_applied_local_incomplete"
+                attempt_record["local_iterations"] = CI_LOCAL_MAX_ITERATIONS
+
             state["attempts"].append(attempt_record)
             state_file.write_text(json.dumps(state, indent=2))
 

@@ -396,11 +396,15 @@ stateDiagram-v2
     PollCI --> Interrupted : drain/shutdown during poll
     PollCI --> CIPassed : conclusion = success
     PollCI --> CIFailed : conclusion = failure
+    PollCI --> CICancelled : conclusion = cancelled
     PollCI --> CIError : gh API error
     PollCI --> CITimeout : poll exceeded 30 min
 
     CIPassed --> Finalize : spawn finalize agent
     Finalize --> [*] : PR created, task marked complete
+
+    CICancelled --> Push : re-push, do NOT diagnose/fix
+    Push --> PollCI : fresh CI run triggered
 
     CIFailed --> DownloadLogs : download failed job logs
     DownloadLogs --> Diagnose : spawn diagnosis agent
@@ -410,11 +414,18 @@ stateDiagram-v2
     DiagFailed --> CheckDrainShutdown : skip fix, next attempt
 
     CheckDrainPostDiag --> Interrupted : drain/shutdown after diagnosis
-    CheckDrainPostDiag --> Fix : proceed to fix
+    CheckDrainPostDiag --> LocalFixLoop : proceed to local fix-validate
 
-    Fix --> LocalValidation : fix applied
-    LocalValidation --> Fix : build/lint/test fails, fix again
-    LocalValidation --> Push : build + lint + tests pass
+    state LocalFixLoop {
+        [*] --> Fix
+        Fix --> LocalValidate : fix applied (no push)
+        LocalValidate --> LocalPassed : all CI commands pass locally
+        LocalValidate --> Fix : validation failed, iteration < 20
+        LocalValidate --> LocalExhausted : iteration >= 20
+    }
+
+    LocalFixLoop --> Push : LocalPassed
+    LocalFixLoop --> Push : LocalExhausted (push anyway)
     Push --> CheckDrainShutdown : pushed, next attempt
 
     CIError --> CheckDrainShutdown : next attempt
@@ -426,18 +437,36 @@ stateDiagram-v2
     Interrupted --> [*] : save state, exit thread (resumable on next run)
 ```
 
-### Fix Agent Local Validation (mandatory)
+### Runner-Managed Local Fix-Validate Loop (mandatory)
 
-The fix agent must run local validation **before pushing**. This prevents wasting 10-30 min CI cycles on code that doesn't compile or breaks tests locally.
+The runner manages a **structured fix-validate loop** before pushing. Instead of one agent that fixes and pushes, the runner alternates between separate fix and validation agents up to **20 local iterations** (`CI_LOCAL_MAX_ITERATIONS`). This prevents wasting 10-30 min CI cycles on code that doesn't compile or breaks tests locally.
 
-| Step | Command (examples) | On failure |
-|------|--------------------|------------|
-| Build | `go build ./...`, `npm run build`, `cargo build` | Fix before proceeding |
-| Lint | `golangci-lint run`, `npm run lint`, `cargo clippy` | Fix lint errors introduced by the change |
-| Unit tests | `go test -short ./...`, `npm test`, `pytest -x` | Fix if caused by the change; document and proceed if pre-existing |
-| Integration tests | Project-specific (if available, < 5 min) | Skip if requires external services not available locally |
+| Agent | Job | Pushes? |
+|-------|-----|---------|
+| **Fix agent** | Reads diagnosis, applies fix, commits. Reads `.github/workflows/ci.yml` to understand what CI validates. | NO |
+| **Validation agent** | Runs the SAME commands CI runs locally, writes structured PASS/FAIL result. | NO |
+| **Runner** | Checks validation result. If PASS → push. If FAIL → spawn fix agent again. | YES (only after PASS) |
 
-The fix agent reads `CLAUDE.md` first to determine the project's actual build/test/lint commands. Only pushes after build + lint + tests pass (or after confirming failures are pre-existing and documented in `attempt-<N>-fix-notes.md`).
+#### CI parity: validation commands are derived from the CI workflow
+
+The validation agent reads `.github/workflows/ci.yml` to discover commands, rather than using a hardcoded list. It runs every `run:` command from the CI workflow, skipping only GitHub Actions-specific steps (checkout, artifact upload, SARIF upload) and steps gated on CI-only secrets. This ensures local validation catches the same failures CI would, including:
+
+- NixOS VM tests (`nix flake check --print-build-logs`)
+- Full test suites (not just `-short`)
+- Linters, formatters, and static analysis
+
+#### Validation result file format
+
+Each validation iteration writes `attempt-<N>-local-<iter>.md` with:
+- `## Result: PASS` or `## Result: FAIL`
+- A table of every command run with exit codes
+- Detailed failure output for each failed command
+
+The runner parses the `## Result:` heading to decide whether to push or loop.
+
+#### What happens after 20 local iterations
+
+If validation still fails after 20 iterations, the runner pushes anyway and lets CI catch remaining issues. The attempt is recorded as `fix_applied_local_incomplete` so the diagnosis agent on the next CI failure knows local validation was exhausted.
 
 ### Drain/Shutdown Checkpoints in CI Loop
 
@@ -462,6 +491,7 @@ All stored in `ci-debug/<task_id>/`:
 | `attempt-<N>-ci-result.json` | JSON | CI run result (status, conclusion, failed jobs, URL) |
 | `attempt-<N>-diagnosis.md` | Markdown | Diagnosis agent output (root cause, recommended fix) |
 | `attempt-<N>-fix-notes.md` | Markdown | Optional: fix agent's reasoning when disagreeing with diagnosis |
+| `attempt-<N>-local-<M>.md` | Markdown | Local validation result for CI attempt N, local iteration M (PASS/FAIL + command table) |
 | `ci-loop.log` | plaintext | Timestamped CI loop event log |
 
 ### CI State File Schema
@@ -491,14 +521,18 @@ All stored in `ci-debug/<task_id>/`:
 
 | Status | Meaning |
 |--------|---------|
-| `fix_applied` | Diagnosis + fix completed, pushed, looping back to poll |
+| `fix_applied` | Diagnosis + local fix-validate loop passed, pushed, looping back to poll |
+| `fix_applied_local_incomplete` | Local validation failed after 20 iterations, pushed anyway |
 | `pass` | CI passed, finalize agent will run |
 | `push_failed` | Git push failed |
+| `push_failed_after_local` | Local validation passed but push failed |
+| `cancelled` | CI run was cancelled (not a failure) — re-pushed without diagnosing |
 | `diag_failed` | Diagnosis agent didn't produce a diagnosis file |
 | `error` | GitHub API error during polling |
 | `timeout` | CI poll exceeded 30 min timeout |
 | `interrupted` | Drain/shutdown requested during CI polling |
 | `interrupted_after_diag` | Drain/shutdown requested between diagnose and fix |
+| `interrupted_during_local_fix` | Drain/shutdown requested during local fix-validate loop |
 
 ---
 

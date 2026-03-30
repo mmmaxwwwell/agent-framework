@@ -234,11 +234,26 @@ Tasks that push code and iterate on CI failures MUST be tagged `[needs: gh, ci-l
 
 1. **Runner pushes** the current branch
 2. **Runner polls CI** in the main thread (no agent context burned) via `gh run list` / `gh run view`
-3. **On failure**: runner downloads logs to `ci-debug/<task_id>/attempt-N-logs.txt`, then:
+3. **On cancellation**: if the CI run was cancelled (not failed), the runner re-pushes to trigger a fresh run — it does NOT spawn diagnosis or fix agents. A cancelled run is not a code failure.
+4. **On failure**: runner downloads logs to `ci-debug/<task_id>/attempt-N-logs.txt`, then:
    - Spawns a **diagnosis sub-agent** that reads the logs + prior history and writes `attempt-N-diagnosis.md`
-   - Spawns a **fix sub-agent** that reads the diagnosis, applies the fix, and pushes
-4. **Loop**: runner polls CI again for the fix, repeats until green or attempt cap (15) is hit
-5. **On success**: spawns a **finalize sub-agent** to create the PR and mark the task complete
+   - Runs a **local fix-validate loop** (up to 20 iterations):
+     1. Spawns a **fix sub-agent** that reads the diagnosis, applies the fix, and commits (does NOT push)
+     2. Spawns a **validation sub-agent** that runs the SAME commands CI runs locally and writes a PASS/FAIL result
+     3. If FAIL → spawns another fix agent, then another validation agent, repeating up to 20 times
+     4. If PASS → runner pushes the fix
+   - This catches failures locally instead of burning 10-30 min CI cycles per iteration
+5. **Loop**: runner polls CI again for the pushed fix, repeats until green or attempt cap (50) is hit
+6. **On success**: spawns a **finalize sub-agent** to create the PR and mark the task complete
+
+### CI parity in local validation
+
+The validation agent reads `.github/workflows/ci.yml` to discover commands rather than using a hardcoded list. It runs every `run:` command from the CI workflow, skipping only GitHub Actions-specific steps and CI-only secrets. This ensures local validation catches the same failures CI would, including:
+
+- NixOS VM tests (`nix flake check --print-build-logs`)
+- Full test suites with race detection (`go test -race`)
+- Linters and formatters (`golangci-lint`, `nixfmt`)
+- Security scanners (when available locally)
 
 ### Artifact directory
 
@@ -247,10 +262,11 @@ All CI debug artifacts live in `ci-debug/<task_id>/`:
 | File | Purpose |
 |------|---------|
 | `state.json` | Resumable state — tracks all attempts |
-| `attempt-N-ci-result.json` | CI poll result (status, failed jobs, URL) |
+| `attempt-N-ci-result.json` | CI poll result (status, conclusion, failed jobs, URL) |
 | `attempt-N-logs.txt` | Raw CI failure logs |
 | `attempt-N-diagnosis.md` | Diagnosis agent's analysis |
 | `attempt-N-fix-notes.md` | Fix agent's notes (if it disagreed with diagnosis) |
+| `attempt-N-local-M.md` | Local validation result for attempt N, iteration M (PASS/FAIL + command table) |
 
 Sub-agents read prior attempt files for context without inflating their own context window.
 
@@ -266,4 +282,4 @@ The `state.json` file tracks completed attempts. If the runner is killed and res
 
 ### Failure limit
 
-After 15 failed CI fix attempts, the runner writes `BLOCKED.md` for human review. The full history is preserved in `ci-debug/<task_id>/`.
+After 50 failed CI attempts, the runner writes `BLOCKED.md` for human review. Within each CI attempt, up to 20 local fix-validate iterations run before pushing. The full history is preserved in `ci-debug/<task_id>/`.

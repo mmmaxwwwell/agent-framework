@@ -190,6 +190,38 @@ These patterns apply regardless of language, framework, or runtime:
 - Write a test that exercises the real delivery path — if clipboard is the only viable mechanism, test clipboard write + programmatic paste. If an API exists, test the API. If nothing works reliably, document the limitation and test up to the boundary.
 - Don't assume OS-level input simulation (xdotool, wtype, AppleScript) works in all environments — display server differences (X11 vs Wayland vs macOS), sandbox restrictions, and compositor-specific behavior make this fragile. Test on the actual target platform.
 
+**Pattern 10: NixOS VM and systemd service testing**
+
+When a project uses NixOS VM tests (`nixpkgs.testers.nixosTest`) or relies on systemd services, tests MUST verify that services are **healthy after startup**, not just that `systemctl start` returns. A unit can enter `activating` → `active` → `failed` in under a second — checking only the start command misses crash-on-startup bugs entirely.
+
+Required verification for every systemd service in a VM test:
+
+1. **Wait for the unit to be active**: Use `wait_for_unit("service-name.service")` — this waits for the unit to reach `active` state, but does NOT verify it stays there.
+2. **Verify the unit is still running after startup**: After `wait_for_unit` succeeds, add a brief delay (1-3 seconds), then check `systemctl is-active service-name.service` returns `active`. A service that crashes immediately after startup (e.g., missing config, invalid arguments, failed dependency) will have transitioned to `failed` by this point.
+3. **Check for fatal log messages**: After verifying the unit is active, grep the journal for fatal/error indicators: `journalctl -u service-name.service --no-pager -p err`. If there are error-level messages, the test should fail or at minimum log a warning.
+4. **Verify the service's functional readiness**: Don't just check the process is alive — verify it's actually serving. For a web server, hit its health endpoint. For a gRPC server, make a test RPC. For a coordination server (like headscale), verify its API responds. A process that is `active (running)` but stuck in a startup loop or missing critical config is not ready.
+
+Common failure patterns this catches:
+- **Missing configuration**: Service starts, reads config, finds a required field empty (e.g., `initial DERPMap is empty`), logs `FTL`, and exits with code 1 — all within 1 second of starting
+- **Dependency ordering**: Service A starts before Service B is ready, fails to connect, and crashes
+- **Permission errors**: Service runs as wrong user, can't read its data directory, exits immediately
+- **Port conflicts**: Two services bind the same port, second one crashes on startup
+
+NixOS VM test example (Python test script):
+```python
+# BAD — only checks that systemd started the unit, not that it's healthy
+host.wait_for_unit("headscale.service")
+
+# GOOD — verifies the unit is still running after startup settles
+host.wait_for_unit("headscale.service")
+host.sleep(2)  # let crash-on-startup failures manifest
+host.succeed("systemctl is-active headscale.service")  # fails if unit crashed
+host.succeed("journalctl -u headscale.service --no-pager -p err | grep -v 'no error' | wc -l | grep '^0$'")  # no error-level messages
+host.succeed("curl -sf http://localhost:8080/health")  # functional readiness
+```
+
+This pattern applies beyond NixOS — any test that starts a background service (Docker container, `systemctl start`, `supervisord`, background process) must verify the service is **alive and functional**, not just that the start command returned 0.
+
 ### What makes these different from per-boundary tests
 
 | Per-boundary integration test | User-flow integration test |
