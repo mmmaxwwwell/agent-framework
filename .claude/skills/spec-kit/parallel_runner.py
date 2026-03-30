@@ -3910,15 +3910,22 @@ class Runner:
                 continue
 
             if ci_result["status"] == "cancelled":
-                ci_log(f"CI run was cancelled (attempt {attempt}) — re-pushing and re-polling")
+                ci_log(f"CI run was cancelled (attempt {attempt}) — creating empty commit to trigger fresh run")
                 attempt_record["status"] = "cancelled"
                 state["attempts"].append(attempt_record)
                 state_file.write_text(json.dumps(state, indent=2))
-                # Re-push to trigger a fresh CI run — don't diagnose or fix
+                # Create an empty commit so the push actually triggers a new CI run.
+                # A bare re-push with no new commits won't create a new workflow run,
+                # and _poll_ci_run would just find the same cancelled run again.
                 try:
+                    subprocess.run(
+                        ["git", "commit", "--allow-empty", "-m",
+                         f"ci({task.id}): retry after cancelled run #{ci_result.get('run_id', '?')}"],
+                        capture_output=True, text=True, timeout=30,
+                    )
                     _gh_push(branch, ci_log)
                 except subprocess.TimeoutExpired:
-                    ci_log("Re-push timed out after cancellation")
+                    ci_log("Retry commit/push timed out after cancellation")
                 continue
 
             # ── Step 3: CI failed — download logs ──
