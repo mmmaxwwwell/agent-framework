@@ -29,12 +29,21 @@ import sys
 import textwrap
 import threading
 import time
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Optional
+
+
+# ── Exceptions ─────────────────────────────────────────────────────────
+
+
+class AgentAuthError(RuntimeError):
+    """Raised when a sub-agent fails due to authentication (401/expired token)."""
+    pass
 
 
 # ── Data model ──────────────────────────────────────────────────────────
@@ -1610,6 +1619,21 @@ Run these steps **in order**, stopping at the first failure category. Do NOT ski
 - Missing system tool (not an npm/pip package) → add it to `flake.nix` devShell and commit the change. The runner detects flake.nix modifications and automatically restarts inside the updated `nix develop` shell.
 - Then re-run the command. Only report a failure if the command fails AFTER dependencies are installed.
 
+**Step 5 — CI workflow verification** (if `.github/workflows/` files were modified in this phase):
+Check if any workflow files were modified:
+```bash
+git diff {base_sha}...HEAD --name-only -- .github/workflows/
+```
+If any were modified:
+1. Parse the modified workflow files and extract every `run:` command from added/changed steps
+2. Run each command locally (e.g., `./gradlew assembleDebug`, `nix build`, `go test ...`)
+3. For each `actions/upload-artifact` step, verify the `path:` file exists after the build
+4. For non-vacuous verification steps (counting JUnit XML, parsing summary.json), verify the
+   expected output files exist and contain valid data (>0 tests, >0 bytes)
+5. For multi-build-system projects: verify EVERY build system produced results, not just one.
+   A project with `go.mod` and `android/build.gradle.kts` must pass both Go and Gradle builds.
+Report any missing artifacts or failed commands as FAIL (same as test failure).
+
 **Important**: For early phases, the build/test infrastructure may not exist yet or may only cover a subset. Run what's available. If literally nothing can be validated yet, note this and pass.
 
 ### If ANY step FAILS — stop here
@@ -2284,7 +2308,8 @@ def extract_attempt_summary(log_path: Path) -> dict:
 
 
 def write_attempt_record(spec_dir: str, task_id: str, agent_id: int,
-                         duration_s: int, summary: dict):
+                         duration_s: int, summary: dict,
+                         session_id: str | None = None):
     """Append an attempt record to {spec_dir}/attempts/{task_id}.jsonl."""
     attempts_dir = Path(spec_dir) / "attempts"
     attempts_dir.mkdir(parents=True, exist_ok=True)
@@ -2294,12 +2319,20 @@ def write_attempt_record(spec_dir: str, task_id: str, agent_id: int,
         "duration_s": duration_s,
         **summary,
     }
+    if session_id:
+        record["session_id"] = session_id
     with open(attempts_dir / f"{task_id}.jsonl", "a") as f:
         f.write(json.dumps(record) + "\n")
 
 
-def read_attempt_history(spec_dir: str, task_id: str) -> list[dict]:
-    """Read all prior attempt records for a task."""
+def read_attempt_history(spec_dir: str, task_id: str,
+                         session_id: str | None = None) -> list[dict]:
+    """Read attempt records for a task.
+
+    If *session_id* is given, only return records from that session.
+    This prevents old failures from a previous runner invocation from
+    poisoning retry/failure decisions after the user intervenes.
+    """
     path = Path(spec_dir) / "attempts" / f"{task_id}.jsonl"
     if not path.exists():
         return []
@@ -2308,7 +2341,10 @@ def read_attempt_history(spec_dir: str, task_id: str) -> list[dict]:
         line = line.strip()
         if line:
             try:
-                records.append(json.loads(line))
+                rec = json.loads(line)
+                if session_id and rec.get("session_id") != session_id:
+                    continue
+                records.append(rec)
             except json.JSONDecodeError:
                 pass
     return records
@@ -3000,15 +3036,20 @@ Run the SAME commands that CI runs and report the results. You do NOT fix anythi
 
 Read `.github/workflows/ci.yml` (or scan `.github/workflows/` for the CI workflow). For each
 job, extract every `run:` command. Skip only:
-- GitHub Actions `uses:` steps (checkout, upload-artifact, setup-java, install-nix, cachix, etc.)
+- GitHub Actions `uses:` steps that have no local equivalent (checkout, upload-artifact, setup-java, install-nix, cachix, etc.)
 - Steps gated on CI-only secrets (`SNYK_TOKEN`, `SONAR_TOKEN`, `CACHIX_AUTH_TOKEN`)
 - SARIF uploads, artifact uploads, job summary generation
 - Steps in `if: always()` blocks that only generate reports
 
-Everything else MUST run. Pay special attention to:
+**IMPORTANT**: For `uses:` steps that DO have local equivalents, run the local equivalent:
+- Security scanners (Trivy, Semgrep, etc.) → run `make security-scan` or the equivalent local command
+- Check the project's Makefile or CLAUDE.md for local equivalents of CI-only actions
+
+Everything else MUST run — do NOT skip build steps. Pay special attention to:
 - `nix flake check --print-build-logs` — this runs NixOS VM tests
 - `go test -json -race -count=1 ./...` — full test suite, not just `-short`
 - Linters: `golangci-lint run`, `nixfmt --check`, etc.
+- Build steps like `gomobile bind` — these MUST run even if a later step also builds (e.g., Gradle)
 
 ### Step 2: Run ALL commands in order
 
@@ -3074,6 +3115,45 @@ To verify: cross-reference the number of tests reported against the actual test 
 Use `find` or `glob` to count test files/functions, then compare with the runner's reported count.
 If they diverge significantly, investigate and report it as a failure with details.
 
+- **Exit code swallowed by pipe**: a command like `cmd 2>&1 | tee log.txt` exits 0 even if `cmd` failed,
+  unless `set -o pipefail` is set. Check CI workflow steps that pipe output — if the pipe target
+  (`tee`, `head`, etc.) succeeds, the step succeeds regardless of the source command's exit code.
+  Treat this as a FAIL if the source command's output shows errors.
+- **Multi-build-system blind spot**: if the project has multiple build systems (e.g., Go + Gradle,
+  Rust + npm), verify EACH one produced results. A project with `go.mod` and `android/build.gradle.kts`
+  must have Go test results AND Android test results. If only one build system reported results,
+  the other likely failed silently.
+
+## CI workflow change detection
+
+Check if any files in `.github/workflows/` were modified in this phase's commits:
+```bash
+git diff --name-only HEAD~$(number of commits in this phase) -- .github/workflows/
+```
+
+If ANY workflow files were modified:
+
+1. **Parse the modified workflow files** and extract every `run:` command from added or changed steps
+2. **Run each command locally** in the project's dev environment. If a command references
+   `./gradlew assembleDebug`, run it. If it references `nix build`, run it. If it references
+   `jq '.passed' summary.json`, first run the test suite to produce summary.json, then run jq.
+3. **For each `actions/upload-artifact` step**, check the `path:` value — after running the
+   producing build command, verify the file exists at that path. If the step uploads
+   `android/app/build/outputs/apk/debug/app-debug.apk`, that file MUST exist.
+4. **For non-vacuous verification steps** (counting JUnit XML, parsing summary.json), run
+   the test suite and confirm the verification logic would pass (files exist, counts > 0)
+5. Report any failures as FAIL with the specific command and missing artifact
+
+**Why**: If this phase only edited YAML files (no source code changes), the standard
+build+test+lint sequence sees "nothing changed" and passes. But the YAML changes may
+reference build commands (`./gradlew`, `nix build`) that have never been run or are broken.
+This check catches that gap.
+
+**IMPORTANT**: This is NOT report-only. If a referenced command fails, treat it as a
+validation FAIL with the same severity as a test failure. The runner will spawn a fix agent
+to diagnose and fix the issue (add missing dep, fix build config, correct artifact path),
+then re-validate. Same fix-validate loop as test failures — 20-iteration cap.
+
 ## Rules
 
 - Do NOT fix any code — just run commands and report
@@ -3129,16 +3209,84 @@ For every job that runs tests, verify the results are plausible:
 3. Do NOT commit
 4. Exit — the runner will re-schedule the task for fixing
 
-**If all sanity checks pass**: proceed to finalization below.
+**If all sanity checks pass**: proceed to observable output validation.
 
-## Steps 1-5: Finalize
+## Step 1: Observable output validation
+
+After sanity checks pass, validate the **observable outputs** before finalizing.
+
+### 1a. Badge validation (if README.md has badges)
+
+Read `README.md` and extract every badge URL (both `img.shields.io` and GitHub Actions badge URLs).
+For each badge:
+- Fetch with `curl -sL <url>` and check HTTP status
+- For shields.io SVGs: check the response body does NOT contain error text:
+  `not found`, `not specified`, `invalid`, `no releases`, `inaccessible`
+- For GitHub Actions badges (`/actions/workflows/.../badge.svg`): check the response is a valid SVG (not 404)
+
+**If a badge is broken**:
+- Workflow badge 404 → check if the workflow file exists on the default branch:
+  `gh api repos/{{owner}}/{{repo}}/contents/.github/workflows/{{file}}?ref={{default_branch}}`
+  If 404, the workflow needs to reach the default branch via PR merge.
+- License badge "not specified" → check if LICENSE exists on default branch:
+  `gh api repos/{{owner}}/{{repo}}/contents/LICENSE?ref={{default_branch}}`
+- Release badge "no releases" → check `gh api repos/{{owner}}/{{repo}}/releases --jq 'length'`
+  If 0, this is expected for a new project and will self-heal after first release.
+
+Document broken badges and their causes in the finalization notes. If the cause is fixable (missing
+file that should be in the PR), do NOT finalize — write a diagnosis and exit.
+
+### 1b. Artifact validation
+
+List artifacts from the CI run:
+```bash
+gh run view <run_id> --json artifacts --jq '.artifacts[].name'
+```
+
+Cross-reference against `actions/upload-artifact` steps in `.github/workflows/ci.yml`.
+For each expected artifact not in the list, check if the upload step has `if:` conditions
+that prevented it from running.
+
+Download at least one artifact and verify it's non-empty:
+```bash
+gh run download <run_id> -n <artifact-name> -D /tmp/artifact-check/
+ls -la /tmp/artifact-check/
+```
+
+### 1c. Default branch readiness (if PR is being created)
+
+Before creating the PR, check what's on the default branch:
+```bash
+gh api repos/{{owner}}/{{repo}}/git/trees/{{default_branch}}?recursive=1 --jq '.tree[].path'
+```
+
+Verify the PR will bring:
+- All workflow files (`.github/workflows/*.yml`)
+- LICENSE file
+- README.md
+- Release config files (if release automation is configured)
+
+For `workflow_run` triggers: verify each referenced workflow name matches a workflow
+that will exist on the default branch after merge. GitHub uses the default branch's
+version of the workflow file for `workflow_run` events.
+
+### 1d. Acceptance scenario spot-check
+
+Read the spec file (find it in `specs/*/spec.md`) and extract acceptance scenarios.
+For any that are automatically verifiable (URL fetches, CLI commands, file checks, API calls),
+execute them and verify PASS. Do NOT fix code at this point — if a scenario fails,
+write the failure to `{debug_dir}/observable-validation-fail.md` and exit without finalizing.
+
+**If all observable checks pass**: proceed to finalization below.
+
+## Steps 2-6: Finalize
 
 1. Read the task description in `{task_file}` for {task_id}
 2. If the task says to create a PR: create it with `gh pr create`
 3. If the task describes additional post-CI steps (verify release, merge, etc.), do those
 4. Mark {task_id} as complete: change `- [ ]` to `- [x]` in `{task_file}`
 5. Commit: `feat({task_id}): CI/CD validation complete`
-6. Append a summary of the CI debug process to `{learnings_file}`
+6. Append a summary of the CI debug process AND observable validation results to `{learnings_file}`
 
 ## CI debug history
 
@@ -3168,6 +3316,7 @@ class Runner:
         self.log_dir = Path("logs")
         self.log_dir.mkdir(exist_ok=True)
         self.timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.session_id = uuid.uuid4().hex[:12]
         self._shutdown = threading.Event()
         self._draining = threading.Event()  # First Ctrl-C: finish running agents, don't spawn new ones
         self.agents: list[AgentSlot] = []
@@ -3221,9 +3370,17 @@ class Runner:
                     # It's alive — kill its entire process group.
                     self.log(f"Killing stale runner (PID {old_pid}) from previous run")
                     try:
-                        os.killpg(os.getpgid(old_pid), signal.SIGTERM)
-                        time.sleep(2)
-                        os.killpg(os.getpgid(old_pid), signal.SIGKILL)
+                        old_pgid = os.getpgid(old_pid)
+                        my_pgid = os.getpgrp()
+                        if old_pgid == my_pgid:
+                            # PID recycled into our group — just kill it directly
+                            os.kill(old_pid, signal.SIGTERM)
+                            time.sleep(2)
+                            os.kill(old_pid, signal.SIGKILL)
+                        else:
+                            os.killpg(old_pgid, signal.SIGTERM)
+                            time.sleep(2)
+                            os.killpg(old_pgid, signal.SIGKILL)
                     except (ProcessLookupError, PermissionError, OSError):
                         pass
             except (ValueError, ProcessLookupError, OSError):
@@ -3243,6 +3400,7 @@ class Runner:
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
         self._cleanup_stale_run()
+        self.log(f"Session {self.session_id} — prior failures from other sessions will be ignored")
 
         # Check for leftover BLOCKED.md — if the user edited it with an answer, consume and continue
         if self.blocked_file.exists():
@@ -3284,10 +3442,12 @@ class Runner:
         self._print_summary()
 
     def _handle_signal(self, sig, frame):
+        import signal as _signal
+        sig_name = _signal.Signals(sig).name if hasattr(_signal, 'Signals') else str(sig)
         if not self._draining.is_set():
-            # First Ctrl-C → drain: finish running agents, don't spawn new ones
+            # First signal → drain: finish running agents, don't spawn new ones
             self._draining.set()
-            self.log("Ctrl-C — draining: waiting for running agents to finish, no new tasks")
+            self.log(f"Signal {sig_name} — draining: waiting for running agents to finish, no new tasks")
             return
         # Second Ctrl-C → hard shutdown
         self._shutdown.set()
@@ -3311,9 +3471,16 @@ class Runner:
             return
 
         # Phase 1: SIGTERM to process groups (reaches bwrap children).
+        my_pgid = os.getpgrp()
         for agent in live:
             try:
-                os.killpg(os.getpgid(agent.process.pid), signal.SIGTERM)
+                pgid = os.getpgid(agent.process.pid)
+                if pgid == my_pgid:
+                    # PID was recycled into our process group — don't self-signal.
+                    # Just kill the individual process.
+                    agent.process.terminate()
+                else:
+                    os.killpg(pgid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError, OSError):
                 pass
 
@@ -3330,7 +3497,11 @@ class Runner:
         for agent in live:
             if agent.process.poll() is None:
                 try:
-                    os.killpg(os.getpgid(agent.process.pid), signal.SIGKILL)
+                    pgid = os.getpgid(agent.process.pid)
+                    if pgid == my_pgid:
+                        agent.process.kill()
+                    else:
+                        os.killpg(pgid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError, OSError):
                     pass
                 try:
@@ -3403,7 +3574,7 @@ class Runner:
             self.log(f"Already validated: {', '.join(sorted(validated_phases))}")
 
         consecutive_noop = 0
-        max_consecutive_noop = 5
+        max_consecutive_noop = 20
         total_runs = 0
 
         # Track flake.nix hash so we can re-exec if an agent modifies it
@@ -3479,7 +3650,17 @@ class Runner:
             if self._draining.is_set():
                 with self._lock:
                     if not self.agents:
-                        self.log("Drain complete — all agents finished")
+                        remaining = scheduler.remaining_count()
+                        if remaining > 0:
+                            self.log(f"Drain complete — all agents finished, {remaining} task(s) still pending")
+                            pending_ids = [
+                                t.id for p in phases for t in p.tasks
+                                if t.status in (TaskStatus.PENDING, TaskStatus.REWORK)
+                            ]
+                            if pending_ids:
+                                self.log(f"  Unfinished: {', '.join(pending_ids)}")
+                        else:
+                            self.log("Drain complete — all agents finished")
                         break
                 self._poll_agents()
                 time.sleep(1)
@@ -3573,6 +3754,18 @@ class Runner:
 
                 # ── CI loop tasks get a dedicated runner-managed cycle ──
                 if "ci-loop" in task.capabilities:
+                    # Guard against infinite respawn: if the CI loop thread
+                    # keeps returning immediately (drain, error, etc.), don't
+                    # keep re-launching it.
+                    if not hasattr(self, '_ci_loop_spawns'):
+                        self._ci_loop_spawns: dict[str, int] = {}
+                    spawn_count = self._ci_loop_spawns.get(task.id, 0)
+                    if spawn_count >= 3:
+                        self.log(f"Task {task.id} CI loop spawned {spawn_count} times — giving up")
+                        task.status = TaskStatus.FAILED
+                        continue
+                    self._ci_loop_spawns[task.id] = spawn_count + 1
+
                     self.log(f"Task {task.id} is a [ci-loop] task — running CI debug loop")
                     # Run in a thread so the main loop can continue managing other agents
                     ci_thread = threading.Thread(
@@ -3602,7 +3795,7 @@ class Runner:
                     total_runs += 1
                     continue
 
-                history = read_attempt_history(spec_dir, task.id)
+                history = read_attempt_history(spec_dir, task.id, session_id=self.session_id)
 
                 # Use lightweight retry prompt when code exists but agents
                 # keep dying from connection errors
@@ -3794,17 +3987,18 @@ class Runner:
         if not hasattr(self, '_read_positions'):
             self._read_positions = {}
 
-        # Check for completed CI loop threads
-        if hasattr(self, '_ci_threads'):
-            for task_id, thread in list(self._ci_threads.items()):
-                if not thread.is_alive():
-                    self.log(f"CI loop thread for {task_id} completed")
-                    del self._ci_threads[task_id]
-                    # Remove the virtual agent slot
-                    with self._lock:
-                        self.agents = [a for a in self.agents if a.task.id != task_id]
-
         while not self._shutdown.is_set():
+            # Check for completed CI loop threads (must be inside the
+            # while loop so we detect threads that finish while we're polling)
+            if hasattr(self, '_ci_threads'):
+                for task_id, thread in list(self._ci_threads.items()):
+                    if not thread.is_alive():
+                        self.log(f"CI loop thread for {task_id} completed")
+                        del self._ci_threads[task_id]
+                        # Remove the virtual agent slot
+                        with self._lock:
+                            self.agents = [a for a in self.agents if a.task.id != task_id]
+
             with self._lock:
                 if not self.agents:
                     break
@@ -3868,7 +4062,8 @@ class Runner:
                     if spec_dir and not agent.task.id.startswith("VR-"):
                         duration_s = int(time.time() - agent.start_time)
                         summary = extract_attempt_summary(agent.log_file) if agent.log_file else {}
-                        write_attempt_record(spec_dir, agent.task.id, agent.agent_id, duration_s, summary)
+                        write_attempt_record(spec_dir, agent.task.id, agent.agent_id, duration_s, summary,
+                                             session_id=self.session_id)
 
                     finished.append(agent)
 
@@ -3915,9 +4110,9 @@ class Runner:
 
             time.sleep(1)
 
-    def _run_ci_loop(self, task: Task, spec_dir: str, task_file: Path,
-                     learnings_file: str):
-        """Run the CI debug loop for a [ci-loop] task.
+    def __run_ci_loop_inner(self, task: Task, spec_dir: str, task_file: Path,
+                            learnings_file: str):
+        """Inner CI debug loop — called by _run_ci_loop which catches auth errors.
 
         Uses separate sub-agents for diagnosis and fixing, with the runner
         polling CI in the main thread. All artifacts written to ci-debug/<task_id>/.
@@ -3971,11 +4166,32 @@ class Runner:
             proc.wait()
             slot.status = "done" if proc.returncode == 0 else "failed"
 
-            # Remove sub-agent slot
+            # Read final token counts from sub-agent log
+            sub_in_tok, sub_out_tok = 0, 0
+            if log_p and log_p.exists():
+                _, _, _, (sub_in_tok, sub_out_tok) = read_stream_output(log_p, 0)
+
+            # Aggregate sub-agent tokens into the parent CI loop slot
             with self._lock:
+                for a in self.agents:
+                    if a.task.id == task.id and a.agent_id != aid:
+                        a.input_tokens += sub_in_tok
+                        a.output_tokens += sub_out_tok
+                        break
                 self.agents = [a for a in self.agents if a.agent_id != aid]
 
             ci_log(f"{label} completed (exit {proc.returncode})")
+
+            # Detect auth failures — abort early instead of looping uselessly
+            if proc.returncode != 0:
+                auth_err = check_auth_error(log_p)
+                if auth_err:
+                    raise AgentAuthError(
+                        f"Sub-agent authentication failed (401). "
+                        f"Claude Code session may have expired — "
+                        f"re-authenticate and restart."
+                    )
+
             return proc.returncode
 
         branch = subprocess.run(
@@ -3992,7 +4208,12 @@ class Runner:
             except (json.JSONDecodeError, KeyError):
                 pass
 
-        start_attempt = len(state["attempts"]) + 1
+        # Only count attempts from the current session for retry/stuck decisions
+        session_attempts = [
+            a for a in state["attempts"]
+            if a.get("session_id") == self.session_id
+        ]
+        start_attempt = len(session_attempts) + 1
         # Track cancelled run IDs so the poller skips them instead of re-finding them
         skip_run_ids: set[int] = set()
         ci_log(f"Starting CI loop for {task.id} on branch {branch} (attempt {start_attempt})")
@@ -4005,7 +4226,7 @@ class Runner:
                 ci_log(f"CI loop stopping — drain requested (will resume on next run, attempt {attempt})")
                 return
 
-            attempt_record = {"attempt": attempt, "started": datetime.now().isoformat()}
+            attempt_record = {"attempt": attempt, "started": datetime.now().isoformat(), "session_id": self.session_id}
 
             # ── Step 1: Local validation BEFORE pushing ──
             # Always validate locally first — even on the first attempt. The task
@@ -4181,9 +4402,13 @@ class Runner:
             else:
                 ci_log(f"CI failed (attempt {attempt}): {failed_jobs}")
 
-            # Check if the same jobs have been failing consecutively
+            # Check if the same jobs have been failing consecutively (current session only)
             recent_failures = []
-            for prev in reversed(state.get("attempts", [])):
+            session_attempts_for_stuck = [
+                a for a in state.get("attempts", [])
+                if a.get("session_id") == self.session_id
+            ]
+            for prev in reversed(session_attempts_for_stuck):
                 prev_ci = prev.get("ci_result", {})
                 prev_status = prev.get("status", "")
                 if prev_ci.get("status") == "fail" or prev_status == "sanity_check_fail":
@@ -4367,6 +4592,34 @@ class Runner:
             f"## What I need\n\nHuman review of the CI failures — the automated loop couldn't resolve them.\n\n"
             f"## Context\n\nAll diagnosis and log files are in `{debug_dir}/`.\n"
         )
+
+    def _run_ci_loop(self, task: Task, spec_dir: str, task_file: Path,
+                     learnings_file: str):
+        """Run the CI debug loop, catching auth failures."""
+        debug_dir = _ci_debug_dir(task.id)
+        ci_log_path = debug_dir / "ci-loop.log"
+
+        def _ci_log_to_file(msg: str):
+            ts = datetime.now().strftime("%H:%M:%S")
+            with open(ci_log_path, "a") as f:
+                f.write(f"[{ts}] {msg}\n")
+
+        try:
+            return self.__run_ci_loop_inner(task, spec_dir, task_file, learnings_file)
+        except AgentAuthError as e:
+            _ci_log_to_file(f"FATAL: {e}")
+            self.log(f"FATAL: Auth error in CI loop for {task.id} — stopping all tasks. Re-authenticate and re-run.")
+            self._shutdown.set()
+            self.blocked_file.write_text(
+                f"# BLOCKED: {task.id} — Claude Code authentication expired\n\n"
+                f"Sub-agent failed with a 401 authentication error. "
+                f"The Claude Code session has likely expired.\n\n"
+                f"## What to do\n\n"
+                f"1. Re-authenticate Claude Code (run `claude` and log in)\n"
+                f"2. Restart the runner\n\n"
+                f"## Context\n\nAll diagnosis and log files are in `{debug_dir}/`.\n"
+            )
+            return
 
     def _drain_agents(self):
         """Wait for all running agents to finish their current work.

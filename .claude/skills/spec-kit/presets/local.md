@@ -34,7 +34,7 @@
 - Process architecture (single process? spawns child processes? watch mode? daemon?)
 - Operational workflows — for daemons and long-running tools: day-1 setup, day-2 operations (add/remove/restart/debug), failure recovery, admin processes. Skip for pure run-and-exit CLIs.
 
-**Interview style**: 5-10 questions. Focus on UX, data integrity, and workflows. Propose sensible defaults and confirm.
+**Interview style**: Be exhaustive — cover every applicable topic until the spec has no gaps. Focus on UX, data integrity, and workflows. Propose sensible defaults and confirm.
 
 ## Spec phase overrides
 

@@ -44,6 +44,8 @@ reference/           # Enterprise knowledge base — loaded on demand by phase f
   complexity.md      # Complexity tracking
   phase-deps.md      # Phase dependencies & parallelization
   readme.md          # Human-facing README.md structure, sections, quality checklist
+  pre-pr.md          # Pre-PR gate: single-command validation, multi-build discovery, non-vacuous checks
+  e2e-runtime.md     # Real-runtime E2E: emulator, browser, simulator patterns, side-by-side architecture
 presets/             # Quality presets — loaded once per project
   poc.md             # Proof of concept
   local.md           # Single-user local tool
@@ -57,14 +59,14 @@ presets/             # Quality presets — loaded once per project
 
 Before doing anything else, determine the project's quality preset. This controls how many questions you ask, which infrastructure you include, and how heavy the process is. **Ask the user to pick one** (or detect from context if they already stated it):
 
-| Preset | Use when | Questions | Infrastructure |
-|--------|----------|-----------|---------------|
-| **poc** | Throwaway prototype, speed over everything | 3-5 | None — console.log, hardcoded config, no auth/tests/CI |
-| **local** | Single-user local tool (CLI, desktop, dev tooling) | 5-10 | Enterprise-grade — full test infra, CI/CD, structured logging, comprehensive errors. Scoped: no auth/CORS/rate-limiting/observability. |
-| **library** | Published package (npm, PyPI, crates.io) | 8-12 | Enterprise-grade — full test infra across target environments, CI/CD with publish pipeline, strict semver. Scoped: no server, no deployment, no auth. |
-| **extension** | Browser extension, VS Code extension, IDE plugin | 8-12 | Enterprise-grade — full test infra with host platform harness, CI/CD with store publish, permission audit. Scoped: platform sandbox constraints. |
-| **public** | Single-user but internet-exposed | 8-12 | Enterprise-grade — full security hardening, CI/CD, structured logging. Scoped: no multi-user auth, no observability infra. |
-| **enterprise** | Multi-user, production, team-maintained | Exhaustive | Full — everything in the reference files |
+| Preset | Use when | Infrastructure |
+|--------|----------|---------------|
+| **poc** | Throwaway prototype, speed over everything | None — console.log, hardcoded config, no auth/tests/CI |
+| **local** | Single-user local tool (CLI, desktop, dev tooling) | Enterprise-grade — full test infra, CI/CD, structured logging, comprehensive errors. Scoped: no auth/CORS/rate-limiting/observability. |
+| **library** | Published package (npm, PyPI, crates.io) | Enterprise-grade — full test infra across target environments, CI/CD with publish pipeline, strict semver. Scoped: no server, no deployment, no auth. |
+| **extension** | Browser extension, VS Code extension, IDE plugin | Enterprise-grade — full test infra with host platform harness, CI/CD with store publish, permission audit. Scoped: platform sandbox constraints. |
+| **public** | Single-user but internet-exposed | Enterprise-grade — full security hardening, CI/CD, structured logging. Scoped: no multi-user auth, no observability infra. |
+| **enterprise** | Multi-user, production, team-maintained | Full — everything in the reference files |
 
 **How to apply the preset:**
 
@@ -146,6 +148,7 @@ Check and update `.gitignore` after completing **any** of these phases:
 test-logs/
 logs/
 validate/
+attempts/
 ci-debug/
 BLOCKED.md
 

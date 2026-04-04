@@ -26,3 +26,23 @@ Every plan MUST include a **Phase Dependencies** section that makes parallelizat
    For single-stream projects, state "all phases are sequential."
 
 4. **Sync points** — phases where parallel workstreams must converge (e.g., integration testing, e2e validation). These are where agents must wait for all prerequisite streams to complete.
+
+## Avoiding circular phase dependencies
+
+The dependency graph MUST be acyclic (a DAG). The runner considers a phase "complete" only when ALL tasks in that phase are done. This means:
+
+**Never put a task that depends on a later phase into the same phase as tasks that the later phase depends on.** This creates a deadlock: the later phase can't start because the earlier phase isn't complete, but the earlier phase can't complete because its task is waiting on the later phase.
+
+Example of the bug:
+```
+Phase 19: T109a [x], T109b [x], T109c [x], T099 [ ]
+Phase 20: T110 [ ], T111 [ ], T112 [ ], T113 [ ]
+
+DAG: Phase 19 → Phase 20 (because T109a/b/c → T110)
+     T113 → T099 (task-level dep crossing back into Phase 19)
+```
+Phase 20 waits for Phase 19 to complete, but T099 (in Phase 19) waits for T113 (in Phase 20). Deadlock — the runner sits idle with "No agents running."
+
+**Fix:** split the phase. Move T099 into a new Phase 21 that depends on Phase 20. Phase 19 contains only T109a/b/c (already complete), Phase 20 is unblocked, and Phase 21 runs after Phase 20 finishes.
+
+**Rule:** if a task has a dependency on a task in a later phase, that task MUST be moved to a phase that comes after the later phase, not placed alongside the tasks the later phase depends on.

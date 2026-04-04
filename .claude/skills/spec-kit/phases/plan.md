@@ -112,6 +112,8 @@ Skip this section for stateless request/response services, pure-function librari
 - **Custom reporter** — For structured test output (required by fix-validate loop)
 - **Test tiers** — Unit, integration (per-boundary), user-flow integration (end-to-end chain), contract — what goes where
 - **User-flow test plan** — For each primary user flow in the spec, identify: the chain of boundaries crossed, the injectable seams for deterministic input (fixture files, pre-cached resources, test data), and the observable output to verify. See `reference/testing.md` § "User-flow integration tests". This plan ensures implementing agents know WHAT flows to test and HOW to make them deterministic.
+- **Real-runtime E2E strategy** — If the project targets a platform runtime (Android, iOS, web/PWA, desktop), load `reference/e2e-runtime.md` and decide: which runtimes to test on (emulator, simulator, headless browser), side-by-side vs nested architecture for multi-runtime tests, test bypass mechanisms for hardware features (camera, biometrics, NFC), UI automation framework (UI Automator, Playwright, XCUITest), and CI infrastructure (KVM, Xvfb, runner requirements). Present each decision to the user.
+- **Pre-PR gate** — Load `reference/pre-pr.md`. Every project (except poc) gets a `make pre-pr` target. Decide which checks to include based on the preset: build + test + lint + security (minimum), plus E2E, CI workflow validation, and contract tests (when applicable). Present the gate composition to the user.
 - **Test plan matrix** — Map every SC-xxx to a specific test shape. This bridges the gap between success criteria (what to verify) and implementation (how to verify it). For each SC:
 
   | SC | Test Tier | Fixture Requirements | Assertion | Infrastructure |
@@ -233,6 +235,8 @@ After all decisions are made but before writing the plan:
 | Edge case → test mapping | `reference/edge-cases.md` | Mapping enumerated edge cases to test scenarios |
 | Traceability | `reference/traceability.md` | Grouping plan by user story/FR for downstream task traceability |
 | Interface contracts (internal) | `reference/interface-contracts.md` | Defining shared data formats, file paths, and protocols between tasks |
+| Pre-PR gate | `reference/pre-pr.md` | Single-command validation target, multi-build discovery, non-vacuous checks, CI workflow validation |
+| Real-runtime E2E testing | `reference/e2e-runtime.md` | Emulator/browser/simulator selection, side-by-side architecture, readiness checks, test bypass, UI automation, CI infra |
 
 **Conditional loads — check the spec and load only if applicable:**
 - **If the project has a UI**: load `reference/ui-flow.md` before planning UI phases. Include UI_FLOW.md creation as an early task and incremental updates per phase.
@@ -240,6 +244,7 @@ After all decisions are made but before writing the plan:
 - **If the project has an API, IPC protocol, or real-time channels**: load `reference/api-contracts.md` before writing contract documentation. Skip if no external interfaces.
 - **If the project spawns external processes** (CLI tools, agents, child workers): load `reference/testing.md` and include stub-process creation and integration tests for the spawn → stdin → stdout → exit lifecycle. Check the spec's functional requirements for external process interfaces.
 - **If the project has external service dependencies** (databases, emulators, message queues): load `reference/idempotency.md` and plan readiness-check scripts for each dependency.
+- **If the project targets a platform runtime** (Android, iOS, web/PWA, desktop): load `reference/e2e-runtime.md` before planning E2E phases. Include runtime selection, side-by-side architecture, test bypass mechanisms, UI automation framework, and CI infrastructure in the testing strategy.
 
 **Skip reference loads for topics the preset says to skip.** But for any section you're writing, the reference defines the quality bar — load it first.
 

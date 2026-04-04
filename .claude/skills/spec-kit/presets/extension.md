@@ -36,7 +36,7 @@
 - Store listing — name, description, screenshots, categories, privacy policy (required by most stores)
 - Edge cases — host platform updates that break APIs, permission revocation mid-session, storage quota exhaustion, network offline behavior, multi-window/multi-tab scenarios
 
-**Interview style**: 8-12 questions. Focus on permissions justification, platform constraints, and user-facing behavior. Present permission defaults as minimal and let the user add more if needed.
+**Interview style**: Be exhaustive — cover every applicable topic until the spec has no gaps. Focus on permissions justification, platform constraints, and user-facing behavior. Present permission defaults as minimal and let the user add more if needed.
 
 ## Spec phase overrides
 

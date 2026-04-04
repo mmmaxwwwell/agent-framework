@@ -32,12 +32,91 @@ The CI configuration MUST be committed to the repository:
 
 The pipeline MUST block merges on:
 - Test failures (unit, integration, contract, e2e)
+- **Vacuous passes** (0 tests ran, 0 results found — see "Non-vacuous CI validation" below)
 - Critical or high severity vulnerabilities (from security scans)
 - Secrets detected in code
 - Lint failures
 - Build failures
 
 Additional gates (code coverage thresholds, license compliance) are determined during the interview.
+
+## Non-vacuous CI validation
+
+A CI job that reports 0 passed / 0 failed and exits green is **worse than a failure** — it gives false confidence that code is tested when nothing actually ran. This is a common class of silent CI rot: the build tool isn't found, the test directory is wrong, a prerequisite step failed silently, or test results are parsed from an empty directory.
+
+**Every CI job that runs tests MUST assert that a non-zero number of tests actually executed.** A job that finds zero test results MUST exit non-zero.
+
+### Implementation pattern
+
+After the test step, add a verification step that counts results and fails if none were found:
+
+```yaml
+# For JUnit XML results (Android/JVM, pytest, etc.)
+- name: Verify tests ran
+  if: always()
+  run: |
+    COUNT=$(find path/to/test-results -name '*.xml' 2>/dev/null | wc -l)
+    if [ "$COUNT" -eq 0 ]; then
+      echo "::error::No test results found — tests did not run"
+      exit 1
+    fi
+    # Optional: extract total test count from XML and assert > 0
+    TESTS=$(grep -roh 'tests="[0-9]*"' path/to/test-results/ | grep -o '[0-9]*' | paste -sd+ | bc)
+    if [ "${TESTS:-0}" -eq 0 ]; then
+      echo "::error::Test results found but 0 tests reported — build may have failed before tests"
+      exit 1
+    fi
+
+# For Go test -json output (piped through a reporter)
+- name: Verify tests ran
+  if: always()
+  run: |
+    if [ -f test-logs/summary.json ]; then
+      TOTAL=$(jq '.passed + .failed' test-logs/summary.json)
+      if [ "${TOTAL:-0}" -eq 0 ]; then
+        echo "::error::Test reporter found 0 tests — something is misconfigured"
+        exit 1
+      fi
+    else
+      echo "::error::No test summary found — test reporter did not run"
+      exit 1
+    fi
+
+# For security scanners
+- name: Verify scanners ran
+  if: always()
+  run: |
+    for scanner in trivy semgrep gitleaks govulncheck; do
+      if [ ! -f "test-logs/security/${scanner}.json" ]; then
+        echo "::error::Scanner ${scanner} produced no output"
+        exit 1
+      fi
+      SIZE=$(wc -c < "test-logs/security/${scanner}.json")
+      if [ "$SIZE" -lt 10 ]; then
+        echo "::error::Scanner ${scanner} output is empty/trivial (${SIZE} bytes)"
+        exit 1
+      fi
+    done
+```
+
+### What to guard
+
+Apply non-vacuous validation to **every** CI job that produces countable results:
+
+| Job type | What to count | Minimum |
+|----------|--------------|---------|
+| Unit/integration tests | Test count from runner output or result XML | > 0 |
+| Android tests | JUnit XML files in `build/test-results/` | > 0 files, > 0 tests |
+| Security scans | JSON output files per scanner | > 0 bytes per scanner |
+| Lint | Files checked (or at least: tool ran without "no files found") | > 0 |
+| Build | Output artifact exists | file exists and > 0 bytes |
+| Coverage | Coverage report file exists | file exists |
+
+### Why the job summary isn't enough
+
+A common anti-pattern (and what caused this rule): the job summary step parses test results from a directory, finds nothing, reports "0 passed / 0 failed", and the job exits 0 because no step actually failed. The summary is cosmetically green. Branch protection sees a green check. The test suite has been silently broken for weeks.
+
+The fix is structural: **the verification step must be a separate step with `exit 1`**, not part of a summary step that only writes markdown. Summary steps exist for humans reading the Actions UI. Verification steps exist for the merge gate.
 
 ## Security scan reporting
 
@@ -181,6 +260,72 @@ build-artifacts:
 
 This is language-agnostic — adapt the build commands to the project's tech stack. The principle is: **if it's built in the release workflow, it must also be built in the CI workflow.**
 
+## Default branch readiness
+
+Before creating a PR to the default branch, the agent MUST verify that the merge will bring everything external services and workflow triggers need. A project where all code lives on `develop` but the default branch (`main`) is empty or stale will have:
+- **Broken badges**: GitHub Actions badges return 404 if the workflow doesn't exist on the default branch. Shields.io license badges show "not specified" if LICENSE isn't on the default branch.
+- **Failed `workflow_run` triggers**: GitHub runs `workflow_run`-triggered workflows using the **default branch's version** of the workflow file. If the workflow only exists on a feature branch, GitHub uses a stale/nonexistent version from the default branch.
+- **No release automation**: release-please and similar tools require their config files on the default branch.
+
+### What to check
+
+Before the PR is created, verify the default branch contains (or the PR will add):
+
+| File/Directory | Why it's needed on the default branch |
+|---------------|--------------------------------------|
+| `.github/workflows/*.yml` | Workflow badges, `workflow_run` triggers, release automation |
+| `LICENSE` | GitHub API license detection, shields.io license badge |
+| `README.md` | Repository landing page, badge rendering |
+| Release config (`release-please-config.json`, etc.) | Release automation on push to default branch |
+| Package manifests (`go.mod`, `package.json`, etc.) | Dependency scanning services (Snyk, Dependabot) |
+
+### `workflow_run` trigger validation
+
+For every workflow that uses `workflow_run`:
+1. Read the `workflows:` list in the trigger — these are workflow **names** (the `name:` field), not file names
+2. Verify each referenced workflow exists on the default branch with a matching `name:` field
+3. Verify the `branches:` filter in the `workflow_run` trigger matches branches where the triggering workflow actually runs
+4. If the referenced workflow doesn't exist on the default branch, the `workflow_run` trigger will use a stale version (if one ever existed) or fail silently
+
+## Observable output validation (post-CI)
+
+After CI passes, the agent MUST validate the **observable outputs** of the project — everything a user, contributor, or automated service would see. Passing tests and green CI are necessary but not sufficient. This catches the class of bugs where the code works but the project appears broken from outside.
+
+### Badge validation
+
+For every badge URL in README.md:
+
+1. Fetch with `curl -sI <url>` — verify HTTP 200
+2. For shields.io badges: fetch the SVG body and check it doesn't contain error strings (`not found`, `not specified`, `invalid`, `no releases`)
+3. For GitHub Actions badges: verify the badge shows a valid workflow status, not 404
+4. Common failures and fixes:
+
+| Badge shows | Cause | Fix |
+|-------------|-------|-----|
+| 404 | Workflow doesn't exist on default branch | Ensure PR brings the workflow file |
+| "not specified" | File (LICENSE, etc.) not on default branch | Ensure PR brings the file |
+| "no releases" | No GitHub releases exist | Verify release-please config; releases appear after first merge to default branch |
+| "failing" | Workflow uses stale file from default branch | Ensure current workflow file reaches default branch |
+
+### Artifact validation
+
+After CI completes:
+
+1. List artifacts: `gh run view <run_id> --json artifacts`
+2. Cross-reference against every `actions/upload-artifact` step in the workflow YAML
+3. Download at least one artifact and verify it's non-empty
+4. For missing artifacts: check `if:` conditions on the upload step, check if the producing build step ran (non-vacuous)
+
+### Acceptance scenario verification
+
+Parse the spec's acceptance scenarios (Given/When/Then) and classify:
+
+- **Automatically verifiable**: URL fetches, CLI commands, file checks, API calls → execute and report PASS/FAIL
+- **CI-verifiable**: examine CI run logs/artifacts for expected annotations, output, results
+- **Manual**: list in completion report as requiring human verification
+
+Execute all automatable scenarios. Fix-validate on failures (10 iterations per scenario).
+
 ## Local security scan validation (fix-validate loop)
 
 Security scanning is part of the phase validation lifecycle — not a separate workflow. When the runner spawns a validation agent at a phase boundary, that agent runs **build → test → lint → security scan**. If any scanner finds issues, the standard fix-validate loop kicks in: the validation agent writes a FAIL record, a fix task is appended, a fresh fix agent reads the findings and patches the code, and the runner re-validates.
@@ -254,16 +399,63 @@ Security scan failure is treated identically to test failure — same fix task p
 
 Running scanners locally in the fix-validate loop catches issues **before pushing**. This avoids burning 10-30 minute CI cycles on code that has known vulnerabilities. The CI pipeline runs the same scanners as a final gate, but the local loop is the primary feedback mechanism for the implementing agent.
 
+## Local CI workflow validation
+
+When CI workflow files (`.github/workflows/*.yml`) are modified, the changes MUST be validated locally before pushing. Workflow syntax errors, wrong artifact paths, and broken `run:` commands waste 10-30 minutes per CI round-trip. Local validation catches them in seconds.
+
+### What to validate
+
+| Check | How | Tool |
+|-------|-----|------|
+| **YAML syntax** | Parse every workflow file, reject syntax errors | `actionlint` (GitHub Actions-specific linter, catches type mismatches, invalid action refs, expression errors) |
+| **`run:` command reproducibility** | Extract every `run:` block from modified workflows, execute locally | Shell — just run the command |
+| **Artifact path verification** | For every `actions/upload-artifact` step, run the producing build command, verify the file exists | Shell — run build, check path |
+| **Secret references** | List all `${{ secrets.* }}` refs, verify documented in README CI Setup section | Grep + manual check |
+| **Action version pins** | Warn on `@main`/`@master` instead of `@v4` or SHA pins | `actionlint` flags this |
+| **`workflow_run` chain integrity** | Verify referenced workflow `name:` fields match actual workflow files | Grep workflow names across files |
+
+### Tool: `actionlint`
+
+`actionlint` is a static checker for GitHub Actions workflow files. It catches errors that YAML linters miss — invalid action inputs, type mismatches in expressions, deprecated syntax, unpinned action versions, and undefined secret references.
+
+Add to the project's `flake.nix` devShell:
+```nix
+devShells.default = pkgs.mkShell {
+  buildInputs = [ pkgs.actionlint /* ... other tools */ ];
+};
+```
+
+Run on all workflow files:
+```bash
+actionlint .github/workflows/*.yml
+```
+
+### Integration with `pre-pr` gate
+
+The `pre-pr` target (see `reference/pre-pr.md`) should run `actionlint` on modified workflow files. Only run this check when workflows have changed:
+
+```bash
+# Only lint workflows if they changed since origin/HEAD
+if git diff --name-only origin/HEAD -- .github/workflows/ | grep -q '.'; then
+  actionlint .github/workflows/*.yml
+fi
+```
+
+### Integration with fix-validate loop
+
+During implementation, the CI workflow local verification tasks (see `phases/tasks.md § CI workflow local verification`) run every `run:` command from modified workflows in parallel sub-agents. This is the same principle applied at implementation time — catch CI failures before burning CI cycles.
+
 ## Agentic CI feedback loop
 
 Tasks that push code and iterate on CI failures MUST be tagged `[needs: gh, ci-loop]` in tasks.md. This activates a runner-managed debug cycle that uses separate sub-agents instead of one long-running context:
 
 ### How it works
 
-1. **Runner pushes** the current branch
-2. **Runner polls CI** in the main thread (no agent context burned) via `gh run list` / `gh run view`
-3. **On cancellation**: if the CI run was cancelled (not failed), the runner re-pushes to trigger a fresh run — it does NOT spawn diagnosis or fix agents. A cancelled run is not a code failure.
-4. **On failure**: runner downloads logs to `ci-debug/<task_id>/attempt-N-logs.txt`, then:
+1. **Local validation first** — before the first push, spawn parallel fix-validate subagents for every build system in the project (e.g., `make validate`, `nix flake check`, `make android-apk`). Each subagent loops until its command passes. Only push after ALL local validations pass. This catches the majority of failures in seconds/minutes instead of waiting 10-30 min CI round-trips.
+2. **Runner pushes** the current branch
+3. **Runner polls CI** in the main thread (no agent context burned) via `gh run list` / `gh run view`
+4. **On cancellation**: if the CI run was cancelled (not failed), the runner re-pushes to trigger a fresh run — it does NOT spawn diagnosis or fix agents. A cancelled run is not a code failure.
+5. **On failure**: runner downloads logs to `ci-debug/<task_id>/attempt-N-logs.txt`, then:
    - Spawns a **diagnosis sub-agent** that reads the logs + prior history and writes `attempt-N-diagnosis.md`
    - Runs a **local fix-validate loop** (up to 20 iterations):
      1. Spawns a **fix sub-agent** that reads the diagnosis, applies the fix, and commits (does NOT push)
@@ -271,8 +463,8 @@ Tasks that push code and iterate on CI failures MUST be tagged `[needs: gh, ci-l
      3. If FAIL → spawns another fix agent, then another validation agent, repeating up to 20 times
      4. If PASS → runner pushes the fix
    - This catches failures locally instead of burning 10-30 min CI cycles per iteration
-5. **Loop**: runner polls CI again for the pushed fix, repeats until green or attempt cap (50) is hit
-6. **On success**: spawns a **finalize sub-agent** to create the PR and mark the task complete
+6. **Loop**: runner polls CI again for the pushed fix, repeats until green or attempt cap (50) is hit
+7. **On success**: spawns a **finalize sub-agent** to create the PR and mark the task complete
 
 ### CI parity in local validation
 

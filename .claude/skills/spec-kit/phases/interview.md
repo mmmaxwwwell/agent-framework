@@ -4,7 +4,7 @@ You are conducting a specification interview for a new project or feature. Your 
 
 ## Preset awareness
 
-Check `interview-notes.md` (if it exists) for a `preset:` line, or ask the user which preset they chose. Then read the corresponding preset file from `presets/<preset>.md` (relative to the spec-kit skill directory). The preset overrides the interview behavior below — it tells you what to skip, what to default without asking, how many questions to ask, and what interview style to use. **Follow the preset overrides.** The topic checklist below is the full enterprise list; the preset narrows it.
+Check `interview-notes.md` (if it exists) for a `preset:` line, or ask the user which preset they chose. Then read the corresponding preset file from `presets/<preset>.md` (relative to the spec-kit skill directory). The preset overrides the interview behavior below — it tells you what to skip, what to default without asking, and what interview style to use. **Follow the preset overrides.** The topic checklist below is the full enterprise list; the preset narrows it. Every preset requires exhaustive coverage of its applicable topics — keep probing until there are no gaps.
 
 ## Your Approach
 
@@ -145,6 +145,19 @@ For each topic below, present the enterprise-grade default, let the user accept 
 - Real-time update requirements
 - Platform targets (web, mobile, PWA, desktop, Android, iOS)
 - Accessibility requirements
+
+### Platform runtime and E2E testing topics (if the project targets Android, iOS, web/PWA, or desktop)
+
+These questions capture the information needed to design comprehensive E2E tests that exercise the real app on a real runtime. Without this, agents write tests that pass on the host but miss real-world failures.
+
+- **Target runtimes**: "Which platforms does this run on? Android, iOS, web browser, desktop, or multiple?" For each platform, determine: minimum OS/API version, required device capabilities (GPU, biometrics, NFC, camera), deployment form (APK, IPA, PWA, Electron, Tauri).
+- **Cross-runtime communication**: "Do different parts of the system communicate across runtimes?" Examples: phone app talking to a host daemon over a network, PWA talking to a server over WebSocket, desktop app talking to a browser extension. For each cross-runtime path, determine: protocol (gRPC, HTTP, WebSocket, IPC), discovery mechanism (Tailscale, mDNS, hardcoded), and authentication (mTLS, tokens, none).
+- **Hardware-dependent features**: "Which features depend on hardware that can't be emulated?" For each: camera (QR scanning, photo capture), biometrics (fingerprint, face), NFC/Bluetooth, GPS, hardware security module (Android Keystore, iOS Secure Enclave, TPM), accelerometer/gyroscope. For each hardware feature, ask: "Can we bypass this in tests? What would the bypass look like?" (deep link for camera, mock biometric for fingerprint, software keystore fallback, etc.)
+- **First-launch flow**: "Walk me through what happens the first time a user opens the app. What permissions are requested? What configuration is needed? What downloads or initializations happen?" This is critical for E2E test design — the first-launch flow is where most user-facing bugs hide.
+- **Multi-device scenarios**: "Does the system involve multiple devices working together? If so, how do they discover each other and what's the pairing flow?" This determines whether E2E tests need multi-runtime orchestration (e.g., Android emulator + host daemon + mesh network).
+- **Offline behavior**: "What happens when the network is unavailable? Does the app work offline, degrade gracefully, or fail?" For PWAs especially: service worker caching, IndexedDB persistence, sync-on-reconnect.
+
+Document all answers in `interview-notes.md` under a `## Platform Runtime & E2E` section. This information flows directly into the plan's testing strategy and the task list's E2E gap analysis.
 
 ---
 

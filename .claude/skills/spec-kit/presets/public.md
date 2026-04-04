@@ -38,7 +38,7 @@
 - Domain and HTTPS strategy (Let's Encrypt, Cloudflare, etc.)
 - Operational workflows — day-1 setup, day-2 operations, failure recovery for the deployed service
 
-**Interview style**: 8-12 questions. Focus on core features, security posture, and data durability. Present security defaults as non-negotiable ("since this is public-facing, I'm including X") and let the user push back if they want.
+**Interview style**: Be exhaustive — cover every applicable topic until the spec has no gaps. Focus on core features, security posture, and data durability. Present security defaults as non-negotiable ("since this is public-facing, I'm including X") and let the user push back if they want.
 
 ## Spec phase overrides
 

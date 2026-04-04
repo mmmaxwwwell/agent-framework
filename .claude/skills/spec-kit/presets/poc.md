@@ -35,7 +35,7 @@
 - Non-goals — ask "anything this should deliberately NOT do?" One or two exclusions prevent scope creep even in a POC.
 - Edge cases for core happy-path flows — ask "what should happen when X fails?" for each major flow. Skip exhaustive failure mode enumeration, but don't skip edge cases entirely — agents need these answers when they encounter ambiguity during implementation.
 
-**Interview style**: 3-5 questions max. Propose aggressively — suggest the simplest viable architecture and ask "does this work?" rather than exploring options. Default to the user's stack if stated, otherwise pick the most productive stack for the domain.
+**Interview style**: Be exhaustive — cover every applicable topic until the spec has no gaps. Propose aggressively — suggest the simplest viable architecture and ask "does this work?" rather than exploring options. Default to the user's stack if stated, otherwise pick the most productive stack for the domain.
 
 ## Spec phase overrides
 

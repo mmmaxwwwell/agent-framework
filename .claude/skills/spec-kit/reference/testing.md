@@ -37,6 +37,7 @@ The fix-validate loop depends on **structured, machine-readable test output**. W
 3. **`failures/<test-name>.log`** per failing test: assertion details (expected vs actual), full stack trace, and relevant context (server logs, captured stderr, request/response bodies)
 4. **Passing tests**: one-line summary only (name + duration) — don't clutter output
 5. **Custom test reporter**: use the test runner's reporter API (Node.js native test runner custom reporter, JUnit RunListener, pytest plugin, etc.) to produce this format
+6. **Non-vacuous assertion**: after producing `summary.json`, the test harness or CI step MUST verify that `pass + fail > 0`. A summary reporting 0 passed / 0 failed means tests didn't run — this MUST be treated as a failure, not a pass. See `reference/cicd.md` § "Non-vacuous CI validation" for the CI-level enforcement pattern.
 
 Example `summary.json`:
 ```json
@@ -104,6 +105,31 @@ The `coverage/` directory is the canonical location. Language-specific subdirect
 ### .gitignore
 
 Coverage output directories (`coverage/`, `.nyc_output/`, `htmlcov/`, `coverage.out`) are already listed in the SKILL.md `.gitignore` conditional entries — ensure they're added when coverage is configured.
+
+## Acceptance scenario exerciser
+
+The spec's acceptance scenarios (Given/When/Then) are documentation during planning — but after implementation, they become **executable validation criteria**. The post-CI observable output validation phase (see `reference/cicd.md § Observable output validation` and `phases/implement.md § Phase 4`) must attempt to verify each one.
+
+### Classification
+
+For each acceptance scenario in the spec, classify by verifiability:
+
+| Type | Examples | Action |
+|------|----------|--------|
+| **Automatically verifiable** | "badge shows MIT" → fetch URL, check SVG; "artifact is downloadable" → `gh run download`; "job fails with ::error::" → `gh run view --log` and grep | Execute and report PASS/FAIL |
+| **CI-verifiable** | "job exits non-zero when 0 tests run" → examine CI run conclusion and logs | Check most recent CI run's logs/artifacts |
+| **Manual** | "biometric prompt appears", "user sees loading state" | List in completion report |
+
+### Execution rules
+
+- Automatically verifiable scenarios are run in a fix-validate loop (10 iterations per scenario)
+- CI-verifiable scenarios are checked against the most recent CI run — if the scenario can't be verified from the run (e.g., the failure condition wasn't triggered), note it as "not exercised in current run" rather than PASS
+- Manual scenarios are listed with specific instructions for human verification
+- A scenario that was verifiable at spec time but can't be verified after implementation (e.g., requires a state that CI doesn't produce) should trigger investigation — the implementation may have missed the requirement
+
+### Integration with post-CI validation
+
+The acceptance scenario exerciser runs as Step 4 of the observable output validation phase (see `phases/implement.md`). It is NOT a replacement for automated tests — it's a final verification that the spec's promises are actually met by the delivered system. Automated tests verify internal correctness; the exerciser verifies external promises.
 
 ## User-flow integration tests
 
@@ -255,6 +281,10 @@ This pattern applies beyond NixOS — any test that starts a background service 
 | Fast, targeted, easy to debug | Slower, broader, catches cascade failures |
 
 Both are needed. Per-boundary tests catch interface bugs quickly. User-flow tests catch the integration gaps that per-boundary tests miss.
+
+## Pre-PR gate
+
+Every project MUST include a single `make pre-pr` (or equivalent) command that runs all quality gates before creating a pull request. This is the repeatable developer action that runs on every future change — not just during initial implementation. See `reference/pre-pr.md` for the complete specification: multi-build-system discovery, non-vacuous assertions, CI workflow validation, E2E integration, and preset behavior.
 
 ### When to write them
 
@@ -569,6 +599,12 @@ During the plan phase, for every project with performance goals in the spec:
 4. Plan microbenchmarks for performance-critical components (`*testing.B` style)
 5. Choose a CI benchmarking tool and configure regression thresholds
 6. Decide whether microbenchmark regressions block merges or just warn
+
+## Real-runtime E2E testing
+
+When a project targets a platform with its own runtime (Android, iOS, web browser, desktop), E2E tests MUST exercise the real app on the real (or emulated) runtime — not a simulated environment (Robolectric, jsdom, etc.). See `reference/e2e-runtime.md` for the complete guide: runtime selection table, side-by-side architecture, readiness checks, test bypass mechanisms for hardware features, UI automation patterns, multi-runtime orchestration, flakiness handling, and CI infrastructure per runtime.
+
+The `e2e-runtime.md` reference is **mandatory reading** for any project that targets Android, iOS, web/PWA, or desktop platforms. Load it during the plan phase when designing the E2E test strategy.
 
 ## E2E test harness requirements
 

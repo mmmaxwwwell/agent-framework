@@ -38,7 +38,7 @@
 - Edge cases for API misuse — what happens when consumers pass wrong types, call methods in wrong order, exceed limits?
 - Platform compatibility (Node-only? Browser-compatible? Isomorphic?)
 
-**Interview style**: 8-12 questions. Focus on API design, consumer experience, and compatibility guarantees. Propose sensible defaults and confirm.
+**Interview style**: Be exhaustive — cover every applicable topic until the spec has no gaps. Focus on API design, consumer experience, and compatibility guarantees. Propose sensible defaults and confirm.
 
 ## Spec phase overrides
 

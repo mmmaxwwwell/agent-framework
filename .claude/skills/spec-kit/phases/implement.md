@@ -66,13 +66,33 @@ The validation agent MUST NOT assume there is a single build command. Before run
 | Manifest | Build system | Build command | Test command |
 |----------|-------------|---------------|-------------|
 | `go.mod` | Go | `go build ./...` | `go test ./...` |
-| `build.gradle.kts` / `build.gradle` | Gradle | `./gradlew assemble` | `./gradlew test` |
+| `build.gradle.kts` / `build.gradle` (non-Android) | Gradle | `./gradlew assemble` | `./gradlew test` |
+| `build.gradle.kts` / `build.gradle` with `com.android.*` plugin | Android/Gradle | `./gradlew assembleDebug` | `./gradlew testDebugUnitTest && ./gradlew connectedDebugAndroidTest` (requires running emulator) |
 | `Cargo.toml` | Cargo | `cargo build` | `cargo test` |
 | `package.json` | npm/pnpm/yarn | `npm run build` | `npm test` |
 | `pyproject.toml` / `setup.py` | Python | `python -m build` | `pytest` |
 | `CMakeLists.txt` | CMake | `cmake --build build/` | `ctest --test-dir build/` |
 | `flake.nix` | Nix | `nix build` | `nix flake check` |
 | `Makefile` | Make | `make build` | `make test` |
+
+**Real-runtime E2E requirement (MANDATORY for platform-targeting projects):**
+
+If the project targets a platform runtime (Android, iOS, web/PWA, desktop), the validation agent MUST test on the real (or emulated) runtime — not a simulated environment. See `reference/e2e-runtime.md` for the complete guide covering all platform runtimes.
+
+**Android specifically:** If `build.gradle.kts` applies a `com.android.application` or `com.android.library` plugin, the validation agent MUST boot an emulator and run instrumented tests — not just JVM unit tests. `./gradlew test` runs JVM-only unit tests that execute on the host without an Android runtime. These tests can pass with stub/mock native libraries, missing resources, and broken runtime behavior. `./gradlew connectedDebugAndroidTest` runs instrumented tests on an actual Android runtime and catches all of these. **Both must pass for validation to succeed.**
+
+**Web/PWA specifically:** If the project has a web UI, use a real headless browser (Playwright with Chromium/Firefox/WebKit), NOT jsdom or happy-dom. jsdom doesn't implement Web Crypto, Service Workers, real CSS rendering, or real fetch networking. Tests that pass on jsdom but break in Chrome are worse than no tests.
+
+Emulator/browser setup: see `reference/e2e-runtime.md` for readiness checks, boot timeouts, CI infrastructure, and flakiness handling per runtime type. If no setup script exists, the validation agent creates one following the patterns in that reference.
+
+**Why this matters:** The most common agent failure mode in platform-targeting projects is: native bridge/library is broken → agent creates a stub that makes host-side tests pass → real-runtime tests are never run → app crashes at runtime. Running on the real runtime catches this structurally because stubs crash in the real environment.
+
+**Cross-language artifact verification (MANDATORY for multi-language projects):**
+
+When one build system produces an artifact consumed by another (gomobile AAR consumed by Gradle, Rust FFI .so consumed by Python, WASM consumed by JS), the validation agent MUST verify the artifact contains real implementation code:
+1. **Inspect the artifact**: for AAR/JAR files, run `jar tf <file>` and verify it contains expected native libraries (`.so` files for AAR) or compiled classes with real method bodies. For `.so`/`.dylib` files, run `nm -D <file>` and verify exported symbols exist. For WASM files, verify the file size is non-trivial (>10KB for any real implementation).
+2. **Exercise a cross-language code path**: the instrumented tests or smoke test MUST call a function that crosses the language boundary (e.g., Kotlin calling Go via gomobile, Python calling Rust via FFI) and verify it returns a real result — not just that the call doesn't throw.
+3. **A stub artifact that makes the compiler happy but would crash at runtime is a build FAILURE**, not a workaround. If the real build tool is broken (e.g., gomobile incompatible with the Go version), the agent must fix the build tool (update it, patch it, use a different approach) or write BLOCKED.md. Creating a stub is a rationalized failure.
 
 **Discovery rules:**
 1. Scan the project root AND immediate subdirectories (e.g., `android/build.gradle.kts` in a Go+Android project)
@@ -103,6 +123,8 @@ The following rationalizations are PROHIBITED:
 - "This security finding is not relevant to our use case" — suppress with an inline justification comment (see security scan rules), don't ignore it
 - "CI will catch this later" — local validation exists precisely to catch it NOW
 - "The Gradle/Cargo/npm failure is expected because we haven't implemented X yet" — if X is in the task list and the phase depends on it, the phase must not pass until X works
+- "I created a stub/mock artifact because the real build tool is broken" — if the real build tool is broken, fix the build tool (update it, patch it, find a compatible version). A stub artifact is a rationalized failure that makes the compiler happy while the app crashes at runtime. This is the worst kind of rationalization because it passes ALL static checks (build, lint, unit tests) and only fails when a human or emulator actually runs the app.
+- "JVM unit tests pass so Android is working" — `./gradlew test` runs on the host JVM without Android runtime. It cannot detect missing native libraries, broken JNI bindings, or stub artifacts. Instrumented tests on an emulator (`./gradlew connectedDebugAndroidTest`) are required.
 
 **Why this rule exists:** Agents are trained to be helpful and accommodating. When faced with a failing build they can't easily fix, the path of least resistance is to explain why it's OK and move on. This is the single most common cause of broken releases — the agent rationalizes a failure, marks the phase done, and the broken build propagates to CI where it fails in front of humans. The rule is absolute: failures are fixed or blocked, never rationalized.
 
@@ -346,6 +368,25 @@ For each primary user flow from the spec:
 
 After local smoke passes:
 
+#### Step 0: Verify CI workflow changes locally (if workflows were modified)
+
+**MANDATORY if any task in this feature modified `.github/workflows/*.yml` files.**
+
+Before reproducing CI, verify that the workflow changes themselves are correct by running every command they reference:
+
+1. **Parse modified workflow files** — for each `run:` block that was added or changed, extract the shell commands. Group them by CI job (test-host, test-android, security, etc.).
+2. **Run each CI job's commands in parallel sub-agents** — each build system is independent. The Go build, Android build, and security scans don't depend on each other. Spawn parallel sub-agents, one per CI job:
+   - **Sub-agent A (Go/host)**: run `nix build`, `go test`, verify `result/bin/nix-key` exists, verify `test-logs/ci/latest/summary.json` exists with `passed + failed > 0`
+   - **Sub-agent B (Android)**: run `./gradlew assembleDebug testDebugUnitTest`, verify APK exists at expected path, verify JUnit XML exists with >0 tests
+   - **Sub-agent C (Security)**: run each scanner command, verify JSON output files exist and are >10 bytes
+   - Additional sub-agents for any other modified CI jobs
+3. **Each sub-agent runs a fix-validate loop independently.** When a command fails, the sub-agent diagnoses the root cause, fixes it (add missing dep to `flake.nix`, fix Gradle config, correct artifact path in ci.yml, etc.), and re-runs. 20-iteration cap per sub-agent, then `BLOCKED.md`.
+4. **All sub-agents must pass before proceeding.** A Gradle failure does not block the Go verification from running — they proceed in parallel. But ALL must pass before pushing to CI.
+
+**Why parallel**: A sequential approach where one failure blocks all subsequent checks wastes time. The Go build might pass in 30 seconds while the Gradle build takes 5 minutes to diagnose and fix. Running them in parallel means the Go verification is already done by the time the Gradle fix completes.
+
+**Why this is separate from Step 1**: Step 1 reproduces what CI *currently* runs. Step 0 verifies what CI *will* run after the workflow changes. If you skip Step 0, you push workflow changes that reference commands that don't work, and discover this only after a 10-30 minute CI cycle.
+
 #### Step 1: Reproduce CI locally FIRST
 
 Before pushing, run the same checks CI would run — locally. Most CI failures are reproducible without a remote runner. Fix everything you can find before burning a push+CI cycle.
@@ -383,6 +424,105 @@ Before pushing, run the same checks CI would run — locally. Most CI failures a
    - CI runner differences (older glibc, missing system libs not in Nix closure — add to flake `buildInputs`)
    - Timeout differences (CI runners are slower — increase test timeouts for integration tests)
 5. **No hard cap** — same rules as smoke test: keep going as long as there's forward progress. Only write `BLOCKED.md` if stuck in circles or genuinely blocked (missing secrets, permissions, etc.).
+
+#### Step 3: Verify `workflow_run` chains (MANDATORY)
+
+For every workflow that uses `workflow_run` as a trigger (e.g., E2E tests triggered after CI passes), verify end-to-end that the chain actually fires:
+
+1. **After the triggering workflow passes**, use `gh run list --workflow=<downstream.yml>` to confirm the downstream workflow was triggered.
+2. **Check the downstream workflow's conclusion** — `success`, not `skipped` or `failure`. A downstream workflow that was skipped because the `if: conclusion == 'success'` gate never saw a successful upstream run is NOT "passing" — it's untested.
+3. **If the downstream was never triggered or was always skipped**: push a new commit (even a no-op like a comment change) to trigger the full chain. Wait for both the upstream and downstream workflows to complete.
+4. **If the downstream workflow fails**: diagnose and fix locally (re-run its commands), push, and re-verify the full chain.
+5. **Do not mark CI/CD tasks complete until every workflow in every `workflow_run` chain has run at least once with a `success` conclusion.** A workflow that has never run green is not validated — it's untested code.
+
+### Phase 4: Observable Output Validation (fix-validate loop)
+
+After CI passes, the system is "working" from a code perspective. But code passing tests is not the same as the system being **observably correct** from outside. This phase validates everything a user, contributor, or automated service would see when interacting with the project — not just the code.
+
+**Why this exists**: Agents consistently declare victory after CI is green, missing an entire class of problems: badges that 404, artifacts that aren't downloadable, release pipelines that have never run, workflow triggers that reference stale files on the default branch, license detection that fails because files only exist on feature branches. These are the bugs that make a project look broken to anyone who visits the repo.
+
+#### Step 1: README and badge validation
+
+If the project has a README with badges:
+
+1. **Extract every badge URL** from README.md (both `img.shields.io` and GitHub Actions badge URLs)
+2. **Fetch each badge URL** using `curl -sI` or `curl -s` and check:
+   - HTTP status is 200 (not 404, not redirect to error page)
+   - For shields.io badges: the response SVG does not contain error text ("not found", "invalid", "not specified", "no releases")
+   - For GitHub Actions badges: the badge SVG shows a valid status ("passing", "failing") not "no status" or 404
+3. **For each broken badge**, determine the root cause:
+   - **Workflow badge 404**: the workflow file doesn't exist on the default branch. Fix: ensure the PR/merge brings the workflow to the default branch.
+   - **License badge "not specified"**: LICENSE file doesn't exist on the default branch. Fix: ensure LICENSE is included in the merge.
+   - **Release badge "no releases"**: no GitHub releases exist. Fix: verify release-please config and that the release workflow will trigger on merge.
+   - **Coverage badge error**: coverage service not configured. Fix: add the integration or remove the badge.
+4. **Fix-validate loop**: fix the cause, re-fetch the badge, repeat until all badges return valid responses. Cap: 10 iterations.
+
+**Note**: Some badges (release version, coverage) may not be fixable until after a merge/release. In that case, verify the **preconditions** are met: the config files exist, the workflow is correct, the trigger conditions match. Document which badges will self-heal on merge vs which need immediate fixes.
+
+#### Step 2: Artifact availability validation
+
+For every `upload-artifact` step in CI workflows:
+
+1. **After CI passes**, use `gh run view <run_id> --json artifacts` to list artifacts from the run
+2. **Verify each expected artifact exists** — cross-reference against every `actions/upload-artifact` step in the workflow YAML
+3. **Download and verify** at least one artifact to confirm it's not empty/corrupt: `gh run download <run_id> -n <artifact-name>`
+4. **For release workflows**: verify the release workflow's artifact upload steps reference paths that actually exist after the build steps run
+
+If artifacts are missing:
+- Check if the upload step has `if:` conditions that prevented it from running
+- Check if the build step that produces the artifact actually ran (non-vacuous validation)
+- Fix and re-push
+
+#### Step 3: Default branch readiness check
+
+Before creating a PR to the default branch (usually `main`), verify that the merge will bring everything the default branch needs:
+
+1. **List what's on the default branch**: `gh api repos/{owner}/{repo}/git/trees/{default_branch}?recursive=1 --jq '.tree[].path'`
+2. **Compare with what the project needs on the default branch**:
+   - All workflow files (`.github/workflows/*.yml`) — required for workflow badges, `workflow_run` triggers, and release automation
+   - LICENSE file — required for license badge detection via GitHub API
+   - README.md — required for repository landing page
+   - Release config files (e.g., `release-please-config.json`, `.release-please-manifest.json`) — required for release automation
+   - Package manifests (`package.json`, `go.mod`, `Cargo.toml`, etc.) — required for dependency scanning services
+3. **For `workflow_run` triggers**: verify that the workflow being triggered exists on the default branch, not just on the feature branch. GitHub uses the default branch's version of the workflow file for `workflow_run` events. If the triggered workflow only exists on develop, it will use a stale/nonexistent version from the default branch, causing failures.
+4. **Flag any gaps** — if the default branch is missing critical files, note that the PR must include them and verify after merge.
+
+#### Step 4: Acceptance scenario exerciser
+
+Parse the spec's acceptance scenarios (Given/When/Then format) and attempt to verify each one:
+
+1. **Read the spec** and extract all acceptance scenarios
+2. **Classify each scenario** by verifiability:
+   - **Automatically verifiable**: can be checked via CLI commands, API calls, URL fetches, file existence checks (e.g., "badge shows MIT" → fetch badge URL and check SVG content)
+   - **CI-verifiable**: can be checked by examining CI run results (e.g., "job fails with ::error::" → check CI logs for the annotation)
+   - **Requires manual verification**: needs human judgment or physical interaction (e.g., "biometric prompt appears on phone")
+3. **Execute every automatically verifiable scenario** and report PASS/FAIL
+4. **For CI-verifiable scenarios**: check the most recent CI run's logs/artifacts
+5. **For manual scenarios**: list them in the completion report as "requires manual verification"
+
+Fix-validate loop: if an automatically verifiable scenario fails, diagnose why, fix the underlying issue, and re-verify. Cap: 10 iterations per scenario.
+
+#### Step 5: Cross-system integration check
+
+Verify that systems that depend on each other are correctly wired:
+
+1. **GitHub API metadata**: fetch `gh api repos/{owner}/{repo}` and verify:
+   - `.license.spdx_id` is not null (LICENSE file detected)
+   - `.description` is set (repo description exists)
+   - `.topics` are set (if applicable)
+2. **Workflow trigger chains**: for every `workflow_run` trigger, verify:
+   - The referenced workflow name matches an actual workflow's `name:` field
+   - The referenced workflow exists on the default branch (not just the feature branch)
+   - The `branches:` filter matches the branches where the triggering workflow runs
+3. **Release automation**: if release-please or similar is configured:
+   - Config files reference the correct release type for the project
+   - Manifest version matches expectations (e.g., `0.0.0` for a new project)
+   - The release workflow's `if: release_created` conditions are correct
+4. **Security scanning services**: if SARIF uploads are configured:
+   - The repository has GitHub Advanced Security enabled (or is public)
+   - Each scanner's SARIF upload step has the correct `category:` to avoid collisions
+
+Any failures in this step indicate configuration issues that would surface as broken badges, failed workflows, or missing release artifacts. Fix them before finalizing.
 
 ### Bug taxonomy for smoke test troubleshooting
 

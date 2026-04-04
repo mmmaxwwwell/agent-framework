@@ -61,6 +61,8 @@ Example:
 | DX tooling | `reference/dx.md` | Full script inventory, dev server config, Nix flake setup, debugging configs, CLAUDE.md section |
 | README.md | `reference/readme.md` | Section structure, cognitive funneling, badges, quality checklist, preset behavior |
 | Database seed script | `reference/migration.md` | Idempotent migrations, seed script pattern, admin process parity |
+| Pre-PR gate | `reference/pre-pr.md` | Single-command validation, multi-build discovery, non-vacuous checks, CI workflow validation |
+| Real-runtime E2E testing | `reference/e2e-runtime.md` | Emulator/browser/simulator patterns, side-by-side architecture, readiness checks, test bypass, UI automation |
 
 **Skip loading reference files for topics the preset says to skip.** But for any foundational task you're writing, load its reference first so the task description is specific enough for an implementing agent to execute without guessing.
 
@@ -148,6 +150,9 @@ These checkpoints fill the gap between per-phase user-flow tests (within-phase o
 ### End-to-end validation phase
 Include a late-phase task that runs ALL user-flow integration tests together after all per-phase tests pass. This catches cross-feature interactions and cascade failures that per-phase testing misses. The test should exercise every primary user flow from the spec in sequence.
 
+### Real-runtime E2E tests (if project targets a platform runtime)
+Load `reference/e2e-runtime.md` before writing E2E tasks for projects targeting Android, iOS, web/PWA, or desktop platforms. The reference defines: runtime selection (real emulator/browser, never simulated), side-by-side architecture for multi-runtime tests, readiness checks, test bypass mechanisms for hardware features, UI automation patterns, flakiness handling, and CI infrastructure. Follow the task generation guidance in that reference — decompose E2E prerequisites into separate infrastructure tasks (artifact build, environment setup, test bypass, UI helper library) before writing the E2E test task itself.
+
 ### Build environment gap analysis (MANDATORY)
 
 Before the E2E gap analysis, verify that every tech stack in the project has its build tools accounted for in Phase 1 (test infrastructure / flake setup). Multi-language projects are the most common source of "command not found" blockers — the Nix flake covers the primary language but silently omits secondary stacks.
@@ -162,6 +167,8 @@ Before the E2E gap analysis, verify that every tech stack in the project has its
 If ANY of these checks fail, add the missing task(s) to Phase 1 with explicit dependencies from every later phase that uses the missing tool.
 
 ### E2E test harness gap analysis (MANDATORY)
+
+**Load `reference/e2e-runtime.md` before performing this analysis** if the project targets any platform runtime (Android, iOS, web/PWA, desktop). The reference defines the full infrastructure stack for real-runtime E2E testing.
 
 Before finalizing the task list, perform an explicit gap analysis on the E2E and CI/CD phases. E2E tests are the most likely to leave implementing agents blocked because they require infrastructure that earlier phases don't need. For each E2E test in the task list, verify that **every prerequisite** has its own task. Walk through this checklist:
 
@@ -200,6 +207,13 @@ For every feature that involves async initialization (model loading, dependency 
 - Handle initialization failures gracefully (show error with actionable guidance, not a cryptic crash)
 - Test the initialization sequence explicitly: verify the state transitions (idle → preparing → ready, and idle → preparing → error)
 
+### Pre-PR gate (foundational phase)
+Load `reference/pre-pr.md` before writing this task. Every project (except poc preset) MUST include a `make pre-pr` (or equivalent) target that runs all quality gates in a single command: build all stacks → test all suites → lint → security scan → non-vacuous assertion → E2E (if applicable) → CI workflow check (if modified). This target is the repeatable action that developers and agents run before every future PR — not just during initial implementation.
+
+Include two tasks:
+1. **Foundational phase**: Create the `pre-pr` target with build + test + lint + security + non-vacuous checks
+2. **Late phase (after E2E infrastructure exists)**: Wire E2E tests into the `pre-pr` target with timeout and retry wrapper
+
 ### Local smoke test phase (post-implementation)
 After all automated tests pass and code review is clean, include a final phase with these tasks:
 1. **Build artifact** — build the distributable package (VSIX, wheel, tarball, container, binary)
@@ -219,14 +233,54 @@ After local smoke passes, include a task to generate `README.md`. Load `referenc
 
 The preset controls which sections to include — see `reference/readme.md § Preset behavior`. POC gets a minimal README; enterprise gets everything.
 
+### CI workflow local verification (MANDATORY before CI loop)
+
+**When any task modifies CI workflow files** (`.github/workflows/*.yml`), the phase MUST include a local verification task **before** the CI loop task. This task runs every build/test command that the modified workflow references — locally, not in CI. This catches broken build commands, missing artifacts, wrong paths, and misconfigured steps before burning CI cycles.
+
+**Split into parallel sub-tasks by build system / CI job.** Each CI job's commands are independent and MUST run in parallel sub-agents. Do NOT put all builds in one sequential task — a Gradle failure shouldn't block Go verification, and vice versa.
+
+```
+- [ ] T0XX-a [P] Verify [primary build system] CI steps locally (fix-validate loop): run [build command], [test command]. Verify artifact path exists, test output files exist with >0 results. On failure: fix and retry.
+  Done when: build succeeds, tests pass with non-zero count, artifact paths verified. Fix-validate loop, 20-iteration cap.
+
+- [ ] T0XX-b [P] Verify [secondary build system] CI steps locally (fix-validate loop): run [build command], [test command]. Verify artifact path exists, test output files exist with >0 results. On failure: fix and retry.
+  Done when: build succeeds, tests pass with non-zero count, artifact paths verified. Fix-validate loop, 20-iteration cap.
+
+- [ ] T0XX-c [P] Verify [security/other] CI steps locally (fix-validate loop): run [scanner/tool commands]. Verify output files exist and are non-empty. On failure: fix and retry.
+  Done when: all tools produce expected output. Fix-validate loop, 20-iteration cap.
+```
+
+Generate one sub-task per CI job that was modified, marked `[P]` for parallel execution. The runner spawns parallel sub-agents — one per build system. The CI loop task (`[needs: gh, ci-loop]`) depends on ALL sub-tasks completing.
+
+**Each sub-task uses a fix-validate loop.** The agent does NOT just report failures — it fixes them. Common fixes:
+- Missing build tool → add to `flake.nix` devShell or install
+- Gradle build fails → fix `build.gradle.kts`, missing SDK, wrong Java version
+- Artifact path wrong in ci.yml → update the `path:` in `upload-artifact` to match actual build output
+- Test output missing → fix test runner config, verify reporter writes expected files
+- Tool not found (`jq`, `bc`) → add to `flake.nix` buildInputs
+
+Each sub-task has a 20-iteration cap. If still failing after 20 iterations, write `BLOCKED.md`.
+
+**Why this is separate from phase validation**: The phase validation agent runs build+test+lint on the project's source code. But if the tasks only edit CI YAML (adding steps, changing paths, adding artifact uploads), the source code hasn't changed — phase validation sees "nothing to build" and passes. Meanwhile, the new CI steps reference commands like `./gradlew assembleDebug` or `nix build` that may not work. The local verification task explicitly runs those commands.
+
+**What to verify**:
+1. **Every `run:` command** added or modified in workflow YAML — execute it locally
+2. **Every artifact path** in `actions/upload-artifact` steps — run the producing build command, verify the file exists at the expected path
+3. **Every test verification step** (non-vacuous checks) — run the test suite, verify the expected output files exist (JUnit XML, summary.json, scanner JSON)
+4. **Every tool referenced** in new steps (`jq`, `bc`, `find`, `grep`, `curl`) — verify it's available in the environment
+
+If the project has multiple build systems (Go + Gradle, Rust + npm), verify ALL of them — not just the primary one. A project with `go.mod` and `android/build.gradle.kts` must pass both `go build ./...` AND `./gradlew assembleDebug`.
+
 ### CI/CD validation phase (post-smoke)
-After local smoke passes, create a **single CI validation task** marked `[needs: gh, ci-loop]`:
+After local smoke passes (and CI workflow local verification, if applicable), create a **single CI validation task** marked `[needs: gh, ci-loop]`:
 
 ```
-- [ ] T0XX [needs: gh, ci-loop] CI/CD validation: push to branch, iterate until CI green (including security scans), create PR
+- [ ] T0XX [needs: gh, ci-loop] CI/CD validation: local validation first (parallel fix-validate subagents for each build system), then push to branch, iterate until CI green (including security scans), create PR
 ```
 
-**Note**: By this point, the local fix-validate loop has already caught and fixed security findings during every phase. The CI security scan is a final gate — it should pass on the first push if the local scanners used the same configs. If CI security fails, the ci-loop diagnose/fix agents handle it the same as any other CI failure.
+**Note**: By this point, the local fix-validate loop has already caught and fixed security findings during every phase, and any CI workflow changes have been verified locally. The CI security scan is a final gate — it should pass on the first push if the local scanners used the same configs. If CI security fails, the ci-loop diagnose/fix agents handle it the same as any other CI failure.
+
+**Phase placement rule**: The `[needs: gh, ci-loop]` task MUST be in a separate phase from the local CI verification tasks (T0XX-a, T0XX-b, T0XX-c). If other phases depend on the verification tasks completing (e.g., an Android emulator phase that needs the build verification to pass first), putting the ci-loop task in the same phase as the verification tasks creates a circular dependency: the downstream phase waits for the ci-loop phase to complete, but the ci-loop task waits for downstream tasks. The runner deadlocks with "No agents running." See `reference/phase-deps.md § Avoiding circular phase dependencies`.
 
 The `ci-loop` tag activates a runner-managed debug cycle (see `reference/cicd.md § Agentic CI feedback loop`):
 
@@ -238,6 +292,29 @@ The `ci-loop` tag activates a runner-managed debug cycle (see `reference/cicd.md
 All artifacts are written to `ci-debug/<task_id>/` so sub-agents can read prior history without inflating context. The cycle has a 15-attempt cap; after that, the runner writes `BLOCKED.md`.
 
 **All CI/CD tasks that use `gh` commands MUST be marked `[needs: gh]`.**  The runner injects a short-lived GH_TOKEN env var only for these tasks. Tasks without this marker never see the token. If an agent discovers it needs `gh` access mid-task, it writes `[needs: gh]` in `BLOCKED.md` and the runner auto-grants and retries.
+
+### Observable output validation phase (post-CI)
+
+After CI passes, create an **observable output validation task** marked `[needs: gh]`. This phase validates everything visible to users, contributors, and external services — not just that code compiles and tests pass.
+
+```
+- [ ] T0XX [needs: gh] Observable output validation: verify README badges render correctly, CI artifacts are downloadable, default branch has all required files for workflow triggers and service integrations, acceptance scenarios are exercised. Fix-validate loop.
+```
+
+This task exercises the checks described in `phases/implement.md § Phase 4: Observable Output Validation`:
+
+1. **Badge validation** — fetch every badge URL from README, verify HTTP 200 and valid SVG content (not "not found", "not specified", 404). Fix causes of broken badges.
+2. **Artifact validation** — use `gh run view` to verify every expected artifact was uploaded and is downloadable. Download at least one to confirm non-empty.
+3. **Default branch readiness** — before creating a PR to main, verify the PR will bring: workflow files, LICENSE, README, release config, package manifests. Check that `workflow_run` triggers reference workflows that will exist on the default branch after merge.
+4. **Acceptance scenario exerciser** — parse spec's Given/When/Then scenarios, classify as automatically verifiable / CI-verifiable / manual, execute all automatable ones and report PASS/FAIL.
+5. **Cross-system integration** — verify GitHub API metadata (license detection, repo description), workflow trigger chains (`workflow_run` references), release automation config, SARIF upload categories.
+
+**Fix-validate loop**: 10 iterations per check category. If a badge is broken because the default branch is empty, the fix is ensuring the PR brings the needed files — not a code change.
+
+**Preset behavior**:
+- **poc**: Skip this phase entirely — no badges, no CI, no release automation
+- **local**: Badge + artifact checks only (no release automation, no cross-system)
+- **library/extension/public/enterprise**: Full observable output validation
 
 ### Code review task
 When the last implementation task completes, append a `REVIEW` task. See `phases/implement.md` for how the runner handles this.
