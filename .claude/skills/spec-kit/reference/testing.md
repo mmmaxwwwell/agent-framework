@@ -38,6 +38,7 @@ The fix-validate loop depends on **structured, machine-readable test output**. W
 4. **Passing tests**: one-line summary only (name + duration) — don't clutter output
 5. **Custom test reporter**: use the test runner's reporter API (Node.js native test runner custom reporter, JUnit RunListener, pytest plugin, etc.) to produce this format
 6. **Non-vacuous assertion**: after producing `summary.json`, the test harness or CI step MUST verify that `pass + fail > 0`. A summary reporting 0 passed / 0 failed means tests didn't run — this MUST be treated as a failure, not a pass. See `reference/cicd.md` § "Non-vacuous CI validation" for the CI-level enforcement pattern.
+7. **Skip-as-failure assertion**: a test run that contains any skipped tests MUST be treated as a failure, not a pass. Skipped tests mean the environment is broken or a dependency is missing — the test suite is giving false confidence. If a test genuinely cannot run on a platform (e.g., iOS tests on Linux), it should not be included in the test list for that platform at all — use conditional test registration, not runtime skips. The test harness MUST enforce this: if `skip > 0`, the run fails. See `reference/cicd.md` § "Skip-as-failure CI validation" for the CI-level enforcement pattern.
 
 Example `summary.json`:
 ```json

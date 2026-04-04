@@ -118,6 +118,52 @@ A common anti-pattern (and what caused this rule): the job summary step parses t
 
 The fix is structural: **the verification step must be a separate step with `exit 1`**, not part of a summary step that only writes markdown. Summary steps exist for humans reading the Actions UI. Verification steps exist for the merge gate.
 
+## Skip-as-failure CI validation
+
+A test suite that reports "4 pass, 0 fail, 1 skip" is **not green** — it means a dependency is missing, an environment is misconfigured, or a prerequisite wasn't installed. The skip hides a broken test behind a green checkmark. This is the same class of silent CI rot as vacuous passes, just harder to spot.
+
+**Every test harness MUST treat skipped tests as failures.** If `skip > 0`, the test run MUST exit non-zero.
+
+### Why skips are not acceptable
+
+- A skipped test gives false confidence — the CI badge says "passing" but functionality is untested
+- Skips accumulate silently — one skip becomes five becomes twenty, and nobody notices because the job is green
+- If a test genuinely cannot run on a platform, it should not be in the test list for that platform. Use conditional test registration (platform checks at list-building time, separate test scripts per platform, CI job matrices) instead of runtime skips
+- Runtime skips are appropriate only during local development (e.g., `t.Skip("requires GPU")`) — they MUST NOT pass CI
+
+### Implementation pattern
+
+In the test harness (language-agnostic):
+
+```
+# After computing pass/fail/skip counts:
+if skip > 0:
+    print("ERROR: {skip} test(s) skipped — skips are treated as failures")
+    print("If a test cannot run on this platform, remove it from the test list instead of skipping.")
+    exit(1)
+```
+
+In CI verification steps:
+
+```yaml
+- name: Verify zero skips
+  run: |
+    SKIP=$(jq '.skip' test-logs/summary.json)
+    if [ "${SKIP:-0}" -gt 0 ]; then
+      echo "::error::${SKIP} test(s) were skipped — environment is misconfigured"
+      exit 1
+    fi
+```
+
+### Relationship to `continue-on-error`
+
+`continue-on-error: true` on CI steps has a similar masking effect — it turns red steps green at the job level. Use it **only** for:
+
+- Security scanners during initial baseline establishment (tighten to `false` once baseline is clean)
+- Optional secret-gated steps (e.g., Snyk without `SNYK_TOKEN`)
+
+**Never use `continue-on-error: true` on test execution or test verification steps.** If a test step is flaky, fix the flakiness — don't mask it. If a browser engine (e.g., WebKit) has known issues, either fix the tests to pass or explicitly exclude that engine from the test matrix with a comment explaining why. A green CI badge must mean all included tests actually passed.
+
 ## Security scan reporting
 
 - **SARIF uploads** to the GitHub Security tab for unified findings
@@ -440,6 +486,23 @@ if git diff --name-only origin/HEAD -- .github/workflows/ | grep -q '.'; then
   actionlint .github/workflows/*.yml
 fi
 ```
+
+### Third-party action version pinning
+
+When a task requires a third-party GitHub Action (Trivy, Snyk, CodeQL, etc.):
+
+1. **Check the action's latest release** before writing the workflow:
+   `gh api repos/{owner}/{repo}/releases/latest --jq .tag_name`
+2. **Read the action's `action.yml`** to confirm valid input names:
+   `gh api repos/{owner}/{repo}/contents/action.yml --jq .content | base64 -d`
+3. **Pin the tool version explicitly** if the action has a `version` input —
+   otherwise the action auto-resolves to the latest, which may not have binaries yet.
+4. **`actionlint` catches some input errors** but not all — it validates syntax,
+   not whether a specific version string resolves to a real binary.
+
+This prevents a common failure mode: the action tag exists, the input name is wrong
+or the auto-resolved tool version has no binary, and CI fails with an opaque error
+that takes 2-3 fix cycles to diagnose.
 
 ### Integration with fix-validate loop
 

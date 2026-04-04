@@ -79,6 +79,17 @@ class Phase:
 
 
 @dataclass
+class SubAgentRecord:
+    """Token/time snapshot of a completed sub-agent inside a CI loop."""
+    agent_id: int
+    label: str          # e.g. "fix-1-2", "validate-1-1", "diag-1"
+    input_tokens: int
+    output_tokens: int
+    elapsed_s: int
+    status: str         # "done" or "failed"
+
+
+@dataclass
 class AgentSlot:
     """Tracks a running claude agent."""
     agent_id: int
@@ -93,6 +104,9 @@ class AgentSlot:
     attempt: int = 1  # which attempt this is for the task (1 = first try)
     input_tokens: int = 0     # cumulative input tokens (including cache)
     output_tokens: int = 0    # cumulative output tokens
+    is_ci_loop: bool = False  # True for the virtual CI loop orchestrator slot
+    sub_agent_history: list[SubAgentRecord] = field(default_factory=list)
+    active_sub_agent_id: Optional[int] = None  # agent_id of currently running sub-agent
 
 
 # ── Task file parser ───────────────────────────────────────────────────
@@ -642,8 +656,12 @@ def render_dependency_graph(phases: list[Phase], phase_deps: dict[str, list[str]
             total_tok = a.input_tokens + a.output_tokens
             if total_tok > 0:
                 tok = f" {total_tok // 1000}k tok"
+            prefix = "CI Loop" if a.is_ci_loop else f"Agent {a.agent_id}"
+            sub_info = ""
+            if a.is_ci_loop and a.active_sub_agent_id is not None:
+                sub_info = f" → Agent {a.active_sub_agent_id}"
             agent_strs.append(
-                f"{STATUS_COLORS[TaskStatus.RUNNING]}Agent {a.agent_id}: {a.task.id}{att} ({elapsed}s{tok}){RESET}"
+                f"{STATUS_COLORS[TaskStatus.RUNNING]}{prefix}: {a.task.id}{att}{sub_info} ({elapsed}s{tok}){RESET}"
             )
         header.append(f" Running: {' │ '.join(agent_strs)}")
 
@@ -881,9 +899,24 @@ class TUI:
         att = f" att#{agent.attempt}" if agent.attempt > 1 else ""
         total_tok = agent.input_tokens + agent.output_tokens
         tok = f", {total_tok // 1000}k tok" if total_tok > 0 else ""
-        header = f"Agent {agent.agent_id}: {agent.task.id}{att} ({agent.status}, {elapsed}s{tok})"
+        prefix = "CI Loop" if agent.is_ci_loop else f"Agent {agent.agent_id}"
+        sub_info = ""
+        if agent.is_ci_loop and agent.active_sub_agent_id is not None:
+            sub_info = f" → Agent {agent.active_sub_agent_id}"
+        header = f"{prefix}: {agent.task.id}{att}{sub_info} ({agent.status}, {elapsed}s{tok})"
         pane_lines.append(f"{BOLD}{header[:pane_width]}{RESET}")
-        pane_lines.append("─" * pane_width)
+
+        # For CI loop slots, show sub-agent history as a compact breakdown
+        if agent.is_ci_loop and agent.sub_agent_history:
+            parts = []
+            for rec in agent.sub_agent_history[-6:]:  # last 6 sub-agents
+                rtok = (rec.input_tokens + rec.output_tokens) // 1000
+                mark = "✓" if rec.status == "done" else "✗"
+                parts.append(f"{mark} {rec.label} {rtok}k")
+            hist_line = " │ ".join(parts)
+            pane_lines.append(f"{hist_line[:pane_width]}")
+        else:
+            pane_lines.append("─" * pane_width)
 
         tail = agent.output_lines[-(pane_height - 3):]
         for oline in tail:
@@ -945,7 +978,13 @@ class HeadlessLogger:
             att = f" att#{a.attempt}" if a.attempt > 1 else ""
             total_tok = a.input_tokens + a.output_tokens
             tok = f", {total_tok // 1000}k tok" if total_tok > 0 else ""
-            lines.append(f"  Agent {a.agent_id}: {a.task.id}{att} ({a.status}, {elapsed}s{tok})")
+            prefix = "CI Loop" if a.is_ci_loop else f"Agent {a.agent_id}"
+            lines.append(f"  {prefix}: {a.task.id}{att} ({a.status}, {elapsed}s{tok})")
+            if a.is_ci_loop and a.sub_agent_history:
+                for rec in a.sub_agent_history:
+                    rtok = (rec.input_tokens + rec.output_tokens) // 1000
+                    mark = "✓" if rec.status == "done" else "✗"
+                    lines.append(f"    {mark} Agent {rec.agent_id}: {rec.label} ({rec.elapsed_s}s, {rtok}k tok)")
 
         with open(status_file, "w") as f:
             f.write("\n".join(lines) + "\n")
@@ -2892,6 +2931,10 @@ Write `{debug_dir}/attempt-{attempt}-diagnosis.md` with this structure:
 ## Rules
 
 - Read the CI logs thoroughly before writing
+- Pay special attention to `##[warning]` lines in CI logs — these reveal silent
+  misconfigurations (wrong input names, deprecated features, ignored parameters)
+  that cause actions to fall back to broken defaults. A warning like
+  "Unexpected input(s) 'trivy_version'" IS the root cause, not a side effect.
 - If prior diagnoses exist, note what changed since the last attempt
 - Be specific: "line 42 of .github/workflows/ci.yml references a nonexistent action" not "CI config is wrong"
 - If the same root cause repeats across attempts, flag it as a deeper issue
@@ -2966,6 +3009,17 @@ If a fast check fails after your fix, fix it and re-run. You have up to **3 iter
 fast checks. If fast checks still fail after 3 tries, commit what you have and document the
 remaining issues in `{debug_dir}/attempt-{attempt}-fix-notes.md`.
 {nix_commands_note}
+## GitHub Actions: verify inputs before modifying
+
+When fixing a GitHub Actions `with:` block, do NOT guess input names from memory.
+Fetch the action's `action.yml` to confirm valid input names:
+
+    gh api repos/OWNER/REPO/contents/action.yml --jq .content | base64 -d | head -50
+
+For example, `aquasecurity/trivy-action` uses `version`, not `trivy_version`.
+Wrong input names are silently ignored and the action falls back to defaults,
+wasting an entire CI round-trip to discover the mistake.
+
 ## Rules
 
 - Fix ONLY what the diagnosis identifies — do not refactor or improve other code
@@ -3776,13 +3830,14 @@ class Runner:
                     )
                     ci_thread.start()
                     running_ids.add(task.id)
-                    # Track as a virtual agent slot for TUI display
+                    # Track as a virtual CI loop slot for TUI display
                     self.agent_counter += 1
                     slot = AgentSlot(
                         agent_id=self.agent_counter,
                         task=task,
                         start_time=time.time(),
                         status="running",
+                        is_ci_loop=True,
                     )
                     with self._lock:
                         self.agents.append(slot)
@@ -4162,25 +4217,41 @@ class Runner:
             with self._lock:
                 self.agents.append(slot)
 
+            # Track active sub-agent on the parent CI loop slot
+            with self._lock:
+                for a in self.agents:
+                    if a.task.id == task.id and a.is_ci_loop:
+                        a.active_sub_agent_id = aid
+                        break
+
             ci_log(f"Spawned {label} (Agent {aid}, pid {proc.pid})")
             proc.wait()
-            slot.status = "done" if proc.returncode == 0 else "failed"
+            sub_status = "done" if proc.returncode == 0 else "failed"
+            slot.status = sub_status
+            sub_elapsed = int(time.time() - slot.start_time)
 
             # Read final token counts from sub-agent log
             sub_in_tok, sub_out_tok = 0, 0
             if log_p and log_p.exists():
                 _, _, _, (sub_in_tok, sub_out_tok) = read_stream_output(log_p, 0)
 
-            # Aggregate sub-agent tokens into the parent CI loop slot
+            # Record sub-agent in parent's history and update aggregate totals
+            record = SubAgentRecord(
+                agent_id=aid, label=sub_task.id,
+                input_tokens=sub_in_tok, output_tokens=sub_out_tok,
+                elapsed_s=sub_elapsed, status=sub_status,
+            )
             with self._lock:
                 for a in self.agents:
-                    if a.task.id == task.id and a.agent_id != aid:
+                    if a.task.id == task.id and a.is_ci_loop:
+                        a.sub_agent_history.append(record)
                         a.input_tokens += sub_in_tok
                         a.output_tokens += sub_out_tok
+                        a.active_sub_agent_id = None
                         break
                 self.agents = [a for a in self.agents if a.agent_id != aid]
 
-            ci_log(f"{label} completed (exit {proc.returncode})")
+            ci_log(f"{label} completed (exit {proc.returncode}, {(sub_in_tok + sub_out_tok) // 1000}k tok)")
 
             # Detect auth failures — abort early instead of looping uselessly
             if proc.returncode != 0:
