@@ -2016,12 +2016,16 @@ def _build_sandbox_env(capabilities: set[str] | None = None) -> dict[str, str]:
 
 def spawn_agent(task: Task, prompt: str, log_path: Path,
                 stderr_path: Path,
-                extra_capabilities: set[str] | None = None) -> subprocess.Popen:
+                extra_capabilities: set[str] | None = None,
+                mcp_config_paths: list[Path] | None = None) -> subprocess.Popen:
     """Spawn a claude CLI process for the given task.
 
     Capabilities from task.capabilities (parsed from [needs: gh] etc.) plus
     any extra_capabilities (e.g. granted after a BLOCKED.md request) control
     which credentials are injected into the sandbox environment.
+
+    mcp_config_paths: list of JSON config files to pass via --mcp-config.
+    These provide MCP server definitions (e.g. mcp-android for E2E tasks).
 
     When sandboxing is enabled, the process runs inside bubblewrap with
     an allowlist-only filesystem.  The OAuth token is passed via a
@@ -2047,8 +2051,15 @@ def spawn_agent(task: Task, prompt: str, log_path: Path,
         "--model", "opus",
         "--verbose",
         "--output-format", "stream-json",
-        "-p", prompt,
     ]
+
+    # Inject MCP server config files for platform runtime capabilities
+    if mcp_config_paths:
+        for config_path in mcp_config_paths:
+            if config_path.exists():
+                claude_cmd += ["--mcp-config", str(config_path)]
+
+    claude_cmd += ["-p", prompt]
 
     cmd = claude_cmd
 
@@ -2401,11 +2412,24 @@ def clear_deferred(task_id: str):
         p.unlink()
 
 
+def _mark_task_done(task_file: Path, task_id: str):
+    """Mark a task as complete in tasks.md by changing `- [ ]` to `- [x]`."""
+    content = task_file.read_text()
+    # Match the task line and flip the checkbox
+    pattern = re.compile(
+        r'^(- \[) \](\s+' + re.escape(task_id) + r'\s)',
+        re.MULTILINE,
+    )
+    new_content = pattern.sub(r'\1x]\2', content)
+    if new_content != content:
+        task_file.write_text(new_content)
+
+
 # ── Capability request parsing ────────────────────────────────────────
 
 # Allowed capabilities that can be auto-granted from BLOCKED.md requests.
 # Anything not in this set requires manual user intervention.
-_AUTO_GRANTABLE_CAPS = {"gh"}
+_AUTO_GRANTABLE_CAPS = {"gh", "e2e-loop"}
 
 # Capabilities that are NEVER allowed alongside untrusted code execution.
 # If a task's description matches any of these patterns, the capability is
@@ -2456,6 +2480,481 @@ def _check_untrusted_code_risk(task: Task) -> bool:
     regardless of declared capabilities.
     """
     return bool(_UNTRUSTED_CODE_PATTERNS.search(task.description))
+
+
+# ── Platform runtime management ────────────────────────────────────────
+#
+# Built-in knowledge of platform runtimes (Android, Browser, iOS).
+# Each platform defines how to boot, check readiness, build + install,
+# generate MCP server config, and teardown.  Tasks declare platform
+# needs via [needs: mcp-android], [needs: mcp-browser], [needs: mcp-ios].
+
+# MCP capabilities that map to platform runtimes.
+_MCP_CAPABILITIES = {"mcp-android", "mcp-browser", "mcp-ios"}
+
+# These are auto-grantable (no user intervention needed).
+_AUTO_GRANTABLE_CAPS |= _MCP_CAPABILITIES
+
+
+@dataclass
+class PlatformRuntime:
+    """Manages lifecycle for a single platform runtime (emulator/browser/sim)."""
+
+    name: str           # "android", "browser", "ios"
+    capability: str     # "mcp-android", "mcp-browser", "mcp-ios"
+    _booted: bool = False
+    _mcp_process: Optional[subprocess.Popen] = None
+    _mcp_config_path: Optional[Path] = None
+
+    def boot(self, project_dir: Path, log_fn=None) -> bool:
+        """Boot the platform runtime. Returns True on success."""
+        _log = log_fn or (lambda msg: print(f"[platform:{self.name}] {msg}", file=sys.stderr))
+
+        if self._booted:
+            _log(f"{self.name} already booted")
+            return True
+
+        if self.name == "android":
+            return self._boot_android(project_dir, _log)
+        elif self.name == "browser":
+            return self._boot_browser(project_dir, _log)
+        elif self.name == "ios":
+            return self._boot_ios(project_dir, _log)
+        return False
+
+    def readiness_check(self, log_fn=None) -> bool:
+        """Check if the runtime is ready to accept commands."""
+        _log = log_fn or (lambda msg: print(f"[platform:{self.name}] {msg}", file=sys.stderr))
+
+        if self.name == "android":
+            return self._check_android_ready(_log)
+        elif self.name == "browser":
+            return True  # Browser MCP server handles its own readiness
+        elif self.name == "ios":
+            return self._check_ios_ready(_log)
+        return False
+
+    def build_and_install(self, project_dir: Path, log_fn=None) -> bool:
+        """Build and install the app for this platform. Returns True on success."""
+        _log = log_fn or (lambda msg: print(f"[platform:{self.name}] {msg}", file=sys.stderr))
+
+        if self.name == "android":
+            return self._build_install_android(project_dir, _log)
+        elif self.name == "browser":
+            return True  # Browser apps don't need install
+        elif self.name == "ios":
+            return self._build_install_ios(project_dir, _log)
+        return False
+
+    def get_mcp_config(self) -> dict:
+        """Return the MCP server configuration JSON for this platform."""
+        if self.name == "android":
+            return {
+                "mcp-android": {
+                    "command": "nix",
+                    "args": ["run", "github:mmmaxwwwell/nix-mcp-debugkit#mcp-android", "--"],
+                }
+            }
+        elif self.name == "browser":
+            return {
+                "mcp-browser": {
+                    "command": "nix",
+                    "args": ["run", "github:mmmaxwwwell/nix-mcp-debugkit#mcp-browser", "--"],
+                }
+            }
+        elif self.name == "ios":
+            return {
+                "mcp-ios": {
+                    "command": "nix",
+                    "args": ["run", "github:mmmaxwwwell/nix-mcp-debugkit#mcp-ios", "--"],
+                }
+            }
+        return {}
+
+    def start_mcp_server(self, project_dir: Path, log_fn=None) -> bool:
+        """Start the MCP server process and write config file. Returns True on success."""
+        _log = log_fn or (lambda msg: print(f"[platform:{self.name}] {msg}", file=sys.stderr))
+
+        # Write MCP config to a temp file for --mcp-config
+        config = self.get_mcp_config()
+        config_dir = project_dir / ".specify" / "mcp"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / f"{self.name}.json"
+        config_path.write_text(json.dumps(config, indent=2))
+        self._mcp_config_path = config_path
+
+        # Verify prerequisites with --check
+        if self.name == "android":
+            check = subprocess.run(
+                ["nix", "run", "github:mmmaxwwwell/nix-mcp-debugkit#mcp-android", "--", "--check"],
+                capture_output=True, timeout=60,
+            )
+            if check.returncode != 0:
+                _log(f"MCP Android prerequisites check failed: {check.stderr.decode()[:200]}")
+                return False
+
+        _log(f"MCP config written to {config_path}")
+        return True
+
+    def teardown(self, log_fn=None):
+        """Stop the runtime and MCP server."""
+        _log = log_fn or (lambda msg: print(f"[platform:{self.name}] {msg}", file=sys.stderr))
+
+        if self._mcp_process and self._mcp_process.poll() is None:
+            self._mcp_process.terminate()
+            try:
+                self._mcp_process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._mcp_process.kill()
+            _log(f"MCP server stopped")
+            self._mcp_process = None
+
+        if self._mcp_config_path and self._mcp_config_path.exists():
+            self._mcp_config_path.unlink()
+            self._mcp_config_path = None
+
+        if self.name == "android":
+            subprocess.run(["adb", "emu", "kill"], capture_output=True, timeout=30)
+            _log("Android emulator stopped")
+        elif self.name == "ios":
+            subprocess.run(["xcrun", "simctl", "shutdown", "booted"], capture_output=True, timeout=30)
+            _log("iOS simulator stopped")
+
+        self._booted = False
+
+    @property
+    def mcp_config_path(self) -> Optional[Path]:
+        return self._mcp_config_path
+
+    # ── Android internals ──
+
+    def _boot_android(self, project_dir: Path, log) -> bool:
+        """Boot Android emulator. Looks for project-provided start-emulator or uses adb."""
+        log("Booting Android emulator...")
+
+        # Check for project-provided emulator script (e.g. nix-key's start-emulator)
+        start_script = None
+        for candidate in [
+            project_dir / "scripts" / "start-emulator.sh",
+            project_dir / "scripts" / "start-emulator",
+        ]:
+            if candidate.exists():
+                start_script = candidate
+                break
+
+        # Try nix-provided start-emulator (from devshell)
+        if not start_script and shutil.which("start-emulator"):
+            start_script = Path(shutil.which("start-emulator"))
+
+        if start_script:
+            log(f"Using emulator script: {start_script}")
+            result = subprocess.run(
+                [str(start_script)],
+                capture_output=True, timeout=300,
+                cwd=str(project_dir),
+            )
+            if result.returncode != 0:
+                log(f"Emulator script failed: {result.stderr.decode()[:300]}")
+                return False
+        else:
+            # Fallback: try to boot directly via emulator command
+            avd_list = subprocess.run(
+                ["emulator", "-list-avds"], capture_output=True, timeout=10
+            )
+            avds = avd_list.stdout.decode().strip().splitlines()
+            if not avds:
+                log("No AVDs found. Create one first.")
+                return False
+            avd = avds[0]
+            log(f"Booting AVD: {avd}")
+            subprocess.Popen(
+                ["emulator", f"@{avd}", "-no-window", "-gpu", "swiftshader_indirect", "-no-audio"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+
+        # Wait for boot
+        if not self._wait_for("boot_completed",
+                              ["adb", "shell", "getprop", "sys.boot_completed"],
+                              expected="1", timeout=180, log=log):
+            return False
+
+        # Wait for package manager (important for install)
+        log("Waiting for package manager...")
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            pm = subprocess.run(
+                ["adb", "shell", "pm", "list", "packages"],
+                capture_output=True, timeout=10,
+            )
+            if pm.returncode == 0 and len(pm.stdout.decode().splitlines()) > 30:
+                break
+            time.sleep(3)
+        else:
+            log("Package manager not ready after 120s")
+            return False
+
+        self._booted = True
+        log("Android emulator ready")
+        return True
+
+    def _check_android_ready(self, log) -> bool:
+        try:
+            result = subprocess.run(
+                ["adb", "shell", "getprop", "sys.boot_completed"],
+                capture_output=True, timeout=5,
+            )
+            return result.stdout.decode().strip() == "1"
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return False
+
+    def _build_install_android(self, project_dir: Path, log) -> bool:
+        """Build debug APK and install on emulator."""
+        log("Building Android APK...")
+
+        # Detect build system
+        gradle_dir = None
+        for candidate in [project_dir / "android", project_dir]:
+            if (candidate / "gradlew").exists():
+                gradle_dir = candidate
+                break
+
+        if not gradle_dir:
+            # Try make target
+            if (project_dir / "Makefile").exists():
+                result = subprocess.run(
+                    ["make", "android-apk"], capture_output=True, timeout=600,
+                    cwd=str(project_dir),
+                )
+                if result.returncode != 0:
+                    log(f"make android-apk failed: {result.stderr.decode()[:300]}")
+                    return False
+            else:
+                log("No Gradle or Makefile found for Android build")
+                return False
+        else:
+            result = subprocess.run(
+                [str(gradle_dir / "gradlew"), "assembleDebug"],
+                capture_output=True, timeout=600,
+                cwd=str(gradle_dir),
+            )
+            if result.returncode != 0:
+                log(f"Gradle assembleDebug failed: {result.stderr.decode()[:300]}")
+                return False
+
+        # Find and install APK
+        apk_candidates = list(project_dir.rglob("*-debug.apk")) + list(project_dir.rglob("app-debug.apk"))
+        if not apk_candidates:
+            log("No debug APK found after build")
+            return False
+
+        apk = sorted(apk_candidates, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+        log(f"Installing APK: {apk}")
+        install = subprocess.run(
+            ["adb", "install", "-r", "-t", str(apk)],
+            capture_output=True, timeout=120,
+        )
+        if install.returncode != 0:
+            log(f"APK install failed: {install.stderr.decode()[:200]}")
+            return False
+
+        log("APK installed successfully")
+        return True
+
+    # ── iOS internals ──
+
+    def _boot_ios(self, project_dir: Path, log) -> bool:
+        log("Booting iOS simulator...")
+        # List available simulators
+        result = subprocess.run(
+            ["xcrun", "simctl", "list", "devices", "--json"],
+            capture_output=True, timeout=10,
+        )
+        if result.returncode != 0:
+            log("xcrun simctl not available")
+            return False
+
+        try:
+            devices = json.loads(result.stdout)
+            # Find first available iPhone simulator
+            for runtime, devs in devices.get("devices", {}).items():
+                if "iOS" not in runtime:
+                    continue
+                for dev in devs:
+                    if dev.get("isAvailable") and "iPhone" in dev.get("name", ""):
+                        udid = dev["udid"]
+                        log(f"Booting simulator: {dev['name']} ({udid})")
+                        subprocess.run(["xcrun", "simctl", "boot", udid], capture_output=True, timeout=30)
+                        self._booted = True
+                        return self._check_ios_ready(log)
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+        log("No available iOS simulator found")
+        return False
+
+    def _check_ios_ready(self, log) -> bool:
+        try:
+            result = subprocess.run(
+                ["xcrun", "simctl", "list", "devices"],
+                capture_output=True, timeout=10,
+            )
+            return b"Booted" in result.stdout
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return False
+
+    def _build_install_ios(self, project_dir: Path, log) -> bool:
+        log("Building iOS app...")
+        # Find .xcodeproj or .xcworkspace
+        xcworkspaces = list(project_dir.rglob("*.xcworkspace"))
+        xcprojects = list(project_dir.rglob("*.xcodeproj"))
+        target = xcworkspaces[0] if xcworkspaces else (xcprojects[0] if xcprojects else None)
+
+        if not target:
+            log("No Xcode project found")
+            return False
+
+        flag = "-workspace" if target.suffix == ".xcworkspace" else "-project"
+        result = subprocess.run(
+            ["xcodebuild", flag, str(target), "-scheme", target.stem,
+             "-sdk", "iphonesimulator", "-destination", "platform=iOS Simulator,name=iPhone 15",
+             "-configuration", "Debug", "build"],
+            capture_output=True, timeout=600,
+            cwd=str(project_dir),
+        )
+        if result.returncode != 0:
+            log(f"xcodebuild failed: {result.stderr.decode()[:300]}")
+            return False
+
+        # Find and install .app
+        apps = list(project_dir.rglob("Debug-iphonesimulator/*.app"))
+        if apps:
+            subprocess.run(["xcrun", "simctl", "install", "booted", str(apps[0])], capture_output=True, timeout=30)
+            log(f"Installed {apps[0].name} on simulator")
+
+        self._booted = True
+        return True
+
+    # ── Browser internals ──
+
+    def _boot_browser(self, project_dir: Path, log) -> bool:
+        # Browser MCP server bundles Chromium — no separate boot needed
+        self._booted = True
+        log("Browser runtime ready (Chromium bundled with MCP server)")
+        return True
+
+    # ── Shared helpers ──
+
+    def _wait_for(self, name: str, cmd: list[str], expected: str,
+                  timeout: int, log, interval: int = 3) -> bool:
+        """Poll a command until output matches expected or timeout."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                result = subprocess.run(cmd, capture_output=True, timeout=5)
+                if result.stdout.decode().strip() == expected:
+                    log(f"{name} ready ({int(time.time() - (deadline - timeout))}s)")
+                    return True
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+            time.sleep(interval)
+        log(f"{name} not ready after {timeout}s")
+        return False
+
+
+class PlatformManager:
+    """Manages all platform runtimes for a runner session."""
+
+    def __init__(self, log_fn=None):
+        self._runtimes: dict[str, PlatformRuntime] = {}
+        self._log = log_fn or (lambda msg: print(f"[platforms] {msg}", file=sys.stderr))
+
+    def ensure_runtime(self, capability: str, project_dir: Path) -> Optional[PlatformRuntime]:
+        """Boot a platform runtime if not already running. Returns the runtime or None on failure."""
+        if capability not in _MCP_CAPABILITIES:
+            return None
+
+        name = capability.replace("mcp-", "")  # "mcp-android" -> "android"
+
+        if name in self._runtimes and self._runtimes[name]._booted:
+            return self._runtimes[name]
+
+        runtime = PlatformRuntime(name=name, capability=capability)
+        self._log(f"Initializing {name} platform runtime...")
+
+        if not runtime.boot(project_dir, self._log):
+            self._log(f"Failed to boot {name} runtime")
+            return None
+
+        if not runtime.readiness_check(self._log):
+            self._log(f"{name} runtime failed readiness check")
+            return None
+
+        if not runtime.build_and_install(project_dir, self._log):
+            self._log(f"Failed to build/install for {name}")
+            return None
+
+        if not runtime.start_mcp_server(project_dir, self._log):
+            self._log(f"Failed to start MCP server for {name}")
+            return None
+
+        self._runtimes[name] = runtime
+        self._log(f"{name} platform runtime fully initialized")
+        return runtime
+
+    def rebuild_and_reinstall(self, capability: str, project_dir: Path) -> bool:
+        """Rebuild and reinstall app on an already-running runtime."""
+        name = capability.replace("mcp-", "")
+        runtime = self._runtimes.get(name)
+        if not runtime or not runtime._booted:
+            self._log(f"Cannot rebuild — {name} runtime not running")
+            return False
+
+        return runtime.build_and_install(project_dir, self._log)
+
+    def get_mcp_config_paths(self, capabilities: set[str]) -> list[Path]:
+        """Get MCP config file paths for the given capabilities."""
+        paths = []
+        for cap in capabilities & _MCP_CAPABILITIES:
+            name = cap.replace("mcp-", "")
+            runtime = self._runtimes.get(name)
+            if runtime and runtime.mcp_config_path:
+                paths.append(runtime.mcp_config_path)
+        return paths
+
+    def teardown_all(self):
+        """Stop all runtimes."""
+        for name, runtime in self._runtimes.items():
+            try:
+                runtime.teardown(self._log)
+            except Exception as e:
+                self._log(f"Error tearing down {name}: {e}")
+        self._runtimes.clear()
+
+    @property
+    def active_runtimes(self) -> dict[str, PlatformRuntime]:
+        return dict(self._runtimes)
+
+
+# ── E2E Explore-Fix-Verify findings format ────────────────────────────
+
+E2E_FINDINGS_SCHEMA = {
+    "version": 1,
+    "findings": [
+        {
+            "id": "BUG-001",
+            "severity": "critical|high|medium|low",
+            "screen": "screen name from UI_FLOW.md",
+            "flow": "which user flow this was found in",
+            "summary": "one-line description",
+            "steps_to_reproduce": ["step 1", "step 2"],
+            "expected": "what should happen",
+            "actual": "what actually happens",
+            "screenshot_path": "path to screenshot if taken",
+            "view_tree_path": "path to view tree dump if taken",
+            "status": "new|fixed|verified|wont_fix",
+        }
+    ],
+}
 
 
 def check_circuit_breaker(spec_dir: str, window_minutes: int = 10,
@@ -3850,6 +4349,44 @@ class Runner:
                     total_runs += 1
                     continue
 
+                # ── E2E loop tasks get a dedicated runner-managed cycle ──
+                if task.capabilities & _MCP_CAPABILITIES and "e2e-loop" in task.capabilities:
+                    if not hasattr(self, '_e2e_loop_spawns'):
+                        self._e2e_loop_spawns: dict[str, int] = {}
+                    spawn_count = self._e2e_loop_spawns.get(task.id, 0)
+                    if spawn_count >= 3:
+                        self.log(f"Task {task.id} E2E loop spawned {spawn_count} times — giving up")
+                        task.status = TaskStatus.FAILED
+                        continue
+                    self._e2e_loop_spawns[task.id] = spawn_count + 1
+
+                    self.log(f"Task {task.id} is an [e2e-loop] task — running E2E explore-fix-verify loop")
+                    e2e_thread = threading.Thread(
+                        target=self._run_e2e_loop,
+                        args=(task, spec_dir, task_file, str(learnings_file)),
+                        daemon=True,
+                        name=f"e2e-loop-{task.id}",
+                    )
+                    e2e_thread.start()
+                    running_ids.add(task.id)
+                    self.agent_counter += 1
+                    slot = AgentSlot(
+                        agent_id=self.agent_counter,
+                        task=task,
+                        start_time=time.time(),
+                        status="running",
+                        is_ci_loop=True,  # reuse TUI display logic
+                    )
+                    with self._lock:
+                        self.agents.append(slot)
+                    if not hasattr(self, '_e2e_threads'):
+                        self._e2e_threads: dict[str, threading.Thread] = {}
+                    self._e2e_threads[task.id] = e2e_thread
+                    available_slots -= 1
+                    spawned += 1
+                    total_runs += 1
+                    continue
+
                 history = read_attempt_history(spec_dir, task.id, session_id=self.session_id)
 
                 # Use lightweight retry prompt when code exists but agents
@@ -3885,8 +4422,19 @@ class Runner:
                 if hasattr(self, '_granted_capabilities'):
                     extra_caps = self._granted_capabilities.get(task.id)
 
+                # Resolve MCP config paths for tasks with platform capabilities
+                task_mcp_configs = None
+                task_mcp_caps = task.capabilities & _MCP_CAPABILITIES
+                if task_mcp_caps:
+                    if not hasattr(self, '_platform_manager'):
+                        self._platform_manager = PlatformManager(log_fn=self.log)
+                    for cap in task_mcp_caps:
+                        self._platform_manager.ensure_runtime(cap, Path.cwd())
+                    task_mcp_configs = self._platform_manager.get_mcp_config_paths(task_mcp_caps)
+
                 proc = spawn_agent(task, prompt, log_path, stderr_path,
-                                   extra_capabilities=extra_caps)
+                                   extra_capabilities=extra_caps,
+                                   mcp_config_paths=task_mcp_configs)
 
                 slot = AgentSlot(
                     agent_id=agent_id,
@@ -4663,6 +5211,600 @@ class Runner:
             f"## What I need\n\nHuman review of the CI failures — the automated loop couldn't resolve them.\n\n"
             f"## Context\n\nAll diagnosis and log files are in `{debug_dir}/`.\n"
         )
+
+    # ── E2E Explore-Fix-Verify loop ──────────────────────────────────────
+
+    def _run_e2e_loop(self, task: Task, spec_dir: str, task_file: Path,
+                      learnings_file: str):
+        """Run the E2E explore-fix-verify loop, catching auth failures."""
+        e2e_dir = Path(spec_dir) / "validate" / "e2e"
+        e2e_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            return self._run_e2e_loop_inner(task, spec_dir, task_file, learnings_file)
+        except AgentAuthError as e:
+            self.log(f"FATAL: Auth error in E2E loop for {task.id}")
+            self._shutdown.set()
+            self.blocked_file.write_text(
+                f"# BLOCKED: {task.id} — Authentication expired during E2E loop\n\n"
+                f"Re-authenticate Claude Code and restart.\n\n"
+                f"## Context\n\nE2E findings and logs are in `{e2e_dir}/`.\n"
+            )
+
+    def _run_e2e_loop_inner(self, task: Task, spec_dir: str, task_file: Path,
+                            learnings_file: str):
+        """Inner E2E loop: explore → fix → rebuild → verify, with supervisor.
+
+        The loop uses three agent types:
+        1. EXPLORE agent (with MCP): walks the app via UI_FLOW.md, takes
+           screenshots, reads view trees, discovers bugs in batches.
+           Writes findings to validate/e2e/findings.json.
+        2. FIX agent (no MCP): reads findings.json, fixes all reported
+           bugs in a single batch pass. Commits changes.
+        3. VERIFY agent (with MCP): re-tests each bug from findings.json,
+           marks fixed/still-broken, discovers new bugs during re-testing.
+
+        Between fix and verify, the runner rebuilds + reinstalls the app.
+
+        A SUPERVISOR agent runs every N iterations to assess progress and
+        either redirect strategy, stop the loop, or continue.
+        """
+        e2e_dir = Path(spec_dir) / "validate" / "e2e"
+        e2e_dir.mkdir(parents=True, exist_ok=True)
+        findings_file = e2e_dir / "findings.json"
+        e2e_log_path = e2e_dir / "e2e-loop.log"
+        project_dir = Path.cwd()
+
+        # Supervisor interval: every N iterations, assess progress
+        SUPERVISOR_INTERVAL = 10
+
+        def e2e_log(msg: str):
+            ts = datetime.now().strftime("%H:%M:%S")
+            line = f"[{ts}] {msg}"
+            with open(e2e_log_path, "a") as f:
+                f.write(line + "\n")
+            with self._lock:
+                for agent in self.agents:
+                    if agent.task.id == task.id:
+                        agent.output_lines.append(line)
+                        if len(agent.output_lines) > 200:
+                            agent.output_lines = agent.output_lines[-200:]
+                        break
+            self.log(msg)
+
+        def _wait_for_subagent(sub_task: Task, prompt: str, label: str,
+                               caps: set[str] | None = None,
+                               mcp_configs: list[Path] | None = None) -> int:
+            """Spawn a sub-agent, track it, wait for completion. Returns exit code."""
+            self.agent_counter += 1
+            aid = self.agent_counter
+            log_p = self.log_dir / f"agent-{aid}-{sub_task.id}-{self.timestamp}.jsonl"
+            stderr_p = self.log_dir / f"agent-{aid}-{sub_task.id}-{self.timestamp}.stderr"
+            proc = spawn_agent(sub_task, prompt, log_p, stderr_p,
+                               extra_capabilities=caps,
+                               mcp_config_paths=mcp_configs)
+
+            slot = AgentSlot(
+                agent_id=aid, task=sub_task, process=proc,
+                pid=proc.pid, start_time=time.time(),
+                log_file=log_p, status="running",
+            )
+            with self._lock:
+                self.agents.append(slot)
+                for a in self.agents:
+                    if a.task.id == task.id and a.is_ci_loop:
+                        a.active_sub_agent_id = aid
+                        break
+
+            e2e_log(f"Spawned {label} (Agent {aid}, pid {proc.pid})")
+            proc.wait()
+            sub_status = "done" if proc.returncode == 0 else "failed"
+            slot.status = sub_status
+
+            sub_in_tok, sub_out_tok = 0, 0
+            if log_p and log_p.exists():
+                _, _, _, (sub_in_tok, sub_out_tok) = read_stream_output(log_p, 0)
+
+            record = SubAgentRecord(
+                agent_id=aid, label=sub_task.id,
+                input_tokens=sub_in_tok, output_tokens=sub_out_tok,
+                elapsed_s=int(time.time() - slot.start_time), status=sub_status,
+            )
+            with self._lock:
+                for a in self.agents:
+                    if a.task.id == task.id and a.is_ci_loop:
+                        a.sub_agent_history.append(record)
+                        a.input_tokens += sub_in_tok
+                        a.output_tokens += sub_out_tok
+                        a.active_sub_agent_id = None
+                        break
+                self.agents = [a for a in self.agents if a.agent_id != aid]
+
+            e2e_log(f"{label} completed (exit {proc.returncode}, {(sub_in_tok + sub_out_tok) // 1000}k tok)")
+
+            if proc.returncode != 0:
+                auth_err = check_auth_error(log_p)
+                if auth_err:
+                    raise AgentAuthError("Sub-agent authentication failed (401)")
+
+            return proc.returncode
+
+        # ── Initialize platform runtime ──
+        mcp_caps = task.capabilities & _MCP_CAPABILITIES
+        if not mcp_caps:
+            e2e_log(f"Task {task.id} has no MCP capabilities — cannot run E2E loop")
+            return
+
+        if not hasattr(self, '_platform_manager'):
+            self._platform_manager = PlatformManager(log_fn=self.log)
+
+        mcp_config_paths = []
+        for cap in mcp_caps:
+            runtime = self._platform_manager.ensure_runtime(cap, project_dir)
+            if not runtime:
+                e2e_log(f"Failed to initialize platform runtime for {cap}")
+                self.blocked_file.write_text(
+                    f"# BLOCKED: {task.id} — Platform runtime initialization failed\n\n"
+                    f"Could not boot {cap} runtime. Check that the platform tools "
+                    f"are available (emulator, adb, Xcode, etc.).\n"
+                )
+                return
+            paths = self._platform_manager.get_mcp_config_paths({cap})
+            mcp_config_paths.extend(paths)
+
+        e2e_log(f"Platform runtimes initialized: {', '.join(c.replace('mcp-', '') for c in mcp_caps)}")
+
+        # ── Read context files for prompts ──
+        ui_flow_content = ""
+        for candidate in [
+            Path(spec_dir) / "UI_FLOW.md",
+            Path(spec_dir) / "ui_flow.md",
+        ]:
+            if candidate.exists():
+                ui_flow_content = candidate.read_text()
+                break
+
+        spec_content = ""
+        spec_path = Path(spec_dir) / "spec.md"
+        if spec_path.exists():
+            # Read first 10000 chars to avoid blowing up the prompt
+            spec_content = spec_path.read_text()[:10000]
+
+        # ── State tracking ──
+        state_file = e2e_dir / "state.json"
+        state = {
+            "task_id": task.id,
+            "iteration": 0,
+            "total_bugs_found": 0,
+            "total_bugs_fixed": 0,
+            "history": [],
+        }
+        if state_file.exists():
+            try:
+                state = json.loads(state_file.read_text())
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        iteration = state.get("iteration", 0)
+
+        # ── Main loop ──
+        while not self._shutdown.is_set():
+            iteration += 1
+            e2e_log(f"=== E2E iteration {iteration} ===")
+
+            # ── Supervisor check every N iterations ──
+            if iteration > 1 and (iteration - 1) % SUPERVISOR_INTERVAL == 0:
+                e2e_log(f"Supervisor check at iteration {iteration}")
+                supervisor_prompt = self._build_e2e_supervisor_prompt(
+                    spec_dir, e2e_dir, state, ui_flow_content
+                )
+                sup_task = Task(
+                    id=f"E2E-supervisor-{iteration}",
+                    description=f"E2E supervisor check at iteration {iteration}",
+                    phase=task.phase, parallel=False,
+                    status=TaskStatus.RUNNING, line_num=0,
+                )
+                _wait_for_subagent(sup_task, supervisor_prompt, f"E2E-supervisor-{iteration}")
+
+                # Read supervisor decision
+                decision_file = e2e_dir / "supervisor-decision.md"
+                if decision_file.exists():
+                    decision = decision_file.read_text()
+                    if "STOP" in decision.upper() and "HUMAN" in decision.upper():
+                        e2e_log("Supervisor says: STOP — human intervention needed")
+                        self.blocked_file.write_text(
+                            f"# BLOCKED: {task.id} — E2E supervisor requested human review\n\n"
+                            f"{decision}\n\n"
+                            f"## Context\n\nFindings: `{findings_file}`\nLogs: `{e2e_dir}/`\n"
+                        )
+                        break
+                    elif "STOP" in decision.upper():
+                        e2e_log("Supervisor says: STOP — tests are comprehensive enough")
+                        break
+                    else:
+                        e2e_log(f"Supervisor says: CONTINUE")
+                        # Supervisor may have written guidance to e2e_dir/guidance.md
+
+            # ── Phase 1: EXPLORE (with MCP) ──
+            e2e_log(f"Phase 1: Explore (with MCP tools)")
+            explore_prompt = self._build_e2e_explore_prompt(
+                spec_dir, findings_file, ui_flow_content, spec_content,
+                iteration, e2e_dir
+            )
+            explore_task = Task(
+                id=f"E2E-explore-{iteration}",
+                description=f"E2E explore iteration {iteration}",
+                phase=task.phase, parallel=False,
+                status=TaskStatus.RUNNING, line_num=0,
+                capabilities=mcp_caps,
+            )
+            _wait_for_subagent(explore_task, explore_prompt,
+                               f"E2E-explore-{iteration}",
+                               mcp_configs=mcp_config_paths)
+
+            # Read findings
+            if not findings_file.exists():
+                e2e_log("No findings file produced — explore agent may have failed")
+                state["history"].append({
+                    "iteration": iteration, "phase": "explore",
+                    "result": "no_findings",
+                })
+                state_file.write_text(json.dumps(state, indent=2))
+                continue
+
+            try:
+                findings = json.loads(findings_file.read_text())
+            except json.JSONDecodeError:
+                e2e_log("Invalid findings.json — skipping this iteration")
+                continue
+
+            open_bugs = [f for f in findings.get("findings", [])
+                         if f.get("status") in ("new", "verified_broken")]
+            e2e_log(f"Open bugs: {len(open_bugs)}")
+
+            if not open_bugs:
+                e2e_log("No open bugs found — E2E exploration complete!")
+                state["history"].append({
+                    "iteration": iteration, "phase": "explore",
+                    "result": "clean", "open_bugs": 0,
+                })
+                state_file.write_text(json.dumps(state, indent=2))
+
+                # Mark the task complete
+                _mark_task_done(task_file, task.id)
+                break
+
+            state["total_bugs_found"] = len(findings.get("findings", []))
+
+            # ── Phase 2: FIX (no MCP needed) ──
+            e2e_log(f"Phase 2: Fix ({len(open_bugs)} bugs)")
+            fix_prompt = self._build_e2e_fix_prompt(
+                spec_dir, findings_file, open_bugs, learnings_file
+            )
+            fix_task = Task(
+                id=f"E2E-fix-{iteration}",
+                description=f"E2E fix iteration {iteration} ({len(open_bugs)} bugs)",
+                phase=task.phase, parallel=False,
+                status=TaskStatus.RUNNING, line_num=0,
+            )
+            _wait_for_subagent(fix_task, fix_prompt, f"E2E-fix-{iteration}")
+
+            # ── Phase 3: Rebuild + reinstall ──
+            e2e_log("Phase 3: Rebuild and reinstall")
+            for cap in mcp_caps:
+                if not self._platform_manager.rebuild_and_reinstall(cap, project_dir):
+                    e2e_log(f"Rebuild failed for {cap} — will retry next iteration")
+
+            # ── Phase 4: VERIFY (with MCP) ──
+            e2e_log(f"Phase 4: Verify fixes")
+            verify_prompt = self._build_e2e_verify_prompt(
+                spec_dir, findings_file, ui_flow_content, e2e_dir
+            )
+            verify_task = Task(
+                id=f"E2E-verify-{iteration}",
+                description=f"E2E verify iteration {iteration}",
+                phase=task.phase, parallel=False,
+                status=TaskStatus.RUNNING, line_num=0,
+                capabilities=mcp_caps,
+            )
+            _wait_for_subagent(verify_task, verify_prompt,
+                               f"E2E-verify-{iteration}",
+                               mcp_configs=mcp_config_paths)
+
+            # Re-read findings after verify
+            try:
+                findings = json.loads(findings_file.read_text())
+            except json.JSONDecodeError:
+                e2e_log("Invalid findings.json after verify")
+                continue
+
+            still_open = [f for f in findings.get("findings", [])
+                          if f.get("status") in ("new", "verified_broken")]
+            fixed = [f for f in findings.get("findings", [])
+                     if f.get("status") == "fixed"]
+
+            state["total_bugs_fixed"] = len(fixed)
+            state["iteration"] = iteration
+            state["history"].append({
+                "iteration": iteration,
+                "bugs_found": len(open_bugs),
+                "bugs_fixed": len(fixed),
+                "bugs_remaining": len(still_open),
+            })
+            state_file.write_text(json.dumps(state, indent=2))
+
+            e2e_log(f"Iteration {iteration} complete: {len(fixed)} fixed, {len(still_open)} remaining")
+
+            if not still_open:
+                e2e_log("All bugs fixed — E2E loop complete!")
+                _mark_task_done(task_file, task.id)
+                break
+
+        # Teardown platform runtimes
+        if hasattr(self, '_platform_manager'):
+            self._platform_manager.teardown_all()
+
+    def _build_e2e_explore_prompt(self, spec_dir: str, findings_file: Path,
+                                   ui_flow: str, spec_content: str,
+                                   iteration: int, e2e_dir: Path) -> str:
+        """Build the prompt for the E2E explore agent."""
+        existing_findings = ""
+        if findings_file.exists():
+            existing_findings = findings_file.read_text()
+
+        guidance = ""
+        guidance_file = e2e_dir / "guidance.md"
+        if guidance_file.exists():
+            guidance = guidance_file.read_text()
+
+        return f"""You are an E2E exploration agent with access to MCP tools that let you interact with a running app.
+
+## Your mission
+
+Explore the running app systematically, comparing actual behavior against the specification. Find AS MANY BUGS AS POSSIBLE in this single run. Do not stop after finding one bug — keep exploring every screen, every flow, every edge case.
+
+## Available MCP tools
+
+You have access to platform MCP tools. Use them to:
+- **Screenshot**: Take screenshots to see what's on screen
+- **Snapshot/DumpHierarchy**: Read the accessibility/view tree to find element selectors
+- **Click/ClickBySelector**: Tap on UI elements
+- **Swipe**: Scroll or swipe gestures
+- **Type/SetText**: Enter text into fields
+- **WaitForElement**: Wait for elements to appear
+- **Press**: Press hardware buttons (BACK, HOME, etc.)
+- **GetScreenInfo**: Get screen dimensions and info
+
+## How to explore
+
+1. Launch the app
+2. Take a screenshot and read the view tree to understand the current screen
+3. Compare what you see against the UI_FLOW.md specification below
+4. Try both happy paths AND error paths for each flow
+5. When you find a bug, document it with:
+   - Screenshot (save to `{e2e_dir}/screenshots/`)
+   - Steps to reproduce
+   - Expected vs actual behavior
+6. Navigate to the next screen/flow and repeat
+7. Keep going until you've covered every screen and flow
+
+## Flows to test (from UI_FLOW.md)
+
+<ui_flow>
+{ui_flow}
+</ui_flow>
+
+## Specification context (key requirements)
+
+<spec>
+{spec_content}
+</spec>
+
+{f'''## Supervisor guidance
+
+The supervisor has provided the following guidance for this iteration:
+
+<guidance>
+{guidance}
+</guidance>
+''' if guidance else ''}
+
+{f'''## Previous findings
+
+These bugs have already been found. Look for NEW bugs, and also verify whether previously fixed bugs have regressed:
+
+<existing_findings>
+{existing_findings}
+</existing_findings>
+''' if existing_findings else '## No previous findings — this is the first exploration run.'}
+
+## Output format
+
+Write your findings to `{findings_file}` as JSON:
+
+```json
+{{
+  "version": 1,
+  "iteration": {iteration},
+  "findings": [
+    {{
+      "id": "BUG-001",
+      "severity": "critical|high|medium|low",
+      "screen": "screen name from UI_FLOW.md",
+      "flow": "which user flow",
+      "summary": "one-line description",
+      "steps_to_reproduce": ["step 1", "step 2"],
+      "expected": "what should happen per spec",
+      "actual": "what actually happens",
+      "screenshot_path": "path to screenshot",
+      "status": "new"
+    }}
+  ]
+}}
+```
+
+**IMPORTANT**: Preserve any findings from previous iterations that have status "fixed" or "verified_broken". Only add new findings or update statuses.
+
+## Rules
+
+- Explore EVERY screen and flow — do not stop early
+- Take screenshots liberally — they help the fix agent understand the bug
+- Test error paths: invalid inputs, back navigation, interruptions
+- Test state persistence: navigate away and back
+- Do NOT fix bugs — only document them
+- Do NOT modify source code
+- Create the screenshots directory: `mkdir -p {e2e_dir}/screenshots/`
+"""
+
+    def _build_e2e_fix_prompt(self, spec_dir: str, findings_file: Path,
+                               open_bugs: list[dict], learnings_file: str) -> str:
+        """Build the prompt for the E2E fix agent."""
+        bugs_summary = json.dumps(open_bugs, indent=2)
+
+        return f"""You are an E2E fix agent. Your job is to fix ALL reported bugs in a single batch pass.
+
+## Bugs to fix ({len(open_bugs)} total)
+
+<findings>
+{bugs_summary}
+</findings>
+
+## Instructions
+
+1. Read `CLAUDE.md` for project conventions and build commands
+2. For each bug:
+   a. Read the steps to reproduce and the expected vs actual behavior
+   b. Find the relevant source code
+   c. Fix the root cause (not just the symptom)
+3. Fix ALL bugs before stopping — do not fix one and then quit
+4. After fixing all bugs, run any available unit tests to make sure you haven't broken anything
+5. Commit all changes with a conventional commit message
+
+## Rules
+
+- Fix ALL {len(open_bugs)} bugs, not just the first one
+- Do NOT modify `{findings_file}` — the verify agent will update it
+- Do NOT skip bugs — if you can't fix one, add a comment in the code explaining why
+- Prefer fixing the app code over fixing tests (tests are the spec)
+- Record any non-obvious learnings to `{learnings_file}`
+"""
+
+    def _build_e2e_verify_prompt(self, spec_dir: str, findings_file: Path,
+                                  ui_flow: str, e2e_dir: Path) -> str:
+        """Build the prompt for the E2E verify agent."""
+        findings_content = findings_file.read_text() if findings_file.exists() else "{}"
+
+        return f"""You are an E2E verify agent with access to MCP tools. Your job is to verify bug fixes and find new bugs.
+
+## Available MCP tools
+
+Same tools as the explore agent: Screenshot, Snapshot/DumpHierarchy, Click, Swipe, Type, WaitForElement, Press, GetScreenInfo.
+
+## Previous findings to verify
+
+<findings>
+{findings_content}
+</findings>
+
+## Instructions
+
+1. For each bug with status "new" in the findings:
+   a. Follow the steps to reproduce exactly
+   b. Take a screenshot
+   c. If the bug is fixed: update status to "fixed"
+   d. If the bug still exists: update status to "verified_broken"
+2. While re-testing, if you discover NEW bugs, add them with status "new"
+3. Write the updated findings back to `{findings_file}`
+
+## UI_FLOW.md for reference
+
+<ui_flow>
+{ui_flow}
+</ui_flow>
+
+## Rules
+
+- Test EVERY bug in the findings — do not skip any
+- Take screenshots for verification (save to `{e2e_dir}/screenshots/`)
+- Add any newly discovered bugs
+- Do NOT modify source code — only update `{findings_file}`
+"""
+
+    def _build_e2e_supervisor_prompt(self, spec_dir: str, e2e_dir: Path,
+                                      state: dict, ui_flow: str) -> str:
+        """Build the prompt for the E2E supervisor agent."""
+        state_json = json.dumps(state, indent=2)
+        findings_content = ""
+        findings_file = e2e_dir / "findings.json"
+        if findings_file.exists():
+            findings_content = findings_file.read_text()
+
+        return f"""You are an E2E supervisor agent. Review the progress of the E2E testing loop and decide whether to continue, redirect, or stop.
+
+## Current state
+
+<state>
+{state_json}
+</state>
+
+## Current findings
+
+<findings>
+{findings_content}
+</findings>
+
+## UI_FLOW.md (what should be tested)
+
+<ui_flow>
+{ui_flow}
+</ui_flow>
+
+## Your decision
+
+Analyze the progress:
+
+1. **Are we making progress?** Compare bugs found/fixed across iterations. If the same bugs keep appearing, we're stuck.
+2. **Is coverage improving?** Check which screens/flows from UI_FLOW.md have been tested vs which haven't.
+3. **Are we stuck in a loop?** If the fix agent keeps "fixing" the same bugs but they come back, the approach needs to change.
+
+Write your decision to `{e2e_dir}/supervisor-decision.md`:
+
+### If progress is being made:
+```
+# CONTINUE
+
+[Brief assessment of progress]
+[Any strategic guidance for the next explore agent — e.g., "focus on error paths in the pairing flow" or "the sign request timeout handling hasn't been tested yet"]
+```
+
+Also write any strategic guidance to `{e2e_dir}/guidance.md` (the explore agent reads this).
+
+### If stuck but fixable:
+```
+# REDIRECT
+
+[What's going wrong]
+[New strategy to try]
+```
+
+Write the new strategy to `{e2e_dir}/guidance.md`.
+
+### If human intervention is needed:
+```
+# STOP — HUMAN INTERVENTION NEEDED
+
+[What's wrong]
+[What the human should look at]
+[Specific files/screens/logs to check]
+```
+
+## Rules
+
+- Be decisive — don't hedge
+- If the same bug has been "fixed" and "verified_broken" more than 3 times, that's a sign the fix approach is wrong
+- If total iterations > 30 with diminishing returns, suggest stopping
+- Consider token cost: each iteration is ~100k tokens. Is continued exploration worth it?
+"""
 
     def _run_ci_loop(self, task: Task, spec_dir: str, task_file: Path,
                      learnings_file: str):

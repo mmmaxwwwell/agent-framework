@@ -17,7 +17,7 @@ These documents contain all the decisions from the interview and planning phases
 
 ## Task structure
 
-- Tasks marked `[P]` can be parallelized.
+- Tasks marked `[P]` can be parallelized — but ONLY if they don't share a singleton resource. Writing to different files is necessary but not sufficient: tasks that share a single emulator, database instance, device, or CI runner cannot run in parallel regardless of file independence. Common singleton resources: Android emulator (one at a time), iOS Simulator, browser instance, hardware device, test database. Only mark `[P]` when tasks are truly independent at both the file level AND the resource level.
 - Tasks marked `[needs: gh]` are granted GitHub CLI access (GH_TOKEN) at runtime. Use this for tasks that call `gh` commands (push, PR creation, CI monitoring). **NEVER combine `[needs: gh]` with tasks that run package install commands** (npm install, pip install, go install, etc.) — this prevents supply-chain attacks from exfiltrating credentials.
 - Tasks marked `[needs: gh, ci-loop]` use a runner-managed CI debug cycle instead of a single agent. The runner pushes, polls CI, and spawns separate diagnosis/fix sub-agents in a loop. See `reference/cicd.md`.
 - Tasks that share state reference interface contracts: `[produces: IC-xxx]` / `[consumes: IC-xxx]`. See `reference/interface-contracts.md`.
@@ -103,6 +103,14 @@ Task list MUST follow the fix-validate loop pattern. Load `reference/testing.md`
 ### Traceability
 Every task MUST reference the user story or functional requirement it implements (e.g., `[Story 3]` or `[FR-015]`). Load `reference/traceability.md` for the structured learnings format and CLAUDE.md auto-generation requirements.
 
+### Requirement precision checks
+
+When generating tasks from spec requirements, watch for these common ambiguities:
+
+1. **"Compatible with X"** — specify the exact integration point. "Compatible with the test reporter" is vague; "aggregatable by `scripts/ci-summary.sh` into ci-summary.json" is precise. Name the tool, script, or interface that consumes the output.
+2. **Mode-scoped features** — if the project has multiple execution modes (CI vs local, debug vs release, server vs CLI), every requirement and task involving a mode-specific feature MUST explicitly state which mode it applies to. A supervisor agent that only runs in local mode must say so in the FR, not just in the task description. Ambiguity here causes implementing agents to wire features into the wrong mode.
+3. **Shared-resource parallelism claims** — if the Dependencies section claims user stories can run in parallel, verify they don't share a singleton resource (emulator, device, database). If they do, the section must say they run sequentially and explain why.
+
 ### Non-goals awareness
 If the spec has a `## Non-Goals` section, reference it in the approach note so implementing agents know what NOT to build. Agents encountering an unlisted scenario should check Non-Goals before implementing — if it's listed there, skip it. If it's genuinely ambiguous and not in Non-Goals, proceed or write BLOCKED.md.
 
@@ -152,6 +160,36 @@ Include a late-phase task that runs ALL user-flow integration tests together aft
 
 ### Real-runtime E2E tests (if project targets a platform runtime)
 Load `reference/e2e-runtime.md` before writing E2E tasks for projects targeting Android, iOS, web/PWA, or desktop platforms. The reference defines: runtime selection (real emulator/browser, never simulated), side-by-side architecture for multi-runtime tests, readiness checks, test bypass mechanisms for hardware features, UI automation patterns, flakiness handling, and CI infrastructure. Follow the task generation guidance in that reference — decompose E2E prerequisites into separate infrastructure tasks (artifact build, environment setup, test bypass, UI helper library) before writing the E2E test task itself.
+
+### MCP-driven E2E exploration (if interview-notes specify MCP debug tools)
+Load `reference/mcp-e2e.md` before writing MCP E2E tasks. If the interview confirmed that agents should use MCP tools for visual E2E testing, include an **E2E exploration task** with the `[needs: mcp-<platform>, e2e-loop]` capabilities. This task uses the runner's explore-fix-verify loop:
+
+```markdown
+- [ ] T0XX E2E integration test exploration [needs: mcp-android, e2e-loop]
+  Done when: all screens and flows from UI_FLOW.md have been visually verified
+  on the real runtime, all discovered bugs are fixed and verified, findings.json
+  shows zero open bugs.
+```
+
+**This task is placed AFTER all implementation phases** — it depends on the app being buildable and functional. The runner handles the full lifecycle (boot runtime, build APK, install, explore, fix, rebuild, verify).
+
+**CRITICAL: Do NOT generate tasks that build orchestration code for MCP E2E.** The runner already handles emulator boot, APK build+install, MCP server lifecycle, and the explore-fix-verify loop. Tasks should NOT create shell scripts, prompt templates, scenario runners, report libraries, or any code whose purpose is to invoke or manage agents. The implementing agent receives MCP tools directly from the runner and uses them to interact with the live app. See the anti-patterns section in `reference/mcp-e2e.md`. If a generated task description says "create a script that..." or "write a prompt template for..." for E2E testing, it is WRONG — rewrite it as "use MCP tools to verify [thing] on the live emulator."
+
+**Multiple platform tasks**: If the project targets multiple platforms, create one E2E exploration task per platform:
+```markdown
+- [ ] T0XX E2E Android exploration [needs: mcp-android, e2e-loop]
+- [ ] T0YY E2E Browser exploration [needs: mcp-browser, e2e-loop] [P]
+- [ ] T0ZZ E2E iOS exploration [needs: mcp-ios, e2e-loop] [P]
+```
+
+Browser and iOS tasks can run in parallel with each other (different runtimes), but each depends on all implementation phases being complete.
+
+**Single platform projects**: If the project targets only one platform (e.g., Android only), do NOT mark scenario tasks as `[P]` — they all share one emulator and must run sequentially. Only non-runtime tasks (prompt writing, config files) can be parallelized. See `reference/e2e-runtime.md § Single-runtime constraint on parallelism`.
+
+**Prerequisites**: The E2E exploration task should depend on:
+- `UI_FLOW.md` existing and being complete
+- The app building successfully for the target platform
+- Any test bypass mechanisms being in place (mock biometrics, deep links, etc.)
 
 ### Build environment gap analysis (MANDATORY)
 

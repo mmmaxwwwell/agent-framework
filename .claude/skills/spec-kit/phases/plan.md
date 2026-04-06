@@ -244,7 +244,7 @@ After all decisions are made but before writing the plan:
 - **If the project has an API, IPC protocol, or real-time channels**: load `reference/api-contracts.md` before writing contract documentation. Skip if no external interfaces.
 - **If the project spawns external processes** (CLI tools, agents, child workers): load `reference/testing.md` and include stub-process creation and integration tests for the spawn → stdin → stdout → exit lifecycle. Check the spec's functional requirements for external process interfaces.
 - **If the project has external service dependencies** (databases, emulators, message queues): load `reference/idempotency.md` and plan readiness-check scripts for each dependency.
-- **If the project targets a platform runtime** (Android, iOS, web/PWA, desktop): load `reference/e2e-runtime.md` before planning E2E phases. Include runtime selection, side-by-side architecture, test bypass mechanisms, UI automation framework, and CI infrastructure in the testing strategy.
+- **If the project targets a platform runtime** (Android, iOS, web/PWA, desktop): load `reference/e2e-runtime.md` before planning E2E phases. Include runtime selection, side-by-side architecture, test bypass mechanisms, UI automation framework, and CI infrastructure in the testing strategy. **If MCP debug tools were confirmed in the interview**: load `reference/mcp-e2e.md` and plan the E2E phase as runner-managed `[needs: mcp-<platform>, e2e-loop]` tasks — do NOT plan custom orchestration scripts, prompt templates, scenario runners, or agent management code. The runner handles the full lifecycle.
 
 **Skip reference loads for topics the preset says to skip.** But for any section you're writing, the reference defines the quality bar — load it first.
 

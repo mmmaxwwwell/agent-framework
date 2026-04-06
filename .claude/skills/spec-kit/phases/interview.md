@@ -156,6 +156,11 @@ These questions capture the information needed to design comprehensive E2E tests
 - **First-launch flow**: "Walk me through what happens the first time a user opens the app. What permissions are requested? What configuration is needed? What downloads or initializations happen?" This is critical for E2E test design — the first-launch flow is where most user-facing bugs hide.
 - **Multi-device scenarios**: "Does the system involve multiple devices working together? If so, how do they discover each other and what's the pairing flow?" This determines whether E2E tests need multi-runtime orchestration (e.g., Android emulator + host daemon + mesh network).
 - **Offline behavior**: "What happens when the network is unavailable? Does the app work offline, degrade gracefully, or fail?" For PWAs especially: service worker caching, IndexedDB persistence, sync-on-reconnect.
+- **MCP debug tools**: "Should agents have visual access to the running app during E2E testing?" If yes, the runner can boot the platform runtime and provide MCP tools (screenshot, tap, view tree) to agents so they can interactively explore the app, compare it against the spec, and discover bugs visually. This is recommended for any project with a UI. Determine which MCP servers are needed: `mcp-android` (Android emulator), `mcp-browser` (headless Chromium), `mcp-ios` (iOS simulator). See `reference/mcp-e2e.md` for the full explore-fix-verify loop.
+- **E2E exploration scope**: "Which flows and screens should agents explore during E2E testing?" By default, agents use `UI_FLOW.md` to walk every screen and flow. Ask: "Are there any flows that can't be tested in an emulator/simulator?" (e.g., NFC pairing, real hardware biometrics). For untestable flows, ask how to bypass them in tests (deep links, test harness flags, mock services).
+- **E2E test depth**: "How thorough should E2E testing be?" Options: (a) smoke test — just verify the app launches and key screens render, (b) flow coverage — test every flow from UI_FLOW.md end-to-end, (c) comprehensive — every flow, every error path, every state transition, edge cases. Default to (c) for production apps.
+
+**IMPORTANT: If MCP debug tools are confirmed, the spec MUST NOT describe building custom test orchestration, scenario runners, prompt templates, or agent management code.** The runner already handles the full MCP E2E lifecycle (boot runtime, build+install app, provide MCP tools to agents, explore-fix-verify loop). The spec should describe WHAT to test (screens, flows, error paths), not HOW to orchestrate agents. See `reference/mcp-e2e.md` for the anti-patterns to avoid.
 
 Document all answers in `interview-notes.md` under a `## Platform Runtime & E2E` section. This information flows directly into the plan's testing strategy and the task list's E2E gap analysis.
 
@@ -191,6 +196,9 @@ FR-007: System MUST reject expired certificates with a descriptive error
   Example: cert with notAfter=2024-01-01 -> error "certificate expired: valid until 2024-01-01"
 ```
 Examples are optional on clear FRs, but MANDATORY on any FR flagged `[NEEDS CLARIFICATION]` during Phase 4 (analyze) — the example IS the clarification. Do not add pseudocode or ASCII mockups here; those belong in `plan.md` or `UI_FLOW.md`.
+
+### Requirement wording precision
+Avoid vague integration claims. Instead of "compatible with X", name the exact tool, script, or interface that consumes the output (e.g., "aggregatable by `scripts/ci-summary.sh`" not "compatible with the test reporter"). If a requirement only applies in a specific mode (CI vs local, debug vs release), state the mode explicitly in the FR text — don't leave it to the task phase to disambiguate.
 
 ### Success criteria
 Include a Success Criteria section with `SC-xxx` IDs mapped to requirements:

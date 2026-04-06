@@ -262,6 +262,22 @@ When E2E tests fail, collect ALL logs from ALL runtimes:
 
 Upload `test-logs/e2e/` as a CI artifact on failure.
 
+## Single-runtime constraint on parallelism
+
+When a project uses a single emulator, simulator, or browser instance, **all scenario-level tasks that interact with that runtime are sequential** — even if they touch different files and have no code dependencies. The `[P]` marker must NOT be applied to these tasks.
+
+Tasks that CAN be parallelized in a single-runtime project:
+- Writing prompt templates, config files, or documentation (no runtime interaction)
+- Writing library code that doesn't need the runtime to validate
+- Tasks targeting genuinely different runtimes (e.g., Android emulator + headless browser)
+
+Tasks that CANNOT be parallelized:
+- Any scenario that boots, interacts with, or reads state from the shared runtime
+- Infrastructure setup tasks that write to the same file (e.g., extracting functions into a shared `infrastructure.sh`)
+- Any task that depends on app state created by a previous scenario on the same runtime
+
+The Dependencies section in tasks.md must reflect this: if all user stories share one emulator, they run sequentially in priority order, not in parallel.
+
 ## Flakiness handling
 
 Real-runtime E2E tests are inherently flakier than unit tests due to:
@@ -372,3 +388,35 @@ Real-runtime E2E tests are inherently flakier than unit tests due to:
 - [ ] T0XX Wire E2E into pre-pr gate: add `make e2e-local` to `make pre-pr`. Include timeout (20m), retry (2 attempts), `SKIP_E2E=1` bypass. [DX, pre-pr]
   Done when: `make pre-pr` runs E2E tests after unit/integration/lint/security pass.
 ```
+
+## MCP-driven E2E exploration (agent-interactive testing)
+
+For projects where the interview confirmed MCP debug tool usage, the runner supports a fully automated **explore-fix-verify loop** using MCP tools. See `reference/mcp-e2e.md` for the complete pattern.
+
+### When to use MCP-driven E2E vs scripted E2E
+
+| Approach | Best for | Strengths | Weaknesses |
+|----------|----------|-----------|------------|
+| **Scripted E2E** (UI Automator, Playwright) | CI/CD gates, regression suites | Deterministic, fast, repeatable | Only tests what you wrote tests for |
+| **MCP-driven exploration** | Bug discovery, visual validation, comprehensive coverage | Finds unexpected bugs, adapts to UI changes | Slower, non-deterministic, needs supervisor |
+| **Both** (recommended) | Production apps | Scripted catches regressions, MCP finds new bugs | More infrastructure to maintain |
+
+### MCP E2E task example
+
+```markdown
+- [ ] T0XX E2E integration test exploration [needs: mcp-android, e2e-loop]
+  Done when: all screens and flows from UI_FLOW.md have been visually verified
+  on the Android emulator, all discovered bugs are fixed and verified,
+  findings.json shows zero open bugs.
+```
+
+The runner handles: emulator boot → APK build+install → MCP server start → explore agent → fix agent → rebuild+install → verify agent → supervisor checks → repeat until clean.
+
+### Integration with scripted E2E
+
+MCP-driven exploration and scripted E2E tests are complementary:
+1. **Run MCP exploration first** to discover bugs and validate the app works visually
+2. **Then write scripted E2E tests** for each flow verified by MCP exploration, ensuring they stay green in CI
+3. **Run MCP exploration periodically** (e.g., on major releases) to catch new visual bugs
+
+The MCP explore agent's `findings.json` can inform what scripted tests to write — each verified flow becomes a regression test.
