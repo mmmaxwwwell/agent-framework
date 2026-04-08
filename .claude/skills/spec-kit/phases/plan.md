@@ -260,7 +260,7 @@ The generated plan MUST include (subject to preset overrides):
 - **Smoke test phase** early — confirm the most basic thing works (server boots, app loads) before diving into test suites
 - **Phase 2: Foundational Infrastructure** (logging, error handling, config, graceful shutdown, health checks, CI/CD pipeline, security scanning)
 - **Feature phases** following TDD pattern
-- **Late phase: E2E validation** — exercise real flows after all unit/integration tests pass. UI_FLOW.md verification if UI project
+- **Late phase: E2E validation** — exercise real flows after all unit/integration tests pass. UI_FLOW.md verification if UI project. The runner automatically runs a post-loop regression check against the full test suite after MCP E2E fixes are applied — ensure `CLAUDE.md` lists ALL test commands (per-language, per-platform) so the regression agent can find them
 
 ---
 

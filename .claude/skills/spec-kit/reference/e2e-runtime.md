@@ -496,7 +496,20 @@ For projects where the interview confirmed MCP debug tool usage, the runner supp
   findings.json shows zero open bugs.
 ```
 
-The runner handles: emulator boot → APK build+install → MCP server start → explore agent → fix agent → rebuild+install → verify agent → supervisor checks → repeat until clean.
+The runner handles: emulator boot → APK build+install → MCP server start → explore agent → fix agent → rebuild+install → verify agent → supervisor checks → repeat until clean → **post-loop regression check**.
+
+### Post-loop regression check
+
+After the E2E loop finishes, the runner automatically spawns a regression check agent that runs the project's **full test suite** (all languages, all test types, lint checks). E2E fixes often touch shared code — screens, view models, navigation, state management — and can break existing tests that weren't exercised by the MCP exploration.
+
+The regression agent:
+1. Reads `CLAUDE.md` to discover all test commands
+2. Runs every test suite it finds (Go tests, Android unit tests, lint, security scans, etc.)
+3. Fixes regressions caused by E2E changes and commits them
+4. Reports results to `validate/e2e/regression-report.md`
+5. The task is only marked done after this check passes
+
+**Prerequisite**: `CLAUDE.md` must list ALL test commands explicitly. If test commands are missing or unclear, the regression agent may skip suites. For multi-language projects, list each language's test command separately (e.g., `make test` for Go, `./gradlew testDebugUnitTest` for Android JVM tests, `./gradlew connectedDebugAndroidTest` for instrumented tests, `./gradlew ktlintCheck` for Kotlin lint).
 
 ### Integration with scripted E2E
 

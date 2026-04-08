@@ -171,9 +171,13 @@ Load `reference/mcp-e2e.md` before writing MCP E2E tasks. If the interview confi
   shows zero open bugs.
 ```
 
-**This task is placed AFTER all implementation phases** — it depends on the app being buildable and functional. The runner handles the full lifecycle (boot runtime, build APK, install, explore, fix, rebuild, verify).
+**This task is placed AFTER all implementation phases** — it depends on the app being buildable and functional. The runner handles the full lifecycle (boot runtime, build APK, install, explore, fix, rebuild, verify, **post-loop regression check**).
 
-**CRITICAL: Do NOT generate tasks that build orchestration code for MCP E2E.** The runner already handles emulator boot, APK build+install, MCP server lifecycle, and the explore-fix-verify loop. Tasks should NOT create shell scripts, prompt templates, scenario runners, report libraries, or any code whose purpose is to invoke or manage agents. The implementing agent receives MCP tools directly from the runner and uses them to interact with the live app. See the anti-patterns section in `reference/mcp-e2e.md`. If a generated task description says "create a script that..." or "write a prompt template for..." for E2E testing, it is WRONG — rewrite it as "use MCP tools to verify [thing] on the live emulator."
+**Post-loop regression check**: After the E2E loop finishes, the runner automatically runs a regression check agent that executes the project's full test suite (all languages, lint, security scans). This catches regressions from E2E fixes without requiring a separate task. The regression agent reads `CLAUDE.md` to discover test commands — **ensure CLAUDE.md lists ALL test commands explicitly**, including per-language and per-platform commands (e.g., `make test` for Go, `./gradlew testDebugUnitTest` for Android JVM, `./gradlew ktlintCheck` for Kotlin lint).
+
+**Backend service setup**: If the app requires backend services to test all screens (daemon, database, mesh network, API server), generate a `test/e2e/setup.sh` and `test/e2e/teardown.sh` task BEFORE the E2E exploration task. The runner calls `setup.sh` automatically before the E2E loop starts. See `reference/e2e-runtime.md § Backend service setup for MCP E2E loops`.
+
+**CRITICAL: Do NOT generate tasks that build orchestration code for MCP E2E.** The runner already handles emulator boot, APK build+install, MCP server lifecycle, backend service setup/teardown, and the explore-fix-verify loop. Tasks should NOT create shell scripts, prompt templates, scenario runners, report libraries, or any code whose purpose is to invoke or manage agents. The implementing agent receives MCP tools directly from the runner and uses them to interact with the live app. See the anti-patterns section in `reference/mcp-e2e.md`. If a generated task description says "create a script that..." or "write a prompt template for..." for E2E testing, it is WRONG — rewrite it as "use MCP tools to verify [thing] on the live emulator."
 
 **Multiple platform tasks**: If the project targets multiple platforms, create one E2E exploration task per platform:
 ```markdown
