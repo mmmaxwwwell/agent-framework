@@ -3129,7 +3129,7 @@ class PlatformManager:
 # ── E2E Explore-Fix-Verify findings format ────────────────────────────
 
 E2E_FINDINGS_SCHEMA = {
-    "version": 1,
+    "version": 2,
     "findings": [
         {
             "id": "BUG-001",
@@ -3142,10 +3142,84 @@ E2E_FINDINGS_SCHEMA = {
             "actual": "what actually happens",
             "screenshot_path": "path to screenshot if taken",
             "view_tree_path": "path to view tree dump if taken",
-            "status": "new|fixed|verified|wont_fix",
+            "status": "new|fixed|verified_fixed|verified_broken|wont_fix",
+            "bug_dir": "validate/e2e/bugs/BUG-001",
         }
     ],
 }
+
+
+# ── Per-bug file management for E2E research/supervisor loop ─────────
+
+def _bug_dir(e2e_dir: Path, bug_id: str) -> Path:
+    """Return the per-bug directory, creating it if needed."""
+    d = e2e_dir / "bugs" / bug_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _read_bug_history(e2e_dir: Path, bug_id: str) -> dict:
+    """Read a bug's fix history from disk. Returns empty structure if none."""
+    history_file = _bug_dir(e2e_dir, bug_id) / "history.json"
+    if history_file.exists():
+        try:
+            return json.loads(history_file.read_text())
+        except json.JSONDecodeError:
+            pass
+    return {"bug_id": bug_id, "fix_attempts": [], "supervisor_runs": 0}
+
+
+def _write_bug_history(e2e_dir: Path, bug_id: str, history: dict):
+    """Persist a bug's fix history to disk."""
+    history_file = _bug_dir(e2e_dir, bug_id) / "history.json"
+    history_file.write_text(json.dumps(history, indent=2))
+
+
+def _read_supervisor_summaries(e2e_dir: Path, bug_id: str) -> list[str]:
+    """Read all supervisor summary files for a bug, in order."""
+    bug_d = _bug_dir(e2e_dir, bug_id)
+    summaries = []
+    n = 1
+    while True:
+        f = bug_d / f"supervisor-{n}-summary.md"
+        if not f.exists():
+            break
+        summaries.append(f.read_text())
+        n += 1
+    return summaries
+
+
+def _read_latest_research(e2e_dir: Path, bug_id: str) -> tuple[str, int]:
+    """Read the most recent research file for a bug. Returns (content, index)."""
+    bug_d = _bug_dir(e2e_dir, bug_id)
+    n = 1
+    latest = ("", 0)
+    while True:
+        f = bug_d / f"research-{n}.md"
+        if not f.exists():
+            break
+        latest = (f.read_text(), n)
+        n += 1
+    return latest
+
+
+def _count_fix_attempts(history: dict) -> int:
+    """Count total fix attempts from a bug's history."""
+    return len(history.get("fix_attempts", []))
+
+
+def _record_fix_attempt(e2e_dir: Path, bug_id: str, approach: str,
+                        verify_status: str, verify_evidence: str):
+    """Record a fix attempt in the bug's history file."""
+    history = _read_bug_history(e2e_dir, bug_id)
+    history["fix_attempts"].append({
+        "attempt": len(history["fix_attempts"]) + 1,
+        "approach": approach,
+        "verify_status": verify_status,
+        "verify_evidence": verify_evidence,
+        "timestamp": datetime.now().isoformat(),
+    })
+    _write_bug_history(e2e_dir, bug_id, history)
 
 
 def check_circuit_breaker(spec_dir: str, window_minutes: int = 10,
@@ -5801,6 +5875,175 @@ class Runner:
 
             state["total_bugs_found"] = len(findings.get("findings", []))
 
+            # ── Phase 1.5: RESEARCH new bugs ──
+            # For any bug that doesn't have a research file yet, spawn a research
+            # agent to investigate before the fix agent runs.
+            new_bugs_needing_research = []
+            for bug in open_bugs:
+                bug_id = bug.get("id", "")
+                if not bug_id:
+                    continue
+                _, research_idx = _read_latest_research(e2e_dir, bug_id)
+                if research_idx == 0:  # No research yet
+                    new_bugs_needing_research.append(bug)
+
+            if new_bugs_needing_research:
+                e2e_log(f"Phase 1.5: Research ({len(new_bugs_needing_research)} new bugs)")
+                for bug in new_bugs_needing_research:
+                    bug_id = bug["id"]
+                    e2e_log(f"  Researching {bug_id}: {bug.get('summary', '')[:60]}")
+                    research_prompt = self._build_e2e_research_prompt(
+                        bug, e2e_dir, spec_dir, ui_flow_content
+                    )
+                    research_task = Task(
+                        id=f"E2E-research-{bug_id}-{iteration}",
+                        description=f"Research {bug_id}",
+                        phase=task.phase, parallel=False,
+                        status=TaskStatus.RUNNING, line_num=0,
+                    )
+                    _wait_for_subagent(research_task, research_prompt,
+                                       f"E2E-research-{bug_id}-{iteration}")
+
+            # ── Per-bug supervisor check ──
+            # For bugs that have hit 3+ fix attempts since last supervisor,
+            # run the bug supervisor before the fix agent.
+            MAX_FIX_ATTEMPTS_BEFORE_SUPERVISOR = 3
+            MAX_SUPERVISOR_RUNS = 5
+            bugs_to_escalate = []
+            bugs_for_fix = list(open_bugs)  # start with all open bugs
+
+            for bug in open_bugs:
+                bug_id = bug.get("id", "")
+                if not bug_id:
+                    continue
+                history = _read_bug_history(e2e_dir, bug_id)
+                total_attempts = _count_fix_attempts(history)
+                sup_runs = history.get("supervisor_runs", 0)
+
+                # Calculate attempts since last supervisor
+                # Each supervisor resets the counter (supervisor fires after 3,
+                # then 1 more attempt per supervisor cycle)
+                if sup_runs == 0:
+                    attempts_since_sup = total_attempts
+                    threshold = MAX_FIX_ATTEMPTS_BEFORE_SUPERVISOR
+                else:
+                    # After first supervisor, only 1 attempt per cycle
+                    attempts_since_sup = total_attempts - (MAX_FIX_ATTEMPTS_BEFORE_SUPERVISOR + sup_runs)
+                    threshold = 1
+
+                if attempts_since_sup >= threshold and total_attempts > 0:
+                    if sup_runs >= MAX_SUPERVISOR_RUNS:
+                        # Exhausted all supervisor runs — escalate
+                        e2e_log(f"  {bug_id}: {sup_runs} supervisor runs exhausted — escalating")
+                        bugs_to_escalate.append(bug)
+                        bugs_for_fix = [b for b in bugs_for_fix if b.get("id") != bug_id]
+                        continue
+
+                    e2e_log(f"  {bug_id}: {total_attempts} fix attempts, running supervisor #{sup_runs + 1}")
+                    sup_prompt = self._build_e2e_bug_supervisor_prompt(
+                        bug, e2e_dir, ui_flow_content
+                    )
+                    sup_task = Task(
+                        id=f"E2E-bug-supervisor-{bug_id}-{iteration}",
+                        description=f"Supervisor for {bug_id} (run #{sup_runs + 1})",
+                        phase=task.phase, parallel=False,
+                        status=TaskStatus.RUNNING, line_num=0,
+                    )
+                    _wait_for_subagent(sup_task, sup_prompt,
+                                       f"E2E-bug-supervisor-{bug_id}-{iteration}")
+
+                    # Update supervisor run count
+                    history["supervisor_runs"] = sup_runs + 1
+                    _write_bug_history(e2e_dir, bug_id, history)
+
+                    # Read the supervisor's decision
+                    bug_d = _bug_dir(e2e_dir, bug_id)
+                    decision_file = bug_d / f"supervisor-{sup_runs + 1}-decision.md"
+                    if decision_file.exists():
+                        decision = decision_file.read_text()
+                        if "ESCALATE" in decision.upper():
+                            # Determine category from decision
+                            category = "code"
+                            for cat in ("spec", "infra"):
+                                if cat in decision.lower():
+                                    category = cat
+                                    break
+                            bugs_to_escalate.append(bug)
+                            bugs_for_fix = [b for b in bugs_for_fix if b.get("id") != bug_id]
+                            e2e_log(f"  {bug_id}: supervisor says ESCALATE ({category})")
+                        elif "REDIRECT_RESEARCH" in decision.upper():
+                            e2e_log(f"  {bug_id}: supervisor says REDIRECT_RESEARCH")
+                            # Extract the research directive from the decision
+                            research_prompt = self._build_e2e_research_prompt(
+                                bug, e2e_dir, spec_dir, ui_flow_content,
+                                supervisor_directive=decision,
+                            )
+                            research_task = Task(
+                                id=f"E2E-research-{bug_id}-sup{sup_runs + 1}",
+                                description=f"Redirected research for {bug_id}",
+                                phase=task.phase, parallel=False,
+                                status=TaskStatus.RUNNING, line_num=0,
+                            )
+                            _wait_for_subagent(research_task, research_prompt,
+                                               f"E2E-research-{bug_id}-sup{sup_runs + 1}")
+                        else:
+                            # DIRECT_FIX — supervisor guidance will be included in fix prompt
+                            e2e_log(f"  {bug_id}: supervisor says DIRECT_FIX")
+
+            # ── Escalation for exhausted bugs ──
+            for bug in bugs_to_escalate:
+                bug_id = bug.get("id", "")
+                history = _read_bug_history(e2e_dir, bug_id)
+
+                # Determine category from latest supervisor decision
+                sup_runs = history.get("supervisor_runs", 0)
+                category = "code"
+                if sup_runs > 0:
+                    bug_d = _bug_dir(e2e_dir, bug_id)
+                    latest_decision = bug_d / f"supervisor-{sup_runs}-decision.md"
+                    if latest_decision.exists():
+                        dec_text = latest_decision.read_text().lower()
+                        for cat in ("spec", "infra"):
+                            if cat in dec_text:
+                                category = cat
+                                break
+
+                e2e_log(f"  Escalating {bug_id} (category: {category})")
+                esc_prompt = self._build_e2e_escalation_prompt(bug, e2e_dir, category)
+                esc_task = Task(
+                    id=f"E2E-escalate-{bug_id}",
+                    description=f"Escalate {bug_id}",
+                    phase=task.phase, parallel=False,
+                    status=TaskStatus.RUNNING, line_num=0,
+                )
+                _wait_for_subagent(esc_task, esc_prompt, f"E2E-escalate-{bug_id}")
+
+                # Update findings status to wont_fix for escalated bugs
+                try:
+                    current_findings = json.loads(findings_file.read_text())
+                    for f in current_findings.get("findings", []):
+                        if f.get("id") == bug_id:
+                            f["status"] = "wont_fix"
+                            f["escalation_category"] = category
+                            f["bug_dir"] = str(_bug_dir(e2e_dir, bug_id))
+                    findings_file.write_text(json.dumps(current_findings, indent=2))
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+            # Refresh open bugs list after escalations
+            if bugs_to_escalate:
+                open_bugs = [b for b in open_bugs if b.get("id") not in
+                             {eb.get("id") for eb in bugs_to_escalate}]
+                if not open_bugs:
+                    e2e_log("All remaining bugs escalated — no fixable bugs left")
+                    state["history"].append({
+                        "iteration": iteration,
+                        "result": "all_escalated",
+                        "escalated": [b.get("id") for b in bugs_to_escalate],
+                    })
+                    state_file.write_text(json.dumps(state, indent=2))
+                    break
+
             # ── Phase 2: FIX (no MCP needed) ──
             e2e_log(f"Phase 2: Fix ({len(open_bugs)} bugs)")
 
@@ -5817,7 +6060,8 @@ class Runner:
                 pass
 
             fix_prompt = self._build_e2e_fix_prompt(
-                spec_dir, findings_file, open_bugs, learnings_file
+                spec_dir, findings_file, open_bugs, learnings_file,
+                e2e_dir=e2e_dir,
             )
             fix_task = Task(
                 id=f"E2E-fix-{iteration}",
@@ -5984,10 +6228,128 @@ This is build-fix attempt {attempt} of {BUILD_FIX_MAX_ATTEMPTS}.
                 e2e_log("Invalid findings.json after verify")
                 continue
 
+            # ── Record per-bug fix attempts from verify evidence ──
+            for finding in findings.get("findings", []):
+                bug_id = finding.get("id", "")
+                status = finding.get("status", "")
+                if not bug_id:
+                    continue
+                # Only record for bugs we tried to fix this iteration
+                if bug_id not in {b.get("id") for b in open_bugs}:
+                    continue
+
+                # Read the fix approach the fix agent wrote
+                bug_d = _bug_dir(e2e_dir, bug_id)
+                approach = "(no approach recorded)"
+                approach_file = bug_d / "fix-approach-latest.md"
+                if approach_file.exists():
+                    approach = approach_file.read_text()[:500]
+
+                # Read verify evidence
+                evidence = "(no evidence recorded)"
+                evidence_files = sorted(bug_d.glob(f"verify-evidence-*.md"))
+                if evidence_files:
+                    evidence = evidence_files[-1].read_text()[:1000]
+
+                if status in ("verified_broken", "new"):
+                    _record_fix_attempt(e2e_dir, bug_id, approach, "failed", evidence)
+                elif status == "fixed":
+                    _record_fix_attempt(e2e_dir, bug_id, approach, "fixed", evidence)
+
+            # ── Phase 4.5: Write regression tests for verified fixes ──
+            newly_fixed = [f for f in findings.get("findings", [])
+                           if f.get("status") == "fixed"
+                           and f.get("id") in {b.get("id") for b in open_bugs}]
+            if newly_fixed:
+                e2e_log(f"Phase 4.5: Write regression tests ({len(newly_fixed)} fixed bugs)")
+                test_writer_prompt = self._build_e2e_test_writer_prompt(
+                    newly_fixed, e2e_dir, spec_dir
+                )
+                tw_task = Task(
+                    id=f"E2E-test-writer-{iteration}",
+                    description=f"Write UI Automator tests for {len(newly_fixed)} fixes",
+                    phase=task.phase, parallel=False,
+                    status=TaskStatus.RUNNING, line_num=0,
+                )
+                _wait_for_subagent(tw_task, test_writer_prompt,
+                                   f"E2E-test-writer-{iteration}")
+
+                # Run the instrumented tests to verify they pass
+                e2e_log("Running instrumented tests to verify new regression tests")
+                TEST_CMD = "cd android && ./gradlew connectedDebugAndroidTest"
+                test_log = e2e_dir / f"test-run-iter{iteration}.log"
+                TEST_FIX_MAX = 5
+                tests_pass = False
+
+                for test_attempt in range(1, TEST_FIX_MAX + 1):
+                    try:
+                        test_result = subprocess.run(
+                            ["bash", "-c", TEST_CMD],
+                            capture_output=True, text=True, timeout=300,
+                            cwd=str(Path(spec_dir).parent) if spec_dir else None,
+                        )
+                        with open(test_log, "w") as f:
+                            f.write(f"Exit code: {test_result.returncode}\n")
+                            f.write("--- stdout ---\n")
+                            f.write(test_result.stdout)
+                            f.write("\n--- stderr ---\n")
+                            f.write(test_result.stderr)
+
+                        if test_result.returncode == 0:
+                            e2e_log(f"  Instrumented tests passed (attempt {test_attempt})")
+                            tests_pass = True
+                            break
+                        else:
+                            e2e_log(f"  Instrumented tests failed (attempt {test_attempt}/{TEST_FIX_MAX})")
+                    except subprocess.TimeoutExpired:
+                        e2e_log(f"  Instrumented tests timed out (attempt {test_attempt}/{TEST_FIX_MAX})")
+                        with open(test_log, "w") as f:
+                            f.write("TIMEOUT after 300s\n")
+
+                    # Spawn fix agent to fix the failing tests
+                    if test_attempt < TEST_FIX_MAX:
+                        test_fix_prompt = f"""You are fixing failing UI Automator instrumented tests. The tests were just written to
+assert E2E bug fixes, but they're failing.
+
+## Test log file
+`{test_log}`
+
+## How to read the log
+1. Read the file — it contains stdout and stderr from `./gradlew connectedDebugAndroidTest`
+2. Look for FAILED test methods and their assertion errors
+3. The test files are in `android/app/src/androidTest/java/com/nixkey/e2e/`
+
+## What to do
+1. Read the test log to identify which tests fail and why
+2. Read the failing test source code
+3. Fix the TEST code (not the app code) — the app behavior is correct, the test assertions may be wrong
+4. Common issues:
+   - Wrong selector (text changed, resource ID different)
+   - Missing wait/sleep before assertion (UI not loaded yet)
+   - Wrong navigation steps to reach the screen
+   - Missing permissions or setup in @Before
+5. Do NOT run the tests yourself — the runner will do that
+6. In your final response, state what you fixed
+
+## Iteration
+This is test-fix attempt {test_attempt} of {TEST_FIX_MAX}.
+"""
+                        tf_task = Task(
+                            id=f"E2E-test-fix-{iteration}-{test_attempt}",
+                            description=f"Fix failing tests (attempt {test_attempt})",
+                            phase=task.phase, parallel=False,
+                            status=TaskStatus.RUNNING, line_num=0,
+                        )
+                        _wait_for_subagent(tf_task, test_fix_prompt,
+                                           f"E2E-test-fix-{iteration}-{test_attempt}")
+
+                if not tests_pass:
+                    e2e_log(f"  Instrumented tests still failing after {TEST_FIX_MAX} attempts — continuing")
+
             still_open = [f for f in findings.get("findings", [])
                           if f.get("status") in ("new", "verified_broken")]
             fixed = [f for f in findings.get("findings", [])
-                     if f.get("status") == "fixed"]
+                     if f.get("status") in ("fixed", "verified_fixed")]
 
             state["total_bugs_fixed"] = len(fixed)
             state["iteration"] = iteration
@@ -6199,9 +6561,73 @@ Write your findings to `{findings_file}` as JSON:
 """
 
     def _build_e2e_fix_prompt(self, spec_dir: str, findings_file: Path,
-                               open_bugs: list[dict], learnings_file: str) -> str:
-        """Build the prompt for the E2E fix agent."""
+                               open_bugs: list[dict], learnings_file: str,
+                               e2e_dir: Path = None) -> str:
+        """Build the prompt for the E2E fix agent.
+
+        When e2e_dir is provided, includes per-bug research reports and
+        supervisor guidance in the prompt.
+        """
         bugs_summary = json.dumps(open_bugs, indent=2)
+
+        # Build per-bug research and guidance sections
+        research_sections = ""
+        if e2e_dir:
+            sections = []
+            for bug in open_bugs:
+                bug_id = bug.get("id", "")
+                if not bug_id:
+                    continue
+                bug_d = _bug_dir(e2e_dir, bug_id)
+
+                parts = [f"### {bug_id}: {bug.get('summary', '')}"]
+
+                # Include latest research
+                research_content, research_idx = _read_latest_research(e2e_dir, bug_id)
+                if research_content:
+                    parts.append(f"**Research report** (research-{research_idx}.md):\n{research_content}")
+
+                # Include supervisor guidance if any
+                history = _read_bug_history(e2e_dir, bug_id)
+                sup_runs = history.get("supervisor_runs", 0)
+                if sup_runs > 0:
+                    decision_file = bug_d / f"supervisor-{sup_runs}-decision.md"
+                    if decision_file.exists():
+                        decision = decision_file.read_text()
+                        parts.append(f"**Supervisor guidance** (run #{sup_runs}):\n{decision}")
+
+                # Include fix attempt history so agent knows what NOT to do
+                attempts = history.get("fix_attempts", [])
+                if attempts:
+                    attempt_lines = []
+                    for a in attempts:
+                        attempt_lines.append(
+                            f"- Attempt {a['attempt']}: {a['approach']} → {a['verify_status']}"
+                        )
+                    parts.append(
+                        "**Previous fix attempts (all failed — do NOT repeat these)**:\n"
+                        + "\n".join(attempt_lines)
+                    )
+
+                # Include latest verify evidence
+                # Find the most recent verify-evidence file
+                evidence_files = sorted(bug_d.glob("verify-evidence-*.md"))
+                if evidence_files:
+                    latest_evidence = evidence_files[-1].read_text()
+                    parts.append(f"**Latest verify evidence**:\n{latest_evidence}")
+
+                if len(parts) > 1:  # more than just the header
+                    sections.append("\n\n".join(parts))
+
+            if sections:
+                research_sections = f"""## Per-bug research and guidance
+
+The following research, supervisor guidance, and fix history is available for each bug.
+**Read this carefully before attempting fixes** — it tells you what approaches have
+already failed and what the research agent recommends.
+
+{chr(10).join(sections)}
+"""
 
         return f"""You are an E2E fix agent. Your job is to fix ALL reported bugs in a single batch pass.
 
@@ -6211,25 +6637,34 @@ Write your findings to `{findings_file}` as JSON:
 {bugs_summary}
 </findings>
 
+{research_sections}
+
 ## Instructions
 
 1. Read `CLAUDE.md` for project conventions and build commands
-2. For each bug:
-   a. Read the steps to reproduce and the expected vs actual behavior
-   b. Find the relevant source code
-   c. Fix the root cause (not just the symptom)
-3. Fix ALL bugs before stopping — do not fix one and then quit
-4. **Run the project's test suite** to make sure your fixes don't break existing functionality:
+2. **Read all per-bug research and guidance above** before writing any code
+3. For each bug:
+   a. If research/guidance exists: follow the recommended fix strategy
+   b. If previous fix attempts exist: ensure your approach is DIFFERENT from all of them
+   c. Read the steps to reproduce and the expected vs actual behavior
+   d. Find the relevant source code
+   e. Fix the root cause (not just the symptom)
+4. Fix ALL bugs before stopping — do not fix one and then quit
+5. **Run the project's test suite** to make sure your fixes don't break existing functionality:
    - Read `CLAUDE.md` or `Makefile` to find the test command (e.g., `make test`, `./gradlew test`, `npm test`, `go test ./...`)
    - Run **all** test suites, not just the ones related to your changes — E2E fixes often touch shared code
    - If tests fail, fix them before committing. If a test failure is pre-existing (not caused by your changes), note it but don't block on it.
-5. Commit all changes with a conventional commit message
+6. Commit all changes with a conventional commit message
+7. **For each bug you fix**, write a brief description of your approach to
+   `{e2e_dir}/bugs/<BUG-ID>/fix-approach-latest.md` — one paragraph describing
+   what you changed and why. This is used by the verify agent and supervisor.
 
 ## Rules
 
 - Fix ALL {len(open_bugs)} bugs, not just the first one
 - Do NOT modify `{findings_file}` — the verify agent will update it
 - Do NOT skip bugs — if you can't fix one, add a comment in the code explaining why
+- **Do NOT repeat failed approaches** — check the per-bug fix history above
 - Prefer fixing the app code over fixing tests (tests are the spec)
 - **Do NOT skip tests** — if you can't find a test command, look harder (CLAUDE.md, Makefile, package.json, build.gradle)
 - Record any non-obvious learnings to `{learnings_file}`
@@ -6240,7 +6675,7 @@ Write your findings to `{findings_file}` as JSON:
         """Build the prompt for the E2E verify agent."""
         findings_content = findings_file.read_text() if findings_file.exists() else "{}"
 
-        return f"""You are an E2E verify agent with access to MCP tools. Your job is to verify bug fixes and find new bugs.
+        return f"""You are an E2E verify agent with access to MCP tools. Your job is to verify bug fixes, produce structured evidence, and find new bugs.
 
 ## CRITICAL: Context window management
 
@@ -6265,13 +6700,56 @@ Same tools as the explore agent: Screenshot, Snapshot/DumpHierarchy, Click, Swip
 
 ## Instructions
 
-1. For each bug with status "new" in the findings:
+1. For each bug with status "new" or "verified_broken" in the findings:
    a. Follow the steps to reproduce exactly
-   b. Use DumpHierarchy to check the state; take a screenshot only if visual verification is needed
-   c. If the bug is fixed: update status to "fixed"
-   d. If the bug still exists: update status to "verified_broken"
+   b. **Always run DumpHierarchy** to capture the actual UI state
+   c. Take a screenshot only if visual verification is needed
+   d. If the bug is fixed: update status to "fixed"
+   e. If the bug still exists: update status to "verified_broken"
+   f. **Write structured evidence** to the bug's directory (see below)
 2. **Update `{findings_file}` after EACH bug** — don't wait until the end
 3. While re-testing, if you discover NEW bugs, add them with status "new"
+
+## CRITICAL: Structured evidence output
+
+For EVERY bug you verify (whether fixed or still broken), you MUST write a
+structured evidence file to `{e2e_dir}/bugs/<BUG-ID>/verify-evidence-<iteration>.md`.
+
+Create the directory if it doesn't exist: `mkdir -p {e2e_dir}/bugs/<BUG-ID>/`
+
+The evidence file MUST contain:
+
+```markdown
+# Verify evidence: <BUG-ID> — iteration N
+
+## Status: FIXED | STILL_BROKEN
+
+## Actions taken
+1. [exact MCP tool call and parameters]
+2. [next action...]
+
+## Observed state
+[Raw DumpHierarchy XML snippet showing the relevant UI element(s).
+Copy the EXACT XML — do not summarize or paraphrase it.]
+
+## Expected state
+[What the XML/hierarchy SHOULD look like per the spec, with specific
+attribute values: class, text, checkable, clickable, etc.]
+
+## Delta
+[Concrete difference: "Node has checkable=false, expected checkable=true"
+or "Node missing entirely from hierarchy" — NOT "accessibility is broken"]
+
+## Screenshot
+[Path to screenshot file, or "not needed — hierarchy sufficient"]
+```
+
+**Why this matters**: The fix agent and supervisor use this evidence to understand
+exactly what failed. "Bug still broken" is useless. "Switch node has checkable=false
+in AccessibilityNodeInfo" tells the fix agent exactly what to fix.
+
+Also update the finding in `{findings_file}` to include a `bug_dir` field pointing
+to the bug's evidence directory: `"bug_dir": "{e2e_dir}/bugs/<BUG-ID>"`
 
 ## UI_FLOW.md for reference
 
@@ -6283,8 +6761,9 @@ Same tools as the explore agent: Screenshot, Snapshot/DumpHierarchy, Click, Swip
 
 - Test EVERY bug in the findings — do not skip any
 - Save screenshots to `{e2e_dir}/screenshots/` — one per bug max
-- Add any newly discovered bugs
-- Do NOT modify source code — only update `{findings_file}`
+- Add any newly discovered bugs (with `bug_dir` field)
+- **Always write structured evidence** — no exceptions
+- Do NOT modify source code — only update `{findings_file}` and write evidence files
 """
 
     def _build_e2e_supervisor_prompt(self, spec_dir: str, e2e_dir: Path,
@@ -6491,6 +6970,571 @@ Agent hit context window limits after doing real work. The next iteration will r
 - A crash that happened once might be transient. The same crash twice is a pattern — check state.history for prior crashes
 - Don't suggest retrying if the error message indicates a deterministic failure (bad config, missing binary, schema error)
 - Context overflow crashes (image limits, token limits) are expected and recoverable — always CONTINUE
+"""
+
+    # ── Per-bug research / supervisor / escalation prompt builders ──────
+
+    def _build_e2e_research_prompt(self, bug: dict, e2e_dir: Path,
+                                    spec_dir: str, ui_flow: str,
+                                    supervisor_directive: str = "") -> str:
+        """Build prompt for a research agent investigating a specific bug."""
+        bug_id = bug["id"]
+        bug_d = _bug_dir(e2e_dir, bug_id)
+        history = _read_bug_history(e2e_dir, bug_id)
+
+        # Load previous research if any
+        prev_research, prev_idx = _read_latest_research(e2e_dir, bug_id)
+        prev_research_section = ""
+        if prev_research:
+            prev_research_section = f"""## Previous research (research-{prev_idx}.md)
+
+The following research was done previously for this bug. It may be incomplete or
+have led the fix agent in the wrong direction. Build on what's useful, discard what's not.
+
+<previous_research>
+{prev_research}
+</previous_research>
+"""
+
+        # Load supervisor summaries if this is a redirected research
+        supervisor_section = ""
+        if supervisor_directive:
+            summaries = _read_supervisor_summaries(e2e_dir, bug_id)
+            summaries_text = ""
+            if summaries:
+                summaries_text = "\n\n---\n\n".join(
+                    f"### Supervisor run #{i+1}\n{s}" for i, s in enumerate(summaries)
+                )
+                summaries_text = f"""### Previous supervisor assessments (summaries)
+
+{summaries_text}
+"""
+            supervisor_section = f"""## Supervisor directive
+
+The bug supervisor has reviewed failed fix attempts and is redirecting research.
+Follow the supervisor's guidance on what to investigate.
+
+<directive>
+{supervisor_directive}
+</directive>
+
+{summaries_text}"""
+
+        # Build fix attempt history summary
+        attempts_section = ""
+        attempts = history.get("fix_attempts", [])
+        if attempts:
+            lines = []
+            for a in attempts:
+                lines.append(
+                    f"- **Attempt {a['attempt']}**: {a['approach']}\n"
+                    f"  Result: {a['verify_status']}\n"
+                    f"  Evidence: {a['verify_evidence'][:300]}"
+                )
+            attempts_section = f"""## Previous fix attempts (all failed)
+
+These approaches have already been tried and failed. Do NOT recommend any of them.
+
+{chr(10).join(lines)}
+"""
+
+        next_idx = (prev_idx or 0) + 1
+
+        return f"""You are a research agent investigating a specific bug before a fix agent attempts to resolve it.
+
+## Bug details
+
+- **ID**: {bug["id"]}
+- **Screen**: {bug.get("screen", "unknown")}
+- **Summary**: {bug.get("summary", "")}
+- **Expected**: {bug.get("expected", "")}
+- **Actual**: {bug.get("actual", "")}
+- **Steps to reproduce**: {json.dumps(bug.get("steps_to_reproduce", []))}
+
+{attempts_section}
+{prev_research_section}
+{supervisor_section}
+
+## Your mission
+
+Investigate this bug thoroughly and produce a research report that gives the fix
+agent a clear, evidence-based strategy. Do NOT guess — find real answers.
+
+### Research steps
+
+1. **Search the codebase** — find the relevant source files for this screen/component.
+   Grep for class names, composable function names, view model references.
+2. **Read the code** — understand the current implementation. What does it do now?
+   What's the gap between current behavior and the spec?
+3. **Search the web** — look up documentation, Stack Overflow answers, and official
+   guides for the specific API/framework behavior involved. For Compose accessibility,
+   search for the exact Modifier or API that's relevant.
+4. **Find working examples** — search the codebase for similar patterns that already
+   work correctly. If another screen handles the same concern (e.g., accessibility,
+   navigation, validation), show how it does it.
+5. **Synthesize a fix strategy** — based on your research, recommend a specific
+   approach. Include the exact API calls, modifier chains, or code patterns to use.
+   Be concrete: "use X with parameters Y" not "consider using X".
+
+## UI_FLOW.md (specification)
+
+<ui_flow>
+{ui_flow}
+</ui_flow>
+
+## Output
+
+Write your research report to `{bug_d}/research-{next_idx}.md` with this structure:
+
+```markdown
+# Research: {bug["id"]} — {bug.get("summary", "")}
+
+## Root cause analysis
+[What's actually wrong in the code and why]
+
+## Evidence
+[Code snippets, documentation quotes, working examples found in codebase]
+
+## Recommended fix strategy
+[Concrete approach — exact API calls, code patterns, file paths to modify]
+
+## What NOT to do
+[Approaches already tried that failed, and why they failed]
+
+## Confidence
+[High/Medium/Low — and what would increase confidence if Low]
+```
+
+## Rules
+
+- Do NOT modify any source code — research only
+- Do NOT modify findings.json
+- Be specific — "add Modifier.semantics(mergeDescendants = true)" is good,
+  "improve accessibility" is useless
+- If you find contradictory information, note both sides and recommend the
+  approach with stronger evidence
+- If your confidence is Low, say so — it's better to admit uncertainty than
+  to send the fix agent down a wrong path
+"""
+
+    def _build_e2e_bug_supervisor_prompt(self, bug: dict, e2e_dir: Path,
+                                          ui_flow: str) -> str:
+        """Build prompt for a per-bug supervisor that reviews fix attempts."""
+        bug_id = bug["id"]
+        bug_d = _bug_dir(e2e_dir, bug_id)
+        history = _read_bug_history(e2e_dir, bug_id)
+        supervisor_run = history.get("supervisor_runs", 0) + 1
+
+        # Load all previous supervisor summaries
+        prev_summaries = _read_supervisor_summaries(e2e_dir, bug_id)
+        summaries_section = ""
+        if prev_summaries:
+            lines = []
+            for i, s in enumerate(prev_summaries):
+                lines.append(f"### Supervisor run #{i+1}\n{s}")
+            summaries_section = f"""## Previous supervisor assessments
+
+Read these carefully — they contain what was already tried and what conclusions
+were reached. Do NOT repeat strategies that previous supervisors already rejected.
+
+{chr(10).join(lines)}
+"""
+
+        # Load fix attempt history
+        attempts = history.get("fix_attempts", [])
+        attempts_lines = []
+        for a in attempts:
+            attempts_lines.append(
+                f"### Attempt {a['attempt']}\n"
+                f"- **Approach**: {a['approach']}\n"
+                f"- **Result**: {a['verify_status']}\n"
+                f"- **Evidence**: {a['verify_evidence'][:500]}\n"
+                f"- **Timestamp**: {a.get('timestamp', 'unknown')}"
+            )
+        attempts_section = "\n\n".join(attempts_lines) if attempts_lines else "(no attempts recorded)"
+
+        # Load latest research
+        research_content, research_idx = _read_latest_research(e2e_dir, bug_id)
+        research_section = ""
+        if research_content:
+            research_section = f"""## Latest research (research-{research_idx}.md)
+
+<research>
+{research_content}
+</research>
+"""
+
+        return f"""You are a bug supervisor agent. A specific bug has failed to be fixed after multiple attempts. Review the history and decide the next action.
+
+## Bug details
+
+- **ID**: {bug["id"]}
+- **Screen**: {bug.get("screen", "unknown")}
+- **Summary**: {bug.get("summary", "")}
+- **Expected**: {bug.get("expected", "")}
+- **Actual**: {bug.get("actual", "")}
+
+## Fix attempt history
+
+{attempts_section}
+
+{research_section}
+{summaries_section}
+
+## UI_FLOW.md (relevant specification)
+
+<ui_flow>
+{ui_flow}
+</ui_flow>
+
+## Your decision
+
+This is supervisor run #{supervisor_run} for this bug (max 5 before human escalation).
+
+Analyze the fix history and determine:
+
+1. **Is the current approach viable?** Look at whether recent attempts are making
+   progress (getting closer to the right state) or oscillating (alternating between
+   two failed approaches).
+2. **Is the research accurate?** Compare what the research recommended against what
+   the verify evidence shows. If the research was wrong, new research is needed.
+3. **Is this a code problem, spec problem, or infra problem?**
+   - Code: the implementation approach is wrong, need a different strategy
+   - Spec: the spec requires something the platform genuinely can't do
+   - Infra: the test tooling can't verify this properly
+
+### Decision: DIRECT_FIX
+
+If you have a concrete fix strategy based on the evidence (not a guess):
+
+```markdown
+# DIRECT_FIX
+
+## Strategy
+[Exact approach — specific API calls, code changes, file paths]
+
+## Why this will work
+[Evidence from the history/research that supports this approach]
+
+## What's different from previous attempts
+[How this differs from what was already tried]
+```
+
+### Decision: REDIRECT_RESEARCH
+
+If the current research was wrong or incomplete and new investigation is needed:
+
+```markdown
+# REDIRECT_RESEARCH
+
+## What went wrong with current approach
+[Why the research/fix direction isn't working]
+
+## Research directive
+Question: [specific question the research agent should answer]
+
+Context: [what's been ruled out and why]
+
+Leads to investigate:
+- [specific search leads — APIs to look up, code to examine, docs to read]
+```
+
+### Decision: ESCALATE
+
+If this bug is fundamentally stuck (supervisor run 4+ or clearly unsolvable):
+
+```markdown
+# ESCALATE
+
+## Category
+[code | spec | infra]
+
+## Why we're stuck
+[Summary of what's been tried and why nothing works]
+
+## What a human could provide
+[Specific guidance or decision needed]
+```
+
+Write your decision to `{bug_d}/supervisor-{supervisor_run}-decision.md`.
+
+Also write a SHORT summary (under 15 lines) to `{bug_d}/supervisor-{supervisor_run}-summary.md`.
+The summary should contain:
+- Approach evaluated
+- Why it failed (one line)
+- Decision taken (DIRECT_FIX / REDIRECT_RESEARCH / ESCALATE)
+- Key insight for next supervisor (one line)
+
+This summary is what future supervisors and research agents will see — make it count.
+
+## Rules
+
+- Do NOT modify source code
+- Do NOT modify findings.json
+- Be decisive — pick one decision, don't hedge
+- If you see oscillation (approach A → fail → approach B → fail → approach A again),
+  that's a strong signal for REDIRECT_RESEARCH with new questions
+- ESCALATE is not failure — it's the right call when the evidence shows the bug
+  can't be resolved without human input
+"""
+
+    def _build_e2e_escalation_prompt(self, bug: dict, e2e_dir: Path,
+                                      category: str) -> str:
+        """Build prompt for the synthesis agent that produces BLOCKED.md."""
+        bug_id = bug["id"]
+        bug_d = _bug_dir(e2e_dir, bug_id)
+        history = _read_bug_history(e2e_dir, bug_id)
+
+        # Collect all artifacts
+        summaries = _read_supervisor_summaries(e2e_dir, bug_id)
+        research_content, research_idx = _read_latest_research(e2e_dir, bug_id)
+
+        attempts = history.get("fix_attempts", [])
+        attempts_text = json.dumps(attempts, indent=2)
+
+        summaries_text = "\n\n---\n\n".join(
+            f"### Supervisor #{i+1}\n{s}" for i, s in enumerate(summaries)
+        )
+
+        # List all files in the bug directory for linking
+        files_list = ""
+        if bug_d.exists():
+            files = sorted(bug_d.iterdir())
+            files_list = "\n".join(f"- `{f.relative_to(e2e_dir.parent)}`" for f in files if f.is_file())
+
+        return f"""You are an escalation synthesis agent. A bug has exhausted all automated fix attempts and needs human intervention. Produce a clear, actionable BLOCKED.md.
+
+## Bug details
+
+- **ID**: {bug["id"]}
+- **Screen**: {bug.get("screen", "unknown")}
+- **Summary**: {bug.get("summary", "")}
+- **Expected**: {bug.get("expected", "")}
+- **Actual**: {bug.get("actual", "")}
+- **Escalation category**: {category}
+
+## Fix attempt history
+
+<attempts>
+{attempts_text}
+</attempts>
+
+## Supervisor summaries
+
+{summaries_text if summaries_text else "(none)"}
+
+## Latest research
+
+<research>
+{research_content if research_content else "(none)"}
+</research>
+
+## Files in bug directory
+
+{files_list}
+
+## Your mission
+
+Write `{bug_d}/BLOCKED.md` with a synthesis that a human (or a future agent
+parsing BLOCKED.md) can act on immediately.
+
+### For category: code
+- Summarize what was tried and why each approach failed
+- Identify the core technical question that needs answering
+- Suggest what a human with domain expertise should look at
+- Link to all relevant bug directory files
+
+### For category: spec
+- Explain what the spec requires
+- Provide evidence that the platform can't satisfy it
+- Propose a specific spec revision
+- Analyze impact on other bugs/requirements
+
+### For category: infra
+- Explain what verification was attempted
+- Show why the tooling can't verify the expected behavior
+- Propose alternative verification approaches
+- Link to relevant evidence files
+
+## Output format
+
+```markdown
+# BLOCKED: {bug["id"]} — {bug.get("summary", "")}
+
+**Category**: {category}
+**Fix attempts**: {{count}}
+**Supervisor runs**: {{count}}
+
+## Summary
+[2-3 sentence synthesis of the entire investigation]
+
+## What was tried
+[Bulleted list of approaches with one-line failure reasons]
+
+## Root cause assessment
+[Why automated fixing couldn't resolve this]
+
+## Recommended human action
+[Specific, actionable next step]
+
+## Evidence files
+[Links to all files in the bug directory]
+```
+
+## Rules
+
+- Be concise — the human should understand the situation in 30 seconds
+- Link to files, don't paste their full contents
+- The "Recommended human action" must be specific enough to act on immediately
+- Do NOT modify source code or findings.json
+"""
+
+    def _build_e2e_test_writer_prompt(self, fixed_bugs: list[dict],
+                                       e2e_dir: Path, spec_dir: str) -> str:
+        """Build prompt for an agent that writes UI Automator regression tests
+        for bugs that were just verified as fixed."""
+        bug_sections = []
+        for bug in fixed_bugs:
+            bug_id = bug.get("id", "")
+            bug_d = _bug_dir(e2e_dir, bug_id)
+
+            # Collect fix approach
+            approach = ""
+            approach_file = bug_d / "fix-approach-latest.md"
+            if approach_file.exists():
+                approach = approach_file.read_text()
+
+            # Collect verify evidence
+            evidence = ""
+            evidence_files = sorted(bug_d.glob("verify-evidence-*.md"))
+            if evidence_files:
+                evidence = evidence_files[-1].read_text()
+
+            # Collect research (for API knowledge)
+            research, _ = _read_latest_research(e2e_dir, bug_id)
+
+            bug_sections.append(f"""### {bug_id}: {bug.get("summary", "")}
+
+**Screen**: {bug.get("screen", "unknown")}
+**Expected**: {bug.get("expected", "")}
+**Actual (before fix)**: {bug.get("actual", "")}
+**Steps to reproduce**: {json.dumps(bug.get("steps_to_reproduce", []))}
+
+**Fix approach**:
+{approach if approach else "(not recorded)"}
+
+**Verify evidence (confirming fix works)**:
+{evidence if evidence else "(not recorded)"}
+
+{f"**Research context**:{chr(10)}{research[:2000]}" if research else ""}
+""")
+
+        bugs_text = "\n---\n".join(bug_sections)
+
+        return f"""You are a test-writer agent. Bugs were just verified as fixed on a live Android emulator.
+Your job is to write **UI Automator instrumented tests** that assert each fix, creating a
+permanent regression gate.
+
+## Bugs to write tests for ({len(fixed_bugs)} total)
+
+{bugs_text}
+
+## Test framework: UI Automator
+
+Write tests using `androidx.test.uiautomator`. These tests:
+- Run on a real emulator via `./gradlew connectedDebugAndroidTest`
+- Access the same accessibility tree that DumpHierarchy reads
+- Can test cross-process interactions (deep links, notifications, back stack)
+
+### Key APIs
+
+```kotlin
+// Get the device
+val device = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
+
+// Find elements
+device.findObject(By.text("Settings"))           // by visible text
+device.findObject(By.res("com.nixkey", "toggle")) // by resource ID
+device.findObject(By.checkable(true))             // by property
+device.findObject(By.desc("content description")) // by accessibility label
+
+// Interact
+obj.click()
+obj.text = "input text"
+device.pressBack()
+
+// Assert
+assertTrue(device.findObject(By.text("Error")).exists())
+assertNotNull(device.findObject(By.checkable(true).checked(true)))
+
+// Wait for elements
+device.wait(Until.hasObject(By.text("Success")), 5000)
+
+// Launch app
+val context = ApplicationProvider.getApplicationContext<Context>()
+val intent = context.packageManager.getLaunchIntentForPackage("com.nixkey")
+context.startActivity(intent)
+device.wait(Until.hasObject(By.pkg("com.nixkey")), 5000)
+
+// Deep links
+val deepLink = Intent(Intent.ACTION_VIEW, Uri.parse("nix-key://pair?payload=..."))
+context.startActivity(deepLink)
+```
+
+## Where to put tests
+
+Write tests to `android/app/src/androidTest/java/com/nixkey/e2e/` — one test class
+per screen, with test methods per bug. If the file already exists, **add to it** rather
+than overwriting.
+
+Naming convention: `{{Screen}}E2ETest.kt` (e.g., `SettingsE2ETest.kt`, `PairingE2ETest.kt`)
+
+Each test class should:
+```kotlin
+@RunWith(AndroidJUnit4::class)
+@LargeTest
+class SettingsE2ETest {{
+    private lateinit var device: UiDevice
+
+    @Before
+    fun setup() {{
+        device = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
+        // Launch app and navigate to the screen under test
+    }}
+
+    @Test
+    fun testOtelValidationShowsError() {{
+        // Navigate to Settings
+        // Enter invalid OTEL endpoint
+        // Assert error message appears
+    }}
+}}
+```
+
+## Instructions
+
+1. Read existing test files in `android/app/src/androidTest/` to understand the project's
+   test patterns and imports
+2. For each fixed bug:
+   a. Read the verify evidence — it contains the exact DumpHierarchy state that confirmed the fix
+   b. Translate the verification into a UI Automator assertion
+   c. The test should reproduce the bug's steps and assert the fixed behavior
+3. Make sure `build.gradle` has the UI Automator dependency:
+   ```
+   androidTestImplementation "androidx.test.uiautomator:uiautomator:2.3.0"
+   ```
+   If missing, add it.
+4. **Do NOT run the tests** — the runner will do that after you finish
+5. Commit the tests with a conventional commit message
+
+## Rules
+
+- Write focused, minimal tests — one assertion per bug, not comprehensive screen tests
+- Use the verify evidence to know exactly what to assert (e.g., "checkable=true" → `By.checkable(true)`)
+- If a bug's verify evidence is missing, skip that bug (don't guess)
+- Do NOT modify app source code — only write tests
+- Do NOT modify findings.json
+- Tests must be deterministic — no timing-dependent assertions without explicit waits
 """
 
     def _run_ci_loop(self, task: Task, spec_dir: str, task_file: Path,

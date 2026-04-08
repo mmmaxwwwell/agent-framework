@@ -162,33 +162,60 @@ Include a late-phase task that runs ALL user-flow integration tests together aft
 Load `reference/e2e-runtime.md` before writing E2E tasks for projects targeting Android, iOS, web/PWA, or desktop platforms. The reference defines: runtime selection (real emulator/browser, never simulated), side-by-side architecture for multi-runtime tests, readiness checks, test bypass mechanisms for hardware features, UI automation patterns, flakiness handling, and CI infrastructure. Follow the task generation guidance in that reference — decompose E2E prerequisites into separate infrastructure tasks (artifact build, environment setup, test bypass, UI helper library) before writing the E2E test task itself.
 
 ### MCP-driven E2E exploration (if interview-notes specify MCP debug tools)
-Load `reference/mcp-e2e.md` before writing MCP E2E tasks. If the interview confirmed that agents should use MCP tools for visual E2E testing, include an **E2E exploration task** with the `[needs: mcp-<platform>, e2e-loop]` capabilities. This task uses the runner's explore-fix-verify loop:
+Load `reference/mcp-e2e.md` before writing MCP E2E tasks. If the interview confirmed that agents should use MCP tools for visual E2E testing, include **per-screen E2E tasks** with the `[needs: mcp-<platform>, e2e-loop]` capabilities. Each task uses the runner's explore-research-fix-verify loop.
 
+**CRITICAL: Split E2E tasks by screen, NOT one monolithic task.** Each screen (or pair of related screens) gets its own task. This keeps explore cycles short (~5-7 minutes instead of 20-25), gets the research→fix→verify loop running faster, and prevents one hard bug from blocking progress on other screens.
+
+**Bad** — one monolithic task:
 ```markdown
-- [ ] T0XX E2E integration test exploration [needs: mcp-android, e2e-loop]
-  Done when: all screens and flows from UI_FLOW.md have been visually verified
-  on the real runtime, all discovered bugs are fixed and verified, findings.json
-  shows zero open bugs.
+- [ ] T0XX Validate all screens [needs: mcp-android, e2e-loop]
 ```
 
-**This task is placed AFTER all implementation phases** — it depends on the app being buildable and functional. The runner handles the full lifecycle (boot runtime, build APK, install, explore, fix, rebuild, verify, **post-loop regression check**).
+**Good** — one task per screen or per 2 related screens:
+```markdown
+- [ ] T0XX Validate AuthScreen + HomeScreen [needs: mcp-android, e2e-loop]
+  Done when: both screens validated against UI_FLOW.md, findings.json has pass/fail.
+
+- [ ] T0XY Validate SettingsScreen [needs: mcp-android, e2e-loop]
+  Done when: all sections validated, toggle defaults and dropdown labels match spec.
+
+- [ ] T0XZ Validate PairingScreen [needs: mcp-android, e2e-loop]
+  Done when: pairing phases verified (scan, connect, success, error).
+
+- [ ] T0XW Validate navigation flows [needs: mcp-android, e2e-loop]
+  Done when: every navigation edge from UI_FLOW.md flowchart exercised.
+```
+
+Each task gets its own E2E loop with independent findings, per-bug research agents, fix cycles, and supervisor oversight. If one screen has hard bugs, it doesn't block other screens.
+
+**The E2E loop per task**: For each task, the runner automatically runs:
+1. **Explore** — agent discovers bugs on the screen(s)
+2. **Research** — per-bug research agent investigates (searches web, codebase, docs) before fix
+3. **Fix** — agent fixes bugs guided by research reports and supervisor guidance
+4. **Verify** — agent produces structured evidence (raw hierarchy XML, exact assertions)
+5. **Test writer** — writes UI Automator regression tests for verified fixes, then runs them
+6. **Bug supervisor** — after 3 failed fix attempts, reviews history and redirects or escalates
+7. **Regression check** — runs full test suite after loop completes
+
+**These tasks are placed AFTER all implementation phases** — they depend on the app being buildable and functional. The runner handles the full lifecycle.
 
 **Post-loop regression check**: After the E2E loop finishes, the runner automatically runs a regression check agent that executes the project's full test suite (all languages, lint, security scans). This catches regressions from E2E fixes without requiring a separate task. The regression agent reads `CLAUDE.md` to discover test commands — **ensure CLAUDE.md lists ALL test commands explicitly**, including per-language and per-platform commands (e.g., `make test` for Go, `./gradlew testDebugUnitTest` for Android JVM, `./gradlew ktlintCheck` for Kotlin lint).
 
-**Backend service setup**: If the app requires backend services to test all screens (daemon, database, mesh network, API server), generate a `test/e2e/setup.sh` and `test/e2e/teardown.sh` task BEFORE the E2E exploration task. The runner calls `setup.sh` automatically before the E2E loop starts. See `reference/e2e-runtime.md § Backend service setup for MCP E2E loops`.
+**Backend service setup**: If the app requires backend services to test all screens (daemon, database, mesh network, API server), generate a `test/e2e/setup.sh` and `test/e2e/teardown.sh` task BEFORE the E2E exploration tasks. The runner calls `setup.sh` automatically before the E2E loop starts. See `reference/e2e-runtime.md § Backend service setup for MCP E2E loops`.
 
-**CRITICAL: Do NOT generate tasks that build orchestration code for MCP E2E.** The runner already handles emulator boot, APK build+install, MCP server lifecycle, backend service setup/teardown, and the explore-fix-verify loop. Tasks should NOT create shell scripts, prompt templates, scenario runners, report libraries, or any code whose purpose is to invoke or manage agents. The implementing agent receives MCP tools directly from the runner and uses them to interact with the live app. See the anti-patterns section in `reference/mcp-e2e.md`. If a generated task description says "create a script that..." or "write a prompt template for..." for E2E testing, it is WRONG — rewrite it as "use MCP tools to verify [thing] on the live emulator."
+**CRITICAL: Do NOT generate tasks that build orchestration code for MCP E2E.** The runner already handles emulator boot, APK build+install, MCP server lifecycle, backend service setup/teardown, and the explore-research-fix-verify loop. Tasks should NOT create shell scripts, prompt templates, scenario runners, report libraries, or any code whose purpose is to invoke or manage agents. The implementing agent receives MCP tools directly from the runner and uses them to interact with the live app. See the anti-patterns section in `reference/mcp-e2e.md`. If a generated task description says "create a script that..." or "write a prompt template for..." for E2E testing, it is WRONG — rewrite it as "use MCP tools to verify [thing] on the live emulator."
 
-**Multiple platform tasks**: If the project targets multiple platforms, create one E2E exploration task per platform:
+**Multiple platform tasks**: If the project targets multiple platforms, create per-screen tasks for each platform:
 ```markdown
-- [ ] T0XX E2E Android exploration [needs: mcp-android, e2e-loop]
-- [ ] T0YY E2E Browser exploration [needs: mcp-browser, e2e-loop] [P]
-- [ ] T0ZZ E2E iOS exploration [needs: mcp-ios, e2e-loop] [P]
+- [ ] T0XX Validate Android AuthScreen [needs: mcp-android, e2e-loop]
+- [ ] T0XY Validate Android SettingsScreen [needs: mcp-android, e2e-loop]
+- [ ] T0YY Validate Browser AuthScreen [needs: mcp-browser, e2e-loop] [P]
+- [ ] T0YZ Validate Browser SettingsScreen [needs: mcp-browser, e2e-loop] [P]
 ```
 
-Browser and iOS tasks can run in parallel with each other (different runtimes), but each depends on all implementation phases being complete.
+Browser and iOS tasks can run in parallel with each other (different runtimes), but tasks within a single platform must run sequentially (single emulator/simulator constraint).
 
-**Single platform projects**: If the project targets only one platform (e.g., Android only), do NOT mark scenario tasks as `[P]` — they all share one emulator and must run sequentially. Only non-runtime tasks (prompt writing, config files) can be parallelized. See `reference/e2e-runtime.md § Single-runtime constraint on parallelism`.
+**Single platform projects**: If the project targets only one platform (e.g., Android only), do NOT mark E2E tasks as `[P]` — they all share one emulator and must run sequentially. Only non-runtime tasks (prompt writing, config files) can be parallelized. See `reference/e2e-runtime.md § Single-runtime constraint on parallelism`.
 
 **Nix-first projects**: If `interview-notes.md` records `Nix available: yes`, the E2E setup phase MUST include a task that adds `nix-mcp-debugkit` as a flake input in `flake.nix` and exposes `mcp-android`, `mcp-browser`, and/or `mcp-ios` as packages. This pins the MCP debug toolkit version in `flake.lock` and lets the runner use `.#mcp-<platform>` instead of an unpinned `github:` URI. Example flake input:
 

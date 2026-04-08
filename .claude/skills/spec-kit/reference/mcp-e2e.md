@@ -44,7 +44,7 @@ Tasks that should use the E2E explore-fix-verify loop MUST declare both capabili
 
 The `e2e-loop` capability tells the runner to use the explore-fix-verify cycle instead of the normal implementation flow. The `mcp-android` (or `mcp-browser`, `mcp-ios`) capability tells the runner which platform runtime to boot and which MCP server to provide.
 
-## The explore-fix-verify loop
+## The explore-research-fix-verify loop
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -61,8 +61,20 @@ The `e2e-loop` capability tells the runner to use the explore-fix-verify cycle i
           └────────────┬────────────┘
                        │
           ┌────────────▼────────────┐
+          │  RESEARCH agent(s)      │
+          │  - 1 per new bug        │
+          │  - Search web + code    │
+          │  - Find working examples│
+          │  - Recommend fix        │
+          │  → bugs/BUG-XXX/        │
+          │    research-N.md        │
+          └────────────┬────────────┘
+                       │
+          ┌────────────▼────────────┐
           │  FIX agent (no MCP)     │
           │  - Read findings.json   │
+          │  - Read research reports│
+          │  - Follow guidance      │
           │  - Fix ALL bugs         │
           │  - Commit changes       │
           └────────────┬────────────┘
@@ -75,11 +87,42 @@ The `e2e-loop` capability tells the runner to use the explore-fix-verify cycle i
           │  VERIFY agent (MCP)     │
           │  - Re-test each bug     │
           │  - Mark fixed/broken    │
+          │  - Write structured     │
+          │    evidence per bug     │
           │  - Find NEW bugs        │
-          │  → updated findings     │
+          │  → updated findings +   │
+          │    verify-evidence-N.md │
           └────────────┬────────────┘
                        │
-                  Loop until clean
+              Loop until clean
+                       │
+         After 3 failed fixes ──────────┐
+                                        │
+          ┌─────────────────────────────▼┐
+          │  BUG SUPERVISOR agent        │
+          │  - Review fix history        │
+          │  - Read supervisor summaries │
+          │  - Decide: DIRECT_FIX /      │
+          │    REDIRECT_RESEARCH /       │
+          │    ESCALATE                  │
+          │  → supervisor-N-summary.md   │
+          │  → supervisor-N-decision.md  │
+          └──────────────┬───────────────┘
+                         │
+          ┌──────────────▼───────────────┐
+          │  1 more fix attempt          │
+          │  (with supervisor guidance)  │
+          └──────────────┬───────────────┘
+                         │
+         After 5 supervisors ───────────┐
+                                        │
+          ┌─────────────────────────────▼┐
+          │  ESCALATION agent            │
+          │  - Synthesize full history   │
+          │  - Categorize: code/spec/    │
+          │    infra                     │
+          │  → BLOCKED.md               │
+          └──────────────────────────────┘
                        │
           ┌────────────▼────────────┐
           │  REGRESSION agent       │
@@ -89,6 +132,90 @@ The `e2e-loop` capability tells the runner to use the explore-fix-verify cycle i
           │  → regression-report.md │
           └─────────────────────────┘
 ```
+
+### Per-bug file structure
+
+Each bug gets its own directory for tracking research, fix history, supervisor
+assessments, and verify evidence:
+
+```
+validate/e2e/bugs/BUG-008/
+  research-1.md              # Initial research report
+  research-2.md              # Redirected research (after supervisor)
+  history.json               # Structured fix attempt log
+  fix-approach-latest.md     # What the fix agent changed (overwritten each attempt)
+  verify-evidence-1.md       # Structured evidence from verify iteration 1
+  verify-evidence-2.md       # Evidence from iteration 2
+  supervisor-1-summary.md    # Short summary for chain (< 15 lines)
+  supervisor-1-decision.md   # Full decision (DIRECT_FIX/REDIRECT_RESEARCH/ESCALATE)
+  supervisor-2-summary.md
+  supervisor-2-decision.md
+  BLOCKED.md                 # Only if escalated — synthesis for human
+```
+
+### Research agent
+
+When the explore agent discovers new bugs, the runner spawns a **research agent per bug** before the fix agent runs. The research agent:
+
+1. Searches the codebase for relevant source files
+2. Reads the code to understand the current implementation
+3. Searches the web for documentation, guides, and working examples
+4. Finds similar patterns in the codebase that already work
+5. Synthesizes a concrete fix strategy with specific API calls and code patterns
+6. Writes its report to `bugs/BUG-XXX/research-N.md`
+
+The fix agent receives the research report and is instructed to follow its recommendations.
+
+When a supervisor issues REDIRECT_RESEARCH, a new research agent spawns with the
+supervisor's directive, all previous supervisor summaries, and the fix attempt history.
+This ensures the new research doesn't repeat dead-end investigations.
+
+### Verify agent structured evidence
+
+The verify agent now writes **structured evidence** per bug to `bugs/BUG-XXX/verify-evidence-N.md`. Each evidence file contains:
+
+- **Actions taken**: exact MCP tool calls and parameters
+- **Observed state**: raw DumpHierarchy XML snippet (not a summary)
+- **Expected state**: what the XML should look like per spec
+- **Delta**: concrete difference (e.g., "checkable=false, expected checkable=true")
+
+This evidence is fed to the fix agent and supervisor in subsequent iterations.
+
+### Bug supervisor
+
+After 3 failed fix attempts for a specific bug, the runner spawns a **bug supervisor** instead of immediately retrying. The supervisor:
+
+1. Reads all fix attempts, their approaches, and verify evidence
+2. Reads all previous supervisor summaries (short chain, not full transcripts)
+3. Reads the latest research report
+4. Decides one of three actions:
+
+| Decision | What happens |
+|----------|-------------|
+| **DIRECT_FIX** | Supervisor provides a concrete fix strategy. Fix agent gets 1 more attempt with this guidance. |
+| **REDIRECT_RESEARCH** | Current research direction is wrong. New research agent spawns with supervisor's directive and new questions. |
+| **ESCALATE** | Bug can't be fixed automatically. Synthesis agent produces BLOCKED.md. |
+
+Each supervisor writes a **short summary** (< 15 lines) that future supervisors and research agents see. This prevents context bloat while preserving what was tried.
+
+After each supervisor, the fix agent gets **1 attempt** (not 3). If that attempt fails, the next supervisor fires immediately.
+
+Maximum 5 supervisor runs per bug before escalation to human.
+
+### Escalation
+
+When a bug exhausts all supervisor runs (or a supervisor explicitly escalates), a **synthesis agent** produces `bugs/BUG-XXX/BLOCKED.md` with:
+
+- Full history synthesis (what was tried, why each approach failed)
+- Category: **code** (implementation stuck), **spec** (platform can't satisfy requirement), or **infra** (tooling can't verify)
+- Specific recommended human action
+- Links to all evidence files in the bug directory
+
+Escalated bugs are marked `wont_fix` in findings.json and excluded from further fix attempts. The E2E loop continues fixing other bugs.
+
+### Fix attempt budget
+
+Per bug: 3 initial attempts + up to 5 supervisor cycles with 1 attempt each = **8 max fix attempts** before human escalation.
 
 ### Post-loop regression check
 
@@ -110,11 +237,19 @@ The explore agent has MCP tools and reads:
 - `spec.md` — functional requirements
 - Previous findings (if any) — to avoid re-reporting known bugs
 
-It systematically walks every screen and flow, taking screenshots and reading view trees. It tests both happy paths and error paths. It writes ALL bugs to `validate/e2e/findings.json`.
+It systematically walks every screen and flow, taking screenshots and reading view trees. It tests both happy paths and error paths. It writes ALL bugs to `validate/e2e/findings.json` with a `bug_dir` field pointing to the per-bug directory.
 
 ### Fix agent
 
 The fix agent reads the findings and fixes ALL reported bugs in a single batch pass. It does NOT have MCP tools — it only needs source code access. This keeps token cost down by not loading MCP context for code-only work.
+
+The fix agent now receives per-bug context:
+- **Research reports** with recommended fix strategies
+- **Supervisor guidance** (if the bug supervisor has run)
+- **Fix attempt history** showing what was already tried and failed
+- **Verify evidence** showing the exact observed vs expected state
+
+After fixing each bug, the fix agent writes `bugs/BUG-XXX/fix-approach-latest.md` describing what it changed.
 
 ### Verify agent
 
@@ -124,9 +259,11 @@ The verify agent re-tests each bug from the findings. It has MCP tools and follo
 
 It also discovers new bugs found during re-testing.
 
-### Supervisor agent
+**Structured evidence**: The verify agent now writes detailed evidence to `bugs/BUG-XXX/verify-evidence-N.md` for every bug it checks. Evidence includes raw DumpHierarchy XML, exact assertions, and concrete deltas. This evidence is fed to fix agents and supervisors in subsequent iterations.
 
-Every N iterations (default 10), a supervisor agent reviews progress:
+### Iteration-level supervisor agent
+
+Every N iterations (default 10), an iteration-level supervisor agent reviews overall progress:
 - Checks if bugs are being fixed (diminishing open count)
 - Checks if coverage is improving (new screens/flows being tested)
 - Detects stuck loops (same bugs repeatedly fixed then broken)
@@ -137,7 +274,7 @@ Every N iterations (default 10), a supervisor agent reviews progress:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "iteration": 3,
   "findings": [
     {
@@ -154,6 +291,7 @@ Every N iterations (default 10), a supervisor agent reviews progress:
       "expected": "Error dialog: 'Invalid auth key format'",
       "actual": "Screen goes blank, no error shown",
       "screenshot_path": "validate/e2e/screenshots/BUG-001-blank.png",
+      "bug_dir": "validate/e2e/bugs/BUG-001",
       "status": "new"
     }
   ]
@@ -166,8 +304,27 @@ Every N iterations (default 10), a supervisor agent reviews progress:
 |--------|---------|
 | `new` | Just discovered, not yet fixed |
 | `fixed` | Verify agent confirmed the fix works |
+| `verified_fixed` | Fix confirmed across multiple iterations |
 | `verified_broken` | Fix attempt failed, bug still exists |
-| `wont_fix` | Intentional behavior or out of scope |
+| `wont_fix` | Escalated to human or intentional behavior |
+
+### Per-bug history.json format
+
+```json
+{
+  "bug_id": "BUG-008",
+  "fix_attempts": [
+    {
+      "attempt": 1,
+      "approach": "Added Modifier.toggleable(role=Switch)...",
+      "verify_status": "failed",
+      "verify_evidence": "Switch node has checkable=false in hierarchy...",
+      "timestamp": "2026-04-07T14:30:00"
+    }
+  ],
+  "supervisor_runs": 2
+}
+```
 
 ## Context window management
 
@@ -270,15 +427,43 @@ When an agent has MCP tools, it can:
 
 ## Integration with spec-kit workflow
 
-E2E loop tasks are typically placed in later phases (after core implementation is done):
+E2E loop tasks are typically placed in later phases (after core implementation is done).
 
+### CRITICAL: Split tasks by screen, not by "all screens"
+
+Each E2E task should cover **1-2 screens**, not all screens at once. This keeps
+explore cycles short (~5-7 minutes instead of 20-25), gets the research→fix→verify
+loop running faster, and prevents one hard bug from blocking progress on other screens.
+
+**Bad** — one monolithic task:
 ```markdown
-## Phase 10: E2E Integration Testing
-
-- [ ] T045 E2E integration test exploration [needs: mcp-android, e2e-loop]
-  Done when: all screens and flows from UI_FLOW.md have been visually verified,
-  all discovered bugs are fixed, findings.json shows zero open bugs.
+- [ ] T045 Validate all screens [needs: mcp-android, e2e-loop]
 ```
+
+**Good** — one task per screen or per 2 related screens:
+```markdown
+## Phase 10: Screen Validation
+
+- [ ] T045 Validate TailscaleAuth + ServerList screens [needs: mcp-android, e2e-loop]
+  Done when: both screens validated against UI_FLOW.md, findings.json has pass/fail.
+
+- [ ] T046 Validate Settings screen [needs: mcp-android, e2e-loop]
+  Done when: all sections (Security, Tailscale, Tracing, About) validated,
+  toggle defaults and dropdown labels match spec.
+
+- [ ] T047 Validate Pairing screen [needs: mcp-android, e2e-loop]
+  Done when: pairing phases verified (scan, connect, success, error),
+  deep link and QR paths tested.
+
+- [ ] T048 Validate KeyManagement + KeyDetail screens [needs: mcp-android, e2e-loop]
+  Done when: key CRUD verified, policy dropdowns, unlock state, delete confirmation.
+
+- [ ] T049 Validate navigation flows [needs: mcp-android, e2e-loop]
+  Done when: every navigation edge from UI_FLOW.md flowchart exercised.
+```
+
+Each task gets its own E2E loop with independent findings, research, and fix cycles.
+If Settings has 4 hard accessibility bugs, it doesn't block Pairing from being validated and fixed.
 
 The phase depends on all implementation phases being complete. The runner handles the entire lifecycle — no manual intervention needed unless the supervisor requests it.
 
