@@ -164,25 +164,30 @@ Load `reference/e2e-runtime.md` before writing E2E tasks for projects targeting 
 ### MCP-driven E2E exploration (if interview-notes specify MCP debug tools)
 Load `reference/mcp-e2e.md` before writing MCP E2E tasks. If the interview confirmed that agents should use MCP tools for visual E2E testing, include **per-screen E2E tasks** with the `[needs: mcp-<platform>, e2e-loop]` capabilities. Each task uses the runner's explore-research-fix-verify loop.
 
-**CRITICAL: Split E2E tasks by screen, NOT one monolithic task.** Each screen (or pair of related screens) gets its own task. This keeps explore cycles short (~5-7 minutes instead of 20-25), gets the research→fix→verify loop running faster, and prevents one hard bug from blocking progress on other screens.
+**CRITICAL: One screen per E2E task.** Each screen gets its own task. This gives each explore agent a fresh context window — screenshots and tool calls don't accumulate across screens, which avoids context overflow and keeps token usage ~5x lower. It also gets the research→fix→verify loop running faster and prevents one hard bug from blocking progress on other screens.
 
-**Bad** — one monolithic task:
+Only bundle two screens in one task when they are **tightly coupled** (e.g., you must create an item on ScreenA before you can view ScreenB). If in doubt, split them.
+
+**Bad** — multiple screens in one task:
 ```markdown
-- [ ] T0XX Validate all screens [needs: mcp-android, e2e-loop]
+- [ ] T0XX Validate AuthScreen + HomeScreen + SettingsScreen [needs: mcp-android, e2e-loop]
 ```
 
-**Good** — one task per screen or per 2 related screens:
+**Good** — one screen per task:
 ```markdown
-- [ ] T0XX Validate AuthScreen + HomeScreen [needs: mcp-android, e2e-loop]
-  Done when: both screens validated against UI_FLOW.md, findings.json has pass/fail.
+- [ ] T0XX Validate AuthScreen [needs: mcp-android, e2e-loop]
+  Done when: layout validated against UI_FLOW.md, auth flows tested, findings.json has pass/fail.
 
-- [ ] T0XY Validate SettingsScreen [needs: mcp-android, e2e-loop]
+- [ ] T0XY Validate HomeScreen [needs: mcp-android, e2e-loop]
+  Done when: empty/populated states validated, navigation tested, findings.json has pass/fail.
+
+- [ ] T0XZ Validate SettingsScreen [needs: mcp-android, e2e-loop]
   Done when: all sections validated, toggle defaults and dropdown labels match spec.
 
-- [ ] T0XZ Validate PairingScreen [needs: mcp-android, e2e-loop]
-  Done when: pairing phases verified (scan, connect, success, error).
+- [ ] T0XW Validate ListScreen + DetailScreen [needs: mcp-android, e2e-loop]
+  Done when: both screens validated (tightly coupled — must create item to see detail).
 
-- [ ] T0XW Validate navigation flows [needs: mcp-android, e2e-loop]
+- [ ] T0XV Validate navigation flows [needs: mcp-android, e2e-loop]
   Done when: every navigation edge from UI_FLOW.md flowchart exercised.
 ```
 

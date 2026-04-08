@@ -328,13 +328,19 @@ Every N iterations (default 10), an iteration-level supervisor agent reviews ove
 
 ## Context window management
 
-MCP explore and verify agents accumulate screenshots and view hierarchy dumps in their conversation context. Without management, the agent will hit the Claude API's multi-image dimension limit and crash mid-session with:
+### One screen per task = fresh context per screen
 
-> "An image in the conversation exceeds the dimension limit for many-image requests (2000px)"
+The most important context management strategy is structural: **each E2E task should cover exactly one screen** (see `phases/tasks.md`). Since each task gets its own explore agent, this means each agent starts with a fresh context window. Screenshots and tool calls from one screen don't accumulate into the next screen's session.
+
+Only bundle two screens when they're tightly coupled (e.g., must create an item on ScreenA to view ScreenB).
+
+### Sonnet for explore and verify agents
+
+Explore and verify agents use Sonnet, not Opus. These agents do visual inspection — "look at screenshot, compare to spec, click things" — which doesn't require Opus-level reasoning. Sonnet is ~5x cheaper per token and handles this work well. Fix, research, and supervisor agents still use Opus for deeper reasoning.
 
 ### Rules the runner enforces via prompts
 
-1. **Prefer DumpHierarchy/Snapshot over Screenshot** — text-based view trees use ~100x less context than images. Only screenshot when visual verification is needed (colors, layout, styling).
+1. **Prefer Screenshot over DumpHierarchy** — screenshots are a single image token while XML hierarchy dumps consume 20-50k text tokens. Only use DumpHierarchy when you need exact resource IDs or accessibility attributes for selectors.
 2. **Maximum 15 screenshots per explore session, 10 per verify session** — agents count and stop taking screenshots after the limit.
 3. **Save screenshots to disk, don't re-read** — once captured to `validate/e2e/screenshots/`, reference by path in findings. Don't re-read images already analyzed.
 4. **Write findings incrementally** — update `findings.json` after each screen/flow, not at the end. If the agent crashes, the next iteration picks up from partial findings.

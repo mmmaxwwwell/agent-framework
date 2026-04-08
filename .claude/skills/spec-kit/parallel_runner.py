@@ -2050,7 +2050,8 @@ def _build_sandbox_env(capabilities: set[str] | None = None) -> dict[str, str]:
 def spawn_agent(task: Task, prompt: str, log_path: Path,
                 stderr_path: Path,
                 extra_capabilities: set[str] | None = None,
-                mcp_config_paths: list[Path] | None = None) -> subprocess.Popen:
+                mcp_config_paths: list[Path] | None = None,
+                model: str = "opus") -> subprocess.Popen:
     """Spawn a claude CLI process for the given task.
 
     Capabilities from task.capabilities (parsed from [needs: gh] etc.) plus
@@ -2081,7 +2082,7 @@ def spawn_agent(task: Task, prompt: str, log_path: Path,
     claude_cmd = [
         "claude",
         "--dangerously-skip-permissions",
-        "--model", "opus",
+        "--model", model,
         "--verbose",
         "--output-format", "stream-json",
     ]
@@ -5589,7 +5590,8 @@ class Runner:
 
         def _wait_for_subagent(sub_task: Task, prompt: str, label: str,
                                caps: set[str] | None = None,
-                               mcp_configs: list[Path] | None = None) -> int:
+                               mcp_configs: list[Path] | None = None,
+                               model: str = "opus") -> int:
             """Spawn a sub-agent, track it, wait for completion. Returns exit code."""
             self.agent_counter += 1
             aid = self.agent_counter
@@ -5597,7 +5599,8 @@ class Runner:
             stderr_p = self.log_dir / f"agent-{aid}-{sub_task.id}-{self.timestamp}.stderr"
             proc = spawn_agent(sub_task, prompt, log_p, stderr_p,
                                extra_capabilities=caps,
-                               mcp_config_paths=mcp_configs)
+                               mcp_config_paths=mcp_configs,
+                               model=model)
 
             slot = AgentSlot(
                 agent_id=aid, task=sub_task, process=proc,
@@ -5703,6 +5706,7 @@ class Runner:
         iteration = state.get("iteration", 0)
         consecutive_explore_failures = 0
         MAX_CONSECUTIVE_EXPLORE_FAILURES = 3
+        e2e_loop_succeeded = False
 
         # ── Main loop ──
         while not self._shutdown.is_set():
@@ -5744,11 +5748,19 @@ class Runner:
 
             # ── Phase 1: EXPLORE (with MCP) ──
             e2e_log(f"Phase 1: Explore (with MCP tools)")
-            task_block = _extract_task_block(str(task_file), task.id)
-            explore_prompt = self._build_e2e_explore_prompt(
-                spec_dir, findings_file, ui_flow_content, spec_content,
-                iteration, e2e_dir, task, task_block
-            )
+            try:
+                task_block = _extract_task_block(str(task_file), task.id)
+                e2e_log(f"DEBUG: task_block length={len(task_block)}")
+                explore_prompt = self._build_e2e_explore_prompt(
+                    spec_dir, findings_file, ui_flow_content, spec_content,
+                    iteration, e2e_dir, task, task_block
+                )
+                e2e_log(f"DEBUG: prompt built, length={len(explore_prompt)}")
+            except Exception as exc:
+                import traceback
+                e2e_log(f"DEBUG: prompt build FAILED: {exc}")
+                e2e_log(f"DEBUG: {traceback.format_exc()}")
+                break
             explore_task = Task(
                 id=f"E2E-explore-{iteration}",
                 description=f"E2E explore iteration {iteration}",
@@ -5756,9 +5768,17 @@ class Runner:
                 status=TaskStatus.RUNNING, line_num=0,
                 capabilities=mcp_caps,
             )
-            explore_exit = _wait_for_subagent(explore_task, explore_prompt,
-                               f"E2E-explore-{iteration}",
-                               mcp_configs=mcp_config_paths)
+            try:
+                explore_exit = _wait_for_subagent(explore_task, explore_prompt,
+                                   f"E2E-explore-{iteration}",
+                                   mcp_configs=mcp_config_paths,
+                                   model="sonnet")
+                e2e_log(f"DEBUG: explore_exit={explore_exit}")
+            except Exception as exc:
+                import traceback
+                e2e_log(f"DEBUG: spawn/wait FAILED: {exc}")
+                e2e_log(f"DEBUG: {traceback.format_exc()}")
+                break
 
             # ── Crash detection: non-zero exit → immediate supervisor ──
             if explore_exit != 0:
@@ -6246,7 +6266,8 @@ This is build-fix attempt {attempt} of {BUILD_FIX_MAX_ATTEMPTS}.
             )
             _wait_for_subagent(verify_task, verify_prompt,
                                f"E2E-verify-{iteration}",
-                               mcp_configs=mcp_config_paths)
+                               mcp_configs=mcp_config_paths,
+                               model="sonnet")
 
             # Re-read findings after verify
             try:
@@ -6306,7 +6327,22 @@ This is build-fix attempt {attempt} of {BUILD_FIX_MAX_ATTEMPTS}.
 
             if not still_open:
                 e2e_log("All bugs fixed — E2E loop complete!")
+                e2e_loop_succeeded = True
                 break
+
+        # ── Check if explore loop actually succeeded ──
+        # The loop exits via break for multiple reasons: all bugs fixed,
+        # supervisor said stop, crash supervisor gave up, or prompt build failed.
+        # Only run regression check and mark done if we actually had a successful run.
+        e2e_succeeded = e2e_loop_succeeded
+
+        if not e2e_succeeded:
+            e2e_log("E2E loop did not complete successfully — task NOT marked done")
+            task.status = TaskStatus.FAILED
+            # Teardown platform runtimes and backend services
+            if hasattr(self, '_platform_manager'):
+                self._platform_manager.teardown_all(project_dir=Path(spec_dir).parent if spec_dir else None)
+            return
 
         # ── Post-loop: full test suite validation ──
         # After the E2E loop finishes (all bugs fixed OR supervisor stopped),
@@ -6410,15 +6446,17 @@ You are running inside a context window with limited capacity. Accumulating too 
 
 ## Available MCP tools
 
-You have access to platform MCP tools. Use them to:
-- **Screenshot**: Take screenshots to see what's on screen (**prefer this — cheaper than hierarchy dumps**)
-- **Snapshot/DumpHierarchy**: Read the accessibility/view tree for precise selectors (**use only when needed**)
-- **Click/ClickBySelector**: Tap on UI elements
-- **Swipe**: Scroll or swipe gestures
-- **Type/SetText**: Enter text into fields
-- **WaitForElement**: Wait for elements to appear
-- **Press**: Press hardware buttons (BACK, HOME, etc.)
-- **GetScreenInfo**: Get screen dimensions and info
+Tools are namespaced as `mcp__mcp-android__<name>`. Call them directly — do NOT use ToolSearch to discover them.
+
+- **mcp__mcp-android__State-Tool**: Get device state. Pass `{{"use_vision": true}}` to include a screenshot image (**prefer this — cheaper than hierarchy dumps**). Without `use_vision`, returns the UI element tree as text.
+- **mcp__mcp-android__Click-Tool**: Tap at coordinates `{{"x": 540, "y": 1200}}`
+- **mcp__mcp-android__Long-Click-Tool**: Long-press at coordinates `{{"x": 540, "y": 1200}}`
+- **mcp__mcp-android__Swipe-Tool**: Swipe from one point to another `{{"x1": 540, "y1": 1600, "x2": 540, "y2": 400}}` (for scrolling)
+- **mcp__mcp-android__Type-Tool**: Type text at coordinates `{{"text": "hello", "x": 540, "y": 600, "clear": true}}` (set `clear: true` to replace existing text)
+- **mcp__mcp-android__Drag-Tool**: Drag and drop `{{"x1": 100, "y1": 200, "x2": 300, "y2": 400}}`
+- **mcp__mcp-android__Press-Tool**: Press a button `{{"button": "back"}}` (also: "home", "enter", "recent")
+- **mcp__mcp-android__Notification-Tool**: Open the notification shade (no parameters)
+- **mcp__mcp-android__Wait-Tool**: Pause for N **seconds** `{{"duration": 2}}` — NEVER pass more than 5
 
 ## How to explore
 
@@ -6652,7 +6690,9 @@ Follow these rules to avoid crashing from context overflow:
 
 ## Available MCP tools
 
-Same tools as the explore agent: Screenshot, Snapshot/DumpHierarchy, Click, Swipe, Type, WaitForElement, Press, GetScreenInfo.
+Same MCP tools as the explore agent (call directly, no ToolSearch needed):
+`State-Tool`, `Click-Tool`, `Long-Click-Tool`, `Swipe-Tool`, `Type-Tool`, `Drag-Tool`, `Press-Tool`, `Notification-Tool`, `Wait-Tool` (duration in **seconds**, max 5).
+All namespaced as `mcp__mcp-android__<name>`.
 
 **Prefer Screenshot over DumpHierarchy** to conserve context window space. Only dump hierarchy when you need exact selectors or accessibility attributes.
 
