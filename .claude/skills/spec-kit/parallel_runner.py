@@ -1053,6 +1053,32 @@ def _extract_phase_block(task_file: str, task: Task, all_phases: list[Phase]) ->
     return "\n".join(result_lines)
 
 
+def _extract_task_block(task_file: str, task_id: str) -> str:
+    """Extract the full block for a single task from tasks.md.
+
+    Returns the task header line plus all indented continuation lines
+    (e.g., 'Done when:' criteria).  Returns empty string if not found.
+    """
+    lines = Path(task_file).read_text().splitlines()
+    result: list[str] = []
+    capturing = False
+    task_re = re.compile(rf"^\s*-\s*\[.\]\s*{re.escape(task_id)}\b")
+
+    for line in lines:
+        if task_re.match(line):
+            capturing = True
+            result.append(line)
+            continue
+        if capturing:
+            # Continuation lines are indented deeper than the task bullet
+            if line.startswith("  ") and not re.match(r"^\s*-\s*\[.\]\s*T\d+", line):
+                result.append(line)
+            else:
+                break
+
+    return "\n".join(result)
+
+
 def _extract_relevant_learnings(learnings_file: str, task: Task,
                                  all_phases: list[Phase],
                                  phase_deps: dict[str, list[str]]) -> str:
@@ -5718,9 +5744,10 @@ class Runner:
 
             # ── Phase 1: EXPLORE (with MCP) ──
             e2e_log(f"Phase 1: Explore (with MCP tools)")
+            task_block = _extract_task_block(str(task_file), task.id)
             explore_prompt = self._build_e2e_explore_prompt(
                 spec_dir, findings_file, ui_flow_content, spec_content,
-                iteration, e2e_dir
+                iteration, e2e_dir, task, task_block
             )
             explore_task = Task(
                 id=f"E2E-explore-{iteration}",
@@ -6256,95 +6283,9 @@ This is build-fix attempt {attempt} of {BUILD_FIX_MAX_ATTEMPTS}.
                 elif status == "fixed":
                     _record_fix_attempt(e2e_dir, bug_id, approach, "fixed", evidence)
 
-            # ── Phase 4.5: Write regression tests for verified fixes ──
-            newly_fixed = [f for f in findings.get("findings", [])
-                           if f.get("status") == "fixed"
-                           and f.get("id") in {b.get("id") for b in open_bugs}]
-            if newly_fixed:
-                e2e_log(f"Phase 4.5: Write regression tests ({len(newly_fixed)} fixed bugs)")
-                test_writer_prompt = self._build_e2e_test_writer_prompt(
-                    newly_fixed, e2e_dir, spec_dir
-                )
-                tw_task = Task(
-                    id=f"E2E-test-writer-{iteration}",
-                    description=f"Write UI Automator tests for {len(newly_fixed)} fixes",
-                    phase=task.phase, parallel=False,
-                    status=TaskStatus.RUNNING, line_num=0,
-                )
-                _wait_for_subagent(tw_task, test_writer_prompt,
-                                   f"E2E-test-writer-{iteration}")
-
-                # Run the instrumented tests to verify they pass
-                e2e_log("Running instrumented tests to verify new regression tests")
-                TEST_CMD = "cd android && ./gradlew connectedDebugAndroidTest"
-                test_log = e2e_dir / f"test-run-iter{iteration}.log"
-                TEST_FIX_MAX = 5
-                tests_pass = False
-
-                for test_attempt in range(1, TEST_FIX_MAX + 1):
-                    try:
-                        test_result = subprocess.run(
-                            ["bash", "-c", TEST_CMD],
-                            capture_output=True, text=True, timeout=300,
-                            cwd=str(Path(spec_dir).parent) if spec_dir else None,
-                        )
-                        with open(test_log, "w") as f:
-                            f.write(f"Exit code: {test_result.returncode}\n")
-                            f.write("--- stdout ---\n")
-                            f.write(test_result.stdout)
-                            f.write("\n--- stderr ---\n")
-                            f.write(test_result.stderr)
-
-                        if test_result.returncode == 0:
-                            e2e_log(f"  Instrumented tests passed (attempt {test_attempt})")
-                            tests_pass = True
-                            break
-                        else:
-                            e2e_log(f"  Instrumented tests failed (attempt {test_attempt}/{TEST_FIX_MAX})")
-                    except subprocess.TimeoutExpired:
-                        e2e_log(f"  Instrumented tests timed out (attempt {test_attempt}/{TEST_FIX_MAX})")
-                        with open(test_log, "w") as f:
-                            f.write("TIMEOUT after 300s\n")
-
-                    # Spawn fix agent to fix the failing tests
-                    if test_attempt < TEST_FIX_MAX:
-                        test_fix_prompt = f"""You are fixing failing UI Automator instrumented tests. The tests were just written to
-assert E2E bug fixes, but they're failing.
-
-## Test log file
-`{test_log}`
-
-## How to read the log
-1. Read the file — it contains stdout and stderr from `./gradlew connectedDebugAndroidTest`
-2. Look for FAILED test methods and their assertion errors
-3. The test files are in `android/app/src/androidTest/java/com/nixkey/e2e/`
-
-## What to do
-1. Read the test log to identify which tests fail and why
-2. Read the failing test source code
-3. Fix the TEST code (not the app code) — the app behavior is correct, the test assertions may be wrong
-4. Common issues:
-   - Wrong selector (text changed, resource ID different)
-   - Missing wait/sleep before assertion (UI not loaded yet)
-   - Wrong navigation steps to reach the screen
-   - Missing permissions or setup in @Before
-5. Do NOT run the tests yourself — the runner will do that
-6. In your final response, state what you fixed
-
-## Iteration
-This is test-fix attempt {test_attempt} of {TEST_FIX_MAX}.
-"""
-                        tf_task = Task(
-                            id=f"E2E-test-fix-{iteration}-{test_attempt}",
-                            description=f"Fix failing tests (attempt {test_attempt})",
-                            phase=task.phase, parallel=False,
-                            status=TaskStatus.RUNNING, line_num=0,
-                        )
-                        _wait_for_subagent(tf_task, test_fix_prompt,
-                                           f"E2E-test-fix-{iteration}-{test_attempt}")
-
-                if not tests_pass:
-                    e2e_log(f"  Instrumented tests still failing after {TEST_FIX_MAX} attempts — continuing")
+            # Phase 4.5 (instrumented test writing) omitted — the emulator
+            # verify phase already confirms fixes; regression tests can be
+            # batch-written after all E2E exploration is complete.
 
             still_open = [f for f in findings.get("findings", [])
                           if f.get("status") in ("new", "verified_broken")]
@@ -6404,8 +6345,15 @@ This is test-fix attempt {test_attempt} of {TEST_FIX_MAX}.
 
     def _build_e2e_explore_prompt(self, spec_dir: str, findings_file: Path,
                                    ui_flow: str, spec_content: str,
-                                   iteration: int, e2e_dir: Path) -> str:
-        """Build the prompt for the E2E explore agent."""
+                                   iteration: int, e2e_dir: Path,
+                                   parent_task: "Task | None" = None,
+                                   task_block: str = "") -> str:
+        """Build the prompt for the E2E explore agent.
+
+        When parent_task and task_block are provided, the agent is scoped to
+        just the screens/flows specified by that task.  Otherwise it falls
+        back to a full-app sweep (legacy behaviour).
+        """
         existing_findings = ""
         if findings_file.exists():
             existing_findings = findings_file.read_text()
@@ -6427,19 +6375,35 @@ This is test-fix attempt {test_attempt} of {TEST_FIX_MAX}.
         if env_file.exists():
             backend_env = env_file.read_text()
 
+        # ── Task-scoped vs full-sweep mission ──
+        if parent_task and task_block:
+            mission = f"""You are scoped to a single task. Focus ONLY on what this task requires — do not explore unrelated screens or flows.
+
+## Your task
+
+**{parent_task.id}**: {parent_task.description}
+
+```
+{task_block}
+```
+
+Validate every element, flow, and error path described in the task above. When the task says "Done when", those are your exit criteria. Once you have validated (or filed bugs for) every item, write your findings and stop."""
+        else:
+            mission = """Explore the running app systematically, comparing actual behavior against the specification. Find bugs in this run. Do not stop after finding one bug — keep exploring every screen, every flow, every edge case."""
+
         return f"""You are an E2E exploration agent with access to MCP tools that let you interact with a running app.
 
 ## Your mission
 
-Explore the running app systematically, comparing actual behavior against the specification. Find AS MANY BUGS AS POSSIBLE in this single run. Do not stop after finding one bug — keep exploring every screen, every flow, every edge case.
+{mission}
 
 ## CRITICAL: Context window management
 
 You are running inside a context window with limited capacity. Accumulating too many screenshots will crash you mid-session. Follow these rules strictly:
 
-1. **Prefer DumpHierarchy/Snapshot over Screenshot** — text-based view trees use far less context than images. Only take a screenshot when you need to verify visual layout, colors, or styling that the hierarchy can't show.
-2. **Maximum 15 screenshots per session** — count them. If you need more, prefer hierarchy dumps.
-3. **Save screenshots to disk, don't view them repeatedly** — once you've captured a screenshot to `{e2e_dir}/screenshots/`, reference it by path in your findings. Don't re-read screenshots you've already analyzed.
+1. **Prefer Screenshot over DumpHierarchy** — screenshots are a single image and use far less context than XML hierarchy dumps (which can be 20-50k tokens each). Use DumpHierarchy only when you need exact resource IDs, content descriptions, or accessibility attributes that aren't visible in the screenshot.
+2. **Maximum 20 screenshots per session** — count them. Save to `{e2e_dir}/screenshots/` and reference by path. Don't re-read screenshots you've already analyzed.
+3. **Avoid DumpHierarchy unless necessary** — if you can determine element positions and text from the screenshot, do so. Only dump the hierarchy when you need precise selectors or accessibility info.
 4. **Write findings incrementally** — update `{findings_file}` after each screen/flow you complete, not just at the end. If you crash, the next agent can pick up from your partial findings.
 5. **Write a progress checkpoint** — after completing each screen or flow, append a line to `{e2e_dir}/progress.md` noting what you covered (e.g., "Settings screen: validated all sections, dropdowns, OTEL field"). The next iteration reads this to skip already-validated areas.
 6. **If you're running low on context** (you've taken 10+ screenshots or made 100+ tool calls), write your current findings and progress immediately, then stop gracefully.
@@ -6447,8 +6411,8 @@ You are running inside a context window with limited capacity. Accumulating too 
 ## Available MCP tools
 
 You have access to platform MCP tools. Use them to:
-- **Screenshot**: Take screenshots to see what's on screen (**use sparingly — prefer DumpHierarchy**)
-- **Snapshot/DumpHierarchy**: Read the accessibility/view tree to find element selectors (**prefer this**)
+- **Screenshot**: Take screenshots to see what's on screen (**prefer this — cheaper than hierarchy dumps**)
+- **Snapshot/DumpHierarchy**: Read the accessibility/view tree for precise selectors (**use only when needed**)
 - **Click/ClickBySelector**: Tap on UI elements
 - **Swipe**: Scroll or swipe gestures
 - **Type/SetText**: Enter text into fields
@@ -6460,7 +6424,7 @@ You have access to platform MCP tools. Use them to:
 
 1. **Check progress first** — read `{e2e_dir}/progress.md` if it exists. Skip screens/flows already marked as validated.
 2. Launch the app (if not already running)
-3. **Use DumpHierarchy first** to understand the current screen, then take a screenshot only if needed
+3. **Take a screenshot first** to understand the current screen, then use DumpHierarchy only if you need precise selectors or accessibility attributes
 4. Compare what you see against the UI_FLOW.md specification below
 5. Try both happy paths AND error paths for each flow
 6. When you find a bug, document it with:
@@ -6549,8 +6513,8 @@ Write your findings to `{findings_file}` as JSON:
 
 ## Rules
 
-- Explore EVERY screen and flow not already covered in `{e2e_dir}/progress.md`
-- **Use DumpHierarchy as primary inspection tool** — only screenshot for visual bugs or one screenshot per bug found
+- {'Focus on the screens/flows specified in your task above' if parent_task else f'Explore EVERY screen and flow not already covered in `{e2e_dir}/progress.md`'}
+- **Use Screenshot as primary inspection tool** — only DumpHierarchy when you need exact selectors or accessibility attributes
 - Test error paths: invalid inputs, back navigation, interruptions
 - Test state persistence: navigate away and back
 - Do NOT fix bugs — only document them
@@ -6681,16 +6645,16 @@ already failed and what the research agent recommends.
 
 Follow these rules to avoid crashing from context overflow:
 
-1. **Prefer DumpHierarchy/Snapshot over Screenshot** — only screenshot when you need visual verification.
-2. **Maximum 10 screenshots per session** — one per bug being verified is enough.
-3. **Save screenshots to disk** at `{e2e_dir}/screenshots/` and reference by path. Don't re-read them.
+1. **Prefer Screenshot over DumpHierarchy** — screenshots use far less context than XML dumps. Only use DumpHierarchy when you need exact resource IDs, content descriptions, or accessibility attributes.
+2. **Maximum 15 screenshots per session** — one per bug being verified is enough. Save to `{e2e_dir}/screenshots/` and reference by path.
+3. **Avoid re-reading screenshots** you've already analyzed.
 4. **Update findings incrementally** — write to `{findings_file}` after verifying each bug, not all at once at the end.
 
 ## Available MCP tools
 
 Same tools as the explore agent: Screenshot, Snapshot/DumpHierarchy, Click, Swipe, Type, WaitForElement, Press, GetScreenInfo.
 
-**Prefer DumpHierarchy over Screenshot** to conserve context window space.
+**Prefer Screenshot over DumpHierarchy** to conserve context window space. Only dump hierarchy when you need exact selectors or accessibility attributes.
 
 ## Previous findings to verify
 
@@ -6702,8 +6666,8 @@ Same tools as the explore agent: Screenshot, Snapshot/DumpHierarchy, Click, Swip
 
 1. For each bug with status "new" or "verified_broken" in the findings:
    a. Follow the steps to reproduce exactly
-   b. **Always run DumpHierarchy** to capture the actual UI state
-   c. Take a screenshot only if visual verification is needed
+   b. **Take a screenshot** to capture the visual state
+   c. Run DumpHierarchy only if you need exact selectors or accessibility attributes for evidence
    d. If the bug is fixed: update status to "fixed"
    e. If the bug still exists: update status to "verified_broken"
    f. **Write structured evidence** to the bug's directory (see below)
@@ -7389,153 +7353,9 @@ parsing BLOCKED.md) can act on immediately.
 - Do NOT modify source code or findings.json
 """
 
-    def _build_e2e_test_writer_prompt(self, fixed_bugs: list[dict],
-                                       e2e_dir: Path, spec_dir: str) -> str:
-        """Build prompt for an agent that writes UI Automator regression tests
-        for bugs that were just verified as fixed."""
-        bug_sections = []
-        for bug in fixed_bugs:
-            bug_id = bug.get("id", "")
-            bug_d = _bug_dir(e2e_dir, bug_id)
-
-            # Collect fix approach
-            approach = ""
-            approach_file = bug_d / "fix-approach-latest.md"
-            if approach_file.exists():
-                approach = approach_file.read_text()
-
-            # Collect verify evidence
-            evidence = ""
-            evidence_files = sorted(bug_d.glob("verify-evidence-*.md"))
-            if evidence_files:
-                evidence = evidence_files[-1].read_text()
-
-            # Collect research (for API knowledge)
-            research, _ = _read_latest_research(e2e_dir, bug_id)
-
-            bug_sections.append(f"""### {bug_id}: {bug.get("summary", "")}
-
-**Screen**: {bug.get("screen", "unknown")}
-**Expected**: {bug.get("expected", "")}
-**Actual (before fix)**: {bug.get("actual", "")}
-**Steps to reproduce**: {json.dumps(bug.get("steps_to_reproduce", []))}
-
-**Fix approach**:
-{approach if approach else "(not recorded)"}
-
-**Verify evidence (confirming fix works)**:
-{evidence if evidence else "(not recorded)"}
-
-{f"**Research context**:{chr(10)}{research[:2000]}" if research else ""}
-""")
-
-        bugs_text = "\n---\n".join(bug_sections)
-
-        return f"""You are a test-writer agent. Bugs were just verified as fixed on a live Android emulator.
-Your job is to write **UI Automator instrumented tests** that assert each fix, creating a
-permanent regression gate.
-
-## Bugs to write tests for ({len(fixed_bugs)} total)
-
-{bugs_text}
-
-## Test framework: UI Automator
-
-Write tests using `androidx.test.uiautomator`. These tests:
-- Run on a real emulator via `./gradlew connectedDebugAndroidTest`
-- Access the same accessibility tree that DumpHierarchy reads
-- Can test cross-process interactions (deep links, notifications, back stack)
-
-### Key APIs
-
-```kotlin
-// Get the device
-val device = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
-
-// Find elements
-device.findObject(By.text("Settings"))           // by visible text
-device.findObject(By.res("com.nixkey", "toggle")) // by resource ID
-device.findObject(By.checkable(true))             // by property
-device.findObject(By.desc("content description")) // by accessibility label
-
-// Interact
-obj.click()
-obj.text = "input text"
-device.pressBack()
-
-// Assert
-assertTrue(device.findObject(By.text("Error")).exists())
-assertNotNull(device.findObject(By.checkable(true).checked(true)))
-
-// Wait for elements
-device.wait(Until.hasObject(By.text("Success")), 5000)
-
-// Launch app
-val context = ApplicationProvider.getApplicationContext<Context>()
-val intent = context.packageManager.getLaunchIntentForPackage("com.nixkey")
-context.startActivity(intent)
-device.wait(Until.hasObject(By.pkg("com.nixkey")), 5000)
-
-// Deep links
-val deepLink = Intent(Intent.ACTION_VIEW, Uri.parse("nix-key://pair?payload=..."))
-context.startActivity(deepLink)
-```
-
-## Where to put tests
-
-Write tests to `android/app/src/androidTest/java/com/nixkey/e2e/` — one test class
-per screen, with test methods per bug. If the file already exists, **add to it** rather
-than overwriting.
-
-Naming convention: `{{Screen}}E2ETest.kt` (e.g., `SettingsE2ETest.kt`, `PairingE2ETest.kt`)
-
-Each test class should:
-```kotlin
-@RunWith(AndroidJUnit4::class)
-@LargeTest
-class SettingsE2ETest {{
-    private lateinit var device: UiDevice
-
-    @Before
-    fun setup() {{
-        device = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
-        // Launch app and navigate to the screen under test
-    }}
-
-    @Test
-    fun testOtelValidationShowsError() {{
-        // Navigate to Settings
-        // Enter invalid OTEL endpoint
-        // Assert error message appears
-    }}
-}}
-```
-
-## Instructions
-
-1. Read existing test files in `android/app/src/androidTest/` to understand the project's
-   test patterns and imports
-2. For each fixed bug:
-   a. Read the verify evidence — it contains the exact DumpHierarchy state that confirmed the fix
-   b. Translate the verification into a UI Automator assertion
-   c. The test should reproduce the bug's steps and assert the fixed behavior
-3. Make sure `build.gradle` has the UI Automator dependency:
-   ```
-   androidTestImplementation "androidx.test.uiautomator:uiautomator:2.3.0"
-   ```
-   If missing, add it.
-4. **Do NOT run the tests** — the runner will do that after you finish
-5. Commit the tests with a conventional commit message
-
-## Rules
-
-- Write focused, minimal tests — one assertion per bug, not comprehensive screen tests
-- Use the verify evidence to know exactly what to assert (e.g., "checkable=true" → `By.checkable(true)`)
-- If a bug's verify evidence is missing, skip that bug (don't guess)
-- Do NOT modify app source code — only write tests
-- Do NOT modify findings.json
-- Tests must be deterministic — no timing-dependent assertions without explicit waits
-"""
+    # _build_e2e_test_writer_prompt removed — instrumented test writing is
+    # deferred to a batch step after all E2E exploration completes, to avoid
+    # burning tokens on per-bug test-fix retry loops during exploration.
 
     def _run_ci_loop(self, task: Task, spec_dir: str, task_file: Path,
                      learnings_file: str):
