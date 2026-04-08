@@ -336,6 +336,18 @@ Real-runtime E2E tests are inherently flakier than unit tests due to:
     sudo udevadm trigger --name-match=kvm
 ```
 
+### KVM access in sandboxed agents (bubblewrap)
+
+The parallel runner executes agents inside a bubblewrap (`bwrap`) sandbox with a synthetic `/dev` (via `--dev /dev`). This synthetic devfs does **not** include host device nodes like `/dev/kvm`. Without `/dev/kvm`, the Android emulator falls back to pure software emulation (`-accel off`), which is ~10x slower — boot takes 5-10 minutes instead of ~30 seconds.
+
+The runner's sandbox automatically bind-mounts `/dev/kvm` into the sandbox when it exists and is writable on the host. If you are running emulator tasks outside the runner's sandbox (e.g., a custom bwrap invocation), add:
+
+```bash
+bwrap ... --dev-bind /dev/kvm /dev/kvm ...
+```
+
+**Diagnosis**: If the emulator is running with `-accel off` despite KVM being available on the host, check whether the process is inside a bwrap sandbox (`ps aux | grep bwrap`). The `start-emulator` script checks `/dev/kvm` writability at runtime — if it's not visible inside the sandbox, it silently falls back to software emulation.
+
 ### Xvfb for headless display
 
 ```yaml
@@ -360,11 +372,85 @@ Real-runtime E2E tests are inherently flakier than unit tests due to:
 - **Plan (Phase 5)**: For each platform runtime, decide: emulator/simulator/headless browser setup, test bypass mechanisms for hardware features, UI automation framework, CI infrastructure. Add to the test plan matrix.
 - **Tasks (Phase 6)**: See the E2E test harness gap analysis in `phases/tasks.md`. Ensure every prerequisite (build infrastructure, emulator setup, test helper library, bypass mechanisms, CI retry wrapper) has its own task.
 
+## Backend service setup for MCP E2E loops
+
+When the MCP-driven E2E loop needs backend services (databases, API servers, mesh networks, daemons), the runner automatically calls a **project-level setup script** before the first explore agent runs.
+
+### Convention: `test/e2e/setup.sh` and `test/e2e/teardown.sh`
+
+The runner checks for `test/e2e/setup.sh` in the project root. If it exists, it runs it once before booting the emulator/browser/simulator. On teardown, it runs `test/e2e/teardown.sh`.
+
+**`setup.sh` requirements:**
+- Start all backend services needed for the app to function end-to-end
+- Be **idempotent** (safe to call if services are already running)
+- Perform readiness checks (wait for each service to be ready before returning)
+- Write PIDs or state to a known location (e.g., `$E2E_PROJECT_DIR/test/e2e/.state/`) for teardown
+- Exit 0 when all services are ready, non-zero on failure
+- The runner passes `E2E_PROJECT_DIR` as an environment variable
+
+**`teardown.sh` requirements:**
+- Stop all services started by `setup.sh`
+- Clean up state files
+- Be safe to call even if services aren't running
+
+### Example: Android app with mesh network backend
+
+```bash
+#!/usr/bin/env bash
+# test/e2e/setup.sh — start headscale + tailscale + daemon for E2E
+set -euo pipefail
+
+STATE_DIR="${E2E_PROJECT_DIR}/test/e2e/.state"
+mkdir -p "$STATE_DIR"
+
+# Skip if already running
+if [ -f "$STATE_DIR/setup.pid" ] && kill -0 "$(cat "$STATE_DIR/setup.pid")" 2>/dev/null; then
+  echo "Services already running"
+  exit 0
+fi
+
+# Start headscale
+headscale serve &
+echo $! > "$STATE_DIR/headscale.pid"
+wait_for "headscale" "curl -sf http://127.0.0.1:8080/health" 30
+
+# Start tailscaled and join mesh
+tailscaled --state="$STATE_DIR/tailscale" &
+echo $! > "$STATE_DIR/tailscaled.pid"
+tailscale up --login-server=http://127.0.0.1:8080 --auth-key="..."
+wait_for "tailscale" "tailscale status --json" 30
+
+# Start app daemon
+nix-key daemon --config="$STATE_DIR/config.yaml" &
+echo $! > "$STATE_DIR/daemon.pid"
+wait_for "daemon" "test -S /tmp/agent.sock" 10
+
+echo "$$" > "$STATE_DIR/setup.pid"
+echo "All E2E backend services ready"
+```
+
+### Task generation
+
+When the spec/plan indicates the app communicates with backend services (server, daemon, database, mesh network, etc.), task generation MUST include a setup script task **before** the MCP E2E exploration task:
+
+```markdown
+- [ ] T0XX Create E2E backend services setup script (`test/e2e/setup.sh`): starts [list services], waits for readiness, writes PIDs for teardown. Matching `teardown.sh` stops all services. [E2E infra]
+  Done when: `bash test/e2e/setup.sh` starts all services and exits 0, `bash test/e2e/teardown.sh` stops them cleanly.
+
+- [ ] T0XX E2E integration test exploration [needs: mcp-android, e2e-loop]
+  Done when: all screens and flows from UI_FLOW.md verified on emulator with live backend services.
+```
+
+The runner calls `setup.sh` automatically before the E2E loop — no `[needs: e2e-services]` annotation is required. The convention is file-based: if `test/e2e/setup.sh` exists, it runs.
+
 ## Task generation guidance
 
 ### Infrastructure tasks (foundational phase or early platform phase)
 
 ```markdown
+- [ ] T0XX Create E2E backend services setup/teardown scripts (`test/e2e/setup.sh`, `test/e2e/teardown.sh`): start all backend services needed for E2E testing, wait for readiness, write PIDs for cleanup. Must be idempotent. [E2E infra]
+  Done when: setup starts all services and exits 0, teardown stops them cleanly.
+
 - [ ] T0XX Create E2E test orchestrator script (`test/e2e/run-e2e.sh`): shell script that starts all services/runtimes, waits for readiness, runs test sequence, collects logs on failure, cleans up on exit. Timeout budget: 20 minutes. Retry wrapper: 2 attempts. [E2E infra]
   Done when: script boots all runtimes, waits for readiness, runs a no-op test, cleans up.
 

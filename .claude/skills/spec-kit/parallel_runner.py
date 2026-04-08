@@ -1881,6 +1881,13 @@ def _build_sandbox_cmd(project_dir: Path, inner_cmd: list[str]) -> list[str]:
     cmd += ["--dev", "/dev"]
     cmd += ["--proc", "/proc"]
 
+    # KVM: bwrap's --dev creates a synthetic /dev without host devices.
+    # Bind-mount /dev/kvm so Android emulator / QEMU can use hardware
+    # acceleration instead of falling back to slow software emulation.
+    kvm_dev = Path("/dev/kvm")
+    if kvm_dev.exists() and os.access(kvm_dev, os.W_OK):
+        cmd += ["--dev-bind", "/dev/kvm", "/dev/kvm"]
+
     # Scratch space (ephemeral, vanishes on exit).
     cmd += ["--tmpfs", "/tmp"]
 
@@ -2146,16 +2153,43 @@ def read_stream_output(log_path: Path, last_pos: int) -> tuple[list[str], int, O
             except json.JSONDecodeError:
                 continue
 
-            if msg.get("type") == "assistant":
-                # Extract token usage from assistant messages
-                usage = msg.get("message", {}).get("usage", {})
+            if msg.get("type") == "result":
+                # The result entry has authoritative cumulative usage — prefer it
+                usage = msg.get("usage", {})
                 if usage:
-                    input_tokens = (
+                    result_in = (
                         usage.get("input_tokens", 0)
                         + usage.get("cache_creation_input_tokens", 0)
                         + usage.get("cache_read_input_tokens", 0)
                     )
-                    output_tokens = usage.get("output_tokens", 0)
+                    result_out = usage.get("output_tokens", 0)
+                    # Only use if non-zero (avoid synthetic error zeroing)
+                    if result_in > 0 or result_out > 0:
+                        input_tokens = result_in
+                        output_tokens = result_out
+                # Also extract display text and exit code from result
+                if msg.get("result"):
+                    lines.append(msg["result"])
+                exit_code = 1 if msg.get("is_error") else 0
+            elif msg.get("type") == "assistant":
+                # Extract token usage from assistant messages.
+                # Each message reports cumulative usage, so we overwrite (not add).
+                # Skip synthetic messages (model == "<synthetic>") which have zeroed usage.
+                model = msg.get("message", {}).get("model", "")
+                if model == "<synthetic>":
+                    pass  # Don't let synthetic error messages zero out real counts
+                else:
+                    usage = msg.get("message", {}).get("usage", {})
+                    if usage:
+                        msg_in = (
+                            usage.get("input_tokens", 0)
+                            + usage.get("cache_creation_input_tokens", 0)
+                            + usage.get("cache_read_input_tokens", 0)
+                        )
+                        msg_out = usage.get("output_tokens", 0)
+                        if msg_in > 0 or msg_out > 0:
+                            input_tokens = msg_in
+                            output_tokens = msg_out
 
                 if msg.get("message", {}).get("content"):
                     for block in msg["message"]["content"]:
@@ -2177,10 +2211,6 @@ def read_stream_output(log_path: Path, last_pos: int) -> tuple[list[str], int, O
                             else:
                                 detail = json.dumps(inp)[:60]
                             lines.append(f"[{name}] {detail}")
-            elif msg.get("type") == "result":
-                if msg.get("result"):
-                    lines.append(msg["result"])
-                exit_code = 1 if msg.get("is_error") else 0
             elif msg.get("type") == "error":
                 err_msg = msg.get("error", {}).get("message", str(msg))
                 lines.append(f"ERROR: {err_msg}")
@@ -2534,39 +2564,92 @@ class PlatformRuntime:
             return self._check_ios_ready(_log)
         return False
 
-    def build_and_install(self, project_dir: Path, log_fn=None) -> bool:
-        """Build and install the app for this platform. Returns True on success."""
+    def build_and_install(self, project_dir: Path, log_fn=None,
+                          build_log_path: Optional[Path] = None) -> bool:
+        """Build and install the app for this platform. Returns True on success.
+
+        If build_log_path is provided, the full build output (stdout+stderr) is
+        written there so agents can inspect failures without loading the entire
+        output into their context window.
+        """
         _log = log_fn or (lambda msg: print(f"[platform:{self.name}] {msg}", file=sys.stderr))
 
         if self.name == "android":
-            return self._build_install_android(project_dir, _log)
+            return self._build_install_android(project_dir, _log, build_log_path)
         elif self.name == "browser":
             return True  # Browser apps don't need install
         elif self.name == "ios":
             return self._build_install_ios(project_dir, _log)
         return False
 
-    def get_mcp_config(self) -> dict:
-        """Return the MCP server configuration JSON for this platform."""
+    @staticmethod
+    def _has_debugkit_flake_input(project_dir: Path) -> bool:
+        """Check if the project's flake.nix has nix-mcp-debugkit as an input."""
+        flake_path = project_dir / "flake.nix"
+        if not flake_path.exists():
+            return False
+        try:
+            content = flake_path.read_text()
+            return "nix-mcp-debugkit" in content
+        except OSError:
+            return False
+
+    def _mcp_run_args(self, server_name: str, project_dir: Path) -> list[str]:
+        """Return the nix run args for an MCP server using the project's flake input."""
+        base = ["run", f".#mcp-{self.name}", "--"]
+        # Android MCP needs --emulator to connect via adb to emulator-5554
         if self.name == "android":
-            return {
-                "mcp-android": {
-                    "command": "nix",
-                    "args": ["run", "github:mmmaxwwwell/nix-mcp-debugkit#mcp-android", "--"],
+            base.append("--emulator")
+        return base
+
+    def _resolve_mcp_binary(self, server_name: str, project_dir: Path) -> Optional[str]:
+        """Try to resolve the MCP server to a direct nix store binary path.
+
+        Using the store path directly avoids nix run's flake evaluation overhead,
+        which can cause the Claude CLI's MCP init to time out.
+        """
+        nix_args = ["nix", "build", "--no-link", "--print-out-paths", f".#mcp-{self.name}"]
+        try:
+            result = subprocess.run(
+                nix_args, capture_output=True, text=True, timeout=120,
+                cwd=str(project_dir),
+            )
+            if result.returncode == 0:
+                store_path = result.stdout.strip()
+                binary = Path(store_path) / "bin" / server_name
+                if binary.exists():
+                    return str(binary)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        return None
+
+    def get_mcp_config(self, project_dir: Optional[Path] = None) -> dict:
+        """Return the MCP server configuration JSON for this platform.
+
+        Resolves the nix store path at config time so the Claude CLI can start
+        the MCP server instantly without nix run's flake evaluation overhead.
+        Falls back to nix run if resolution fails.
+        """
+        _dir = project_dir or Path.cwd()
+        server_name = f"mcp-{self.name}"
+        if self.name in ("android", "browser", "ios"):
+            # Try direct store path first (fast startup)
+            binary = self._resolve_mcp_binary(server_name, _dir)
+            if binary:
+                args = []
+                if self.name == "android":
+                    args.append("--emulator")
+                return {
+                    server_name: {
+                        "command": binary,
+                        "args": args,
+                    }
                 }
-            }
-        elif self.name == "browser":
+            # Fall back to nix run (slow but always works)
             return {
-                "mcp-browser": {
+                server_name: {
                     "command": "nix",
-                    "args": ["run", "github:mmmaxwwwell/nix-mcp-debugkit#mcp-browser", "--"],
-                }
-            }
-        elif self.name == "ios":
-            return {
-                "mcp-ios": {
-                    "command": "nix",
-                    "args": ["run", "github:mmmaxwwwell/nix-mcp-debugkit#mcp-ios", "--"],
+                    "args": self._mcp_run_args(server_name, _dir),
                 }
             }
         return {}
@@ -2575,23 +2658,14 @@ class PlatformRuntime:
         """Start the MCP server process and write config file. Returns True on success."""
         _log = log_fn or (lambda msg: print(f"[platform:{self.name}] {msg}", file=sys.stderr))
 
-        # Write MCP config to a temp file for --mcp-config
-        config = self.get_mcp_config()
+        # Write MCP config to a temp file for --mcp-config.
+        # Claude CLI expects {"mcpServers": {<server-name>: {command, args}}}.
+        config = {"mcpServers": self.get_mcp_config(project_dir)}
         config_dir = project_dir / ".specify" / "mcp"
         config_dir.mkdir(parents=True, exist_ok=True)
         config_path = config_dir / f"{self.name}.json"
         config_path.write_text(json.dumps(config, indent=2))
         self._mcp_config_path = config_path
-
-        # Verify prerequisites with --check
-        if self.name == "android":
-            check = subprocess.run(
-                ["nix", "run", "github:mmmaxwwwell/nix-mcp-debugkit#mcp-android", "--", "--check"],
-                capture_output=True, timeout=60,
-            )
-            if check.returncode != 0:
-                _log(f"MCP Android prerequisites check failed: {check.stderr.decode()[:200]}")
-                return False
 
         _log(f"MCP config written to {config_path}")
         return True
@@ -2707,9 +2781,31 @@ class PlatformRuntime:
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return False
 
-    def _build_install_android(self, project_dir: Path, log) -> bool:
-        """Build debug APK and install on emulator."""
+    def _build_install_android(self, project_dir: Path, log,
+                               build_log_path: Optional[Path] = None) -> bool:
+        """Build debug APK and install on emulator.
+
+        If build_log_path is provided, the full build stdout+stderr is written
+        there so that agents can read the tail on failure without loading the
+        entire output into context.
+        """
         log("Building Android APK...")
+
+        def _write_build_log(result: subprocess.CompletedProcess, phase: str):
+            if not build_log_path:
+                return
+            with open(build_log_path, "a") as f:
+                f.write(f"\n{'=' * 60}\n")
+                f.write(f"Phase: {phase}\n")
+                f.write(f"Exit code: {result.returncode}\n")
+                f.write(f"{'=' * 60}\n")
+                if result.stdout:
+                    f.write("--- stdout ---\n")
+                    f.write(result.stdout.decode(errors="replace"))
+                if result.stderr:
+                    f.write("\n--- stderr ---\n")
+                    f.write(result.stderr.decode(errors="replace"))
+                f.write("\n")
 
         # Detect build system
         gradle_dir = None
@@ -2725,8 +2821,9 @@ class PlatformRuntime:
                     ["make", "android-apk"], capture_output=True, timeout=600,
                     cwd=str(project_dir),
                 )
+                _write_build_log(result, "make android-apk")
                 if result.returncode != 0:
-                    log(f"make android-apk failed: {result.stderr.decode()[:300]}")
+                    log(f"make android-apk failed (full log: {build_log_path})")
                     return False
             else:
                 log("No Gradle or Makefile found for Android build")
@@ -2737,8 +2834,9 @@ class PlatformRuntime:
                 capture_output=True, timeout=600,
                 cwd=str(gradle_dir),
             )
+            _write_build_log(result, "gradlew assembleDebug")
             if result.returncode != 0:
-                log(f"Gradle assembleDebug failed: {result.stderr.decode()[:300]}")
+                log(f"Gradle assembleDebug failed (full log: {build_log_path})")
                 return False
 
         # Find and install APK
@@ -2753,8 +2851,9 @@ class PlatformRuntime:
             ["adb", "install", "-r", "-t", str(apk)],
             capture_output=True, timeout=120,
         )
+        _write_build_log(install, "adb install")
         if install.returncode != 0:
-            log(f"APK install failed: {install.stderr.decode()[:200]}")
+            log(f"APK install failed (full log: {build_log_path})")
             return False
 
         log("APK installed successfully")
@@ -2862,11 +2961,89 @@ class PlatformRuntime:
 
 
 class PlatformManager:
-    """Manages all platform runtimes for a runner session."""
+    """Manages all platform runtimes for a runner session.
+
+    In addition to MCP platform runtimes (emulator, browser, simulator), this
+    manager supports **backend E2E services** via a project-level setup/teardown
+    script convention. If the project has a `test/e2e/setup.sh`, the manager
+    runs it once before the first runtime boots to start backend services
+    (databases, API servers, mesh networks, daemons, etc.). On teardown, it
+    runs `test/e2e/teardown.sh` if present.
+
+    This is project-agnostic: any project declares its own infrastructure needs
+    in its setup script. The runner doesn't need to know what the services are.
+    """
 
     def __init__(self, log_fn=None):
         self._runtimes: dict[str, PlatformRuntime] = {}
         self._log = log_fn or (lambda msg: print(f"[platforms] {msg}", file=sys.stderr))
+        self._e2e_services_started = False
+
+    def _start_e2e_services(self, project_dir: Path) -> bool:
+        """Run the project's E2E setup script to start backend services.
+
+        Convention: if test/e2e/setup.sh exists, it starts all backend services
+        needed for E2E testing (headscale, tailscale, daemon, database, etc.).
+        The script should:
+        - Be idempotent (safe to call if services already running)
+        - Write PIDs to a known location for teardown
+        - Exit 0 when all services are ready
+        - Exit non-zero on failure
+        """
+        if self._e2e_services_started:
+            return True
+
+        setup_script = project_dir / "test" / "e2e" / "setup.sh"
+        if not setup_script.exists():
+            self._log("No test/e2e/setup.sh found — skipping backend service setup")
+            self._e2e_services_started = True
+            return True
+
+        self._log(f"Running E2E backend services setup: {setup_script}")
+        try:
+            result = subprocess.run(
+                ["bash", str(setup_script)],
+                capture_output=True, text=True, timeout=300,
+                cwd=str(project_dir),
+                env={**os.environ, "E2E_PROJECT_DIR": str(project_dir)},
+            )
+            if result.returncode != 0:
+                self._log(f"E2E setup failed (exit {result.returncode}):")
+                self._log(f"  stdout: {result.stdout[-500:]}")
+                self._log(f"  stderr: {result.stderr[-500:]}")
+                return False
+            self._log("E2E backend services started successfully")
+            if result.stdout.strip():
+                self._log(f"  setup output: {result.stdout.strip()[:200]}")
+            self._e2e_services_started = True
+            return True
+        except subprocess.TimeoutExpired:
+            self._log("E2E setup timed out after 300s")
+            return False
+        except Exception as e:
+            self._log(f"E2E setup error: {e}")
+            return False
+
+    def _stop_e2e_services(self, project_dir: Path):
+        """Run the project's E2E teardown script to stop backend services."""
+        if not self._e2e_services_started:
+            return
+
+        teardown_script = project_dir / "test" / "e2e" / "teardown.sh"
+        if not teardown_script.exists():
+            return
+
+        self._log(f"Running E2E backend services teardown: {teardown_script}")
+        try:
+            subprocess.run(
+                ["bash", str(teardown_script)],
+                capture_output=True, text=True, timeout=60,
+                cwd=str(project_dir),
+            )
+            self._log("E2E backend services stopped")
+        except Exception as e:
+            self._log(f"E2E teardown error: {e}")
+        self._e2e_services_started = False
 
     def ensure_runtime(self, capability: str, project_dir: Path) -> Optional[PlatformRuntime]:
         """Boot a platform runtime if not already running. Returns the runtime or None on failure."""
@@ -2877,6 +3054,11 @@ class PlatformManager:
 
         if name in self._runtimes and self._runtimes[name]._booted:
             return self._runtimes[name]
+
+        # Start backend services before first runtime boot
+        if not self._start_e2e_services(project_dir):
+            self._log("Backend E2E services failed to start — cannot proceed")
+            return None
 
         runtime = PlatformRuntime(name=name, capability=capability)
         self._log(f"Initializing {name} platform runtime...")
@@ -2889,27 +3071,32 @@ class PlatformManager:
             self._log(f"{name} runtime failed readiness check")
             return None
 
-        if not runtime.build_and_install(project_dir, self._log):
+        # Register early so build_and_install can find the runtime
+        self._runtimes[name] = runtime
+
+        if not self.build_and_install(capability, project_dir):
             self._log(f"Failed to build/install for {name}")
+            del self._runtimes[name]
             return None
 
         if not runtime.start_mcp_server(project_dir, self._log):
             self._log(f"Failed to start MCP server for {name}")
+            del self._runtimes[name]
             return None
 
-        self._runtimes[name] = runtime
         self._log(f"{name} platform runtime fully initialized")
         return runtime
 
-    def rebuild_and_reinstall(self, capability: str, project_dir: Path) -> bool:
-        """Rebuild and reinstall app on an already-running runtime."""
+    def build_and_install(self, capability: str, project_dir: Path,
+                          build_log_path: Optional[Path] = None) -> bool:
+        """Build and install app on a running runtime. Idempotent."""
         name = capability.replace("mcp-", "")
         runtime = self._runtimes.get(name)
         if not runtime or not runtime._booted:
-            self._log(f"Cannot rebuild — {name} runtime not running")
+            self._log(f"Cannot build — {name} runtime not running")
             return False
 
-        return runtime.build_and_install(project_dir, self._log)
+        return runtime.build_and_install(project_dir, self._log, build_log_path)
 
     def get_mcp_config_paths(self, capabilities: set[str]) -> list[Path]:
         """Get MCP config file paths for the given capabilities."""
@@ -2921,14 +3108,18 @@ class PlatformManager:
                 paths.append(runtime.mcp_config_path)
         return paths
 
-    def teardown_all(self):
-        """Stop all runtimes."""
+    def teardown_all(self, project_dir: Optional[Path] = None):
+        """Stop all runtimes and backend services."""
         for name, runtime in self._runtimes.items():
             try:
                 runtime.teardown(self._log)
             except Exception as e:
                 self._log(f"Error tearing down {name}: {e}")
         self._runtimes.clear()
+
+        # Stop backend E2E services
+        if project_dir:
+            self._stop_e2e_services(project_dir)
 
     @property
     def active_runtimes(self) -> dict[str, PlatformRuntime]:
@@ -3990,6 +4181,7 @@ class Runner:
             # Guarantee all agents are killed on ANY exit path:
             # normal completion, unhandled exception, KeyboardInterrupt.
             self._kill_all_agents()
+            self._teardown_platform_runtimes()
             self._remove_pidfile()
 
         self._print_summary()
@@ -4005,6 +4197,7 @@ class Runner:
         # Second Ctrl-C → hard shutdown
         self._shutdown.set()
         self._kill_all_agents()
+        self._teardown_platform_runtimes()
         self._remove_pidfile()
         if self.tui:
             self.tui.stop()
@@ -4068,6 +4261,28 @@ class Runner:
                 agent.process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 pass
+
+    def _teardown_platform_runtimes(self):
+        """Kill any emulators/simulators/runtimes started by the platform manager."""
+        if hasattr(self, '_platform_manager'):
+            try:
+                self._platform_manager.teardown_all(project_dir=Path.cwd())
+            except Exception:
+                pass
+
+        # Belt-and-suspenders: kill any Android emulator even if the platform
+        # manager didn't track it (e.g. agent spawned one inside its sandbox).
+        try:
+            result = subprocess.run(
+                ["adb", "devices"], capture_output=True, timeout=5,
+            )
+            if b"emulator-" in result.stdout:
+                self.log("Killing leftover Android emulator(s)")
+                subprocess.run(
+                    ["adb", "emu", "kill"], capture_output=True, timeout=30,
+                )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
 
     def _run_feature(self, spec_dir: str):
         self._current_spec_dir = spec_dir  # for _poll_agents attempt tracking
@@ -5386,6 +5601,8 @@ class Runner:
                 pass
 
         iteration = state.get("iteration", 0)
+        consecutive_explore_failures = 0
+        MAX_CONSECUTIVE_EXPLORE_FAILURES = 3
 
         # ── Main loop ──
         while not self._shutdown.is_set():
@@ -5438,25 +5655,133 @@ class Runner:
                 status=TaskStatus.RUNNING, line_num=0,
                 capabilities=mcp_caps,
             )
-            _wait_for_subagent(explore_task, explore_prompt,
+            explore_exit = _wait_for_subagent(explore_task, explore_prompt,
                                f"E2E-explore-{iteration}",
                                mcp_configs=mcp_config_paths)
 
-            # Read findings
+            # ── Crash detection: non-zero exit → immediate supervisor ──
+            if explore_exit != 0:
+                e2e_log(f"Explore agent crashed (exit {explore_exit}) — invoking supervisor")
+                # Collect stderr for the supervisor
+                crash_stderr = ""
+                explore_stderr_path = self.log_dir / f"agent-{self.agent_counter}-E2E-explore-{iteration}-{self.timestamp}.stderr"
+                if explore_stderr_path.exists():
+                    crash_stderr = explore_stderr_path.read_text()[-2000:]  # last 2KB
+
+                # Also extract the JSONL result entry — it often has the real
+                # error message (e.g. API errors) that doesn't appear in stderr
+                crash_result_info = ""
+                explore_log_path = self.log_dir / f"agent-{self.agent_counter}-E2E-explore-{iteration}-{self.timestamp}.jsonl"
+                if explore_log_path.exists():
+                    try:
+                        # Read the last few lines to find the result entry
+                        log_lines = explore_log_path.read_text().splitlines()
+                        for raw_line in reversed(log_lines[-10:]):
+                            raw_line = raw_line.strip()
+                            if not raw_line:
+                                continue
+                            entry = json.loads(raw_line)
+                            if entry.get("type") == "result":
+                                crash_result_info = (
+                                    f"Result message: {entry.get('result', '(none)')}\n"
+                                    f"is_error: {entry.get('is_error', False)}\n"
+                                    f"num_turns: {entry.get('num_turns', '?')}\n"
+                                    f"duration_ms: {entry.get('duration_ms', '?')}\n"
+                                    f"total_cost_usd: {entry.get('total_cost_usd', '?')}"
+                                )
+                                break
+                            elif entry.get("type") == "assistant":
+                                # Check for synthetic error messages
+                                model = entry.get("message", {}).get("model", "")
+                                if model == "<synthetic>":
+                                    content = entry.get("message", {}).get("content", [])
+                                    for block in content:
+                                        if block.get("type") == "text":
+                                            crash_result_info = f"Synthetic error: {block['text']}"
+                                    break
+                    except Exception:
+                        pass  # Best-effort — don't crash the runner
+
+                state["history"].append({
+                    "iteration": iteration, "phase": "explore",
+                    "result": "crash", "exit_code": explore_exit,
+                    "stderr_tail": crash_stderr[:500],
+                    "result_info": crash_result_info[:500],
+                })
+                state_file.write_text(json.dumps(state, indent=2))
+
+                # Build a crash-specific supervisor prompt
+                crash_supervisor_prompt = self._build_e2e_crash_supervisor_prompt(
+                    spec_dir, e2e_dir, state, ui_flow_content,
+                    explore_exit, crash_stderr, crash_result_info, iteration,
+                )
+                sup_task = Task(
+                    id=f"E2E-crash-supervisor-{iteration}",
+                    description=f"E2E crash supervisor after explore exit {explore_exit}",
+                    phase=task.phase, parallel=False,
+                    status=TaskStatus.RUNNING, line_num=0,
+                )
+                _wait_for_subagent(sup_task, crash_supervisor_prompt,
+                                   f"E2E-crash-supervisor-{iteration}")
+
+                # Read supervisor decision — same handling as periodic supervisor
+                decision_file = e2e_dir / "supervisor-decision.md"
+                if decision_file.exists():
+                    decision = decision_file.read_text()
+                    if "STOP" in decision.upper():
+                        reason = "human intervention needed" if "HUMAN" in decision.upper() else "unrecoverable"
+                        e2e_log(f"Crash supervisor says: STOP — {reason}")
+                        self.blocked_file.write_text(
+                            f"# BLOCKED: {task.id} — explore agent crashed\n\n"
+                            f"{decision}\n\n"
+                            f"## Crash details\n\n"
+                            f"Exit code: {explore_exit}\n"
+                            f"```\n{crash_stderr[-1000:]}\n```\n"
+                        )
+                        break
+                    else:
+                        e2e_log("Crash supervisor says: CONTINUE (retrying)")
+                        continue
+                else:
+                    # Supervisor didn't write a decision — treat as stop
+                    e2e_log("Crash supervisor produced no decision — stopping")
+                    break
+
+            # Read findings (explore exited 0 but may not have produced output)
             if not findings_file.exists():
                 e2e_log("No findings file produced — explore agent may have failed")
+                consecutive_explore_failures += 1
                 state["history"].append({
                     "iteration": iteration, "phase": "explore",
                     "result": "no_findings",
                 })
                 state_file.write_text(json.dumps(state, indent=2))
+                if consecutive_explore_failures >= MAX_CONSECUTIVE_EXPLORE_FAILURES:
+                    e2e_log(
+                        f"Explore produced no findings {consecutive_explore_failures} "
+                        f"consecutive times — stopping"
+                    )
+                    self.blocked_file.write_text(
+                        f"# BLOCKED: {task.id} — explore agent not producing findings\n\n"
+                        f"Explore agent exited 0 but produced no findings.json "
+                        f"{consecutive_explore_failures} times in a row.\n"
+                        f"Check agent logs in `{self.log_dir}/`\n"
+                    )
+                    break
                 continue
 
             try:
                 findings = json.loads(findings_file.read_text())
             except json.JSONDecodeError:
                 e2e_log("Invalid findings.json — skipping this iteration")
+                consecutive_explore_failures += 1
+                if consecutive_explore_failures >= MAX_CONSECUTIVE_EXPLORE_FAILURES:
+                    e2e_log(f"Explore failed {consecutive_explore_failures} consecutive times — stopping")
+                    break
                 continue
+
+            # Reset on successful explore
+            consecutive_explore_failures = 0
 
             open_bugs = [f for f in findings.get("findings", [])
                          if f.get("status") in ("new", "verified_broken")]
@@ -5478,6 +5803,19 @@ class Runner:
 
             # ── Phase 2: FIX (no MCP needed) ──
             e2e_log(f"Phase 2: Fix ({len(open_bugs)} bugs)")
+
+            # Snapshot HEAD before fix agent runs so we can detect if it changed anything
+            pre_fix_head = ""
+            try:
+                git_cwd = str(Path(spec_dir).parent) if spec_dir else None
+                pre_fix_result = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    capture_output=True, text=True, timeout=10, cwd=git_cwd,
+                )
+                pre_fix_head = pre_fix_result.stdout.strip()
+            except Exception:
+                pass
+
             fix_prompt = self._build_e2e_fix_prompt(
                 spec_dir, findings_file, open_bugs, learnings_file
             )
@@ -5489,11 +5827,139 @@ class Runner:
             )
             _wait_for_subagent(fix_task, fix_prompt, f"E2E-fix-{iteration}")
 
-            # ── Phase 3: Rebuild + reinstall ──
+            # ── Check if fix agent actually changed anything ──
+            # Compare current HEAD and working tree against the commit before fix ran
+            try:
+                git_cwd = str(Path(spec_dir).parent) if spec_dir else None
+                # Check for uncommitted changes (staged or unstaged)
+                diff_result = subprocess.run(
+                    ["git", "diff", "--stat", "HEAD"],
+                    capture_output=True, text=True, timeout=10, cwd=git_cwd,
+                )
+                has_changes = bool(diff_result.stdout.strip())
+                # Check if fix agent made new commits (compare HEAD to pre-fix snapshot)
+                if not has_changes:
+                    head_result = subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        capture_output=True, text=True, timeout=10, cwd=git_cwd,
+                    )
+                    has_changes = head_result.stdout.strip() != pre_fix_head
+            except Exception:
+                has_changes = True  # Assume changes on error — safe fallback
+
+            if not has_changes:
+                e2e_log("Fix agent made no code changes — skipping rebuild and verify")
+                state["history"].append({
+                    "iteration": iteration,
+                    "bugs_found": len(open_bugs),
+                    "bugs_fixed": 0,
+                    "bugs_remaining": len(open_bugs),
+                    "note": "fix agent made no changes",
+                })
+                state_file.write_text(json.dumps(state, indent=2))
+                continue
+
+            # ── Phase 3: Rebuild + reinstall (with build-fix loop) ──
             e2e_log("Phase 3: Rebuild and reinstall")
+            BUILD_FIX_MAX_ATTEMPTS = 10
+            rebuild_ok = True
             for cap in mcp_caps:
-                if not self._platform_manager.rebuild_and_reinstall(cap, project_dir):
-                    e2e_log(f"Rebuild failed for {cap} — will retry next iteration")
+                build_log = e2e_dir / f"build-{cap.replace('mcp-', '')}-iter{iteration}.log"
+                # Clear any previous build log for this iteration
+                if build_log.exists():
+                    build_log.unlink()
+
+                if self._platform_manager.build_and_install(cap, project_dir, build_log):
+                    e2e_log(f"Rebuild succeeded for {cap}")
+                    continue
+
+                # Build failed — enter build-fix loop
+                e2e_log(f"Rebuild failed for {cap} — entering build-fix loop (up to {BUILD_FIX_MAX_ATTEMPTS} attempts)")
+                build_fixed = False
+                prev_fix_summaries: list[str] = []
+
+                for attempt in range(1, BUILD_FIX_MAX_ATTEMPTS + 1):
+                    e2e_log(f"  Build-fix attempt {attempt}/{BUILD_FIX_MAX_ATTEMPTS}")
+
+                    # Spawn a fix agent with the build log path
+                    prev_attempts_text = ""
+                    if prev_fix_summaries:
+                        prev_attempts_text = (
+                            "\n## Previous fix attempts\n"
+                            + "\n".join(f"- Attempt {i+1}: {s}" for i, s in enumerate(prev_fix_summaries))
+                        )
+
+                    build_fix_prompt = f"""You are fixing a build failure. The build command failed and the full output has been written to a log file.
+
+## Build log file
+`{build_log}`
+
+## How to read the log
+1. **Start by reading the last 300 lines** of the file — the error is usually near the end.
+2. If the error references earlier output (e.g. "see above"), use Grep or Read with offset to find the relevant section.
+3. Do NOT read the entire file at once — it may be very large.
+
+## What to do
+1. Read the tail of the build log to identify the error(s).
+2. Read the source files referenced in the errors.
+3. Fix ALL errors — grep the codebase for similar patterns and fix them in one pass.
+4. Do NOT run the build command yourself — the runner will do that after you finish.
+5. In your final response, state a one-line summary of what you changed.
+{prev_attempts_text}
+
+## Iteration
+This is build-fix attempt {attempt} of {BUILD_FIX_MAX_ATTEMPTS}.
+"""
+                    bfix_task = Task(
+                        id=f"E2E-build-fix-{iteration}-{attempt}",
+                        description=f"Fix build failure (attempt {attempt})",
+                        phase=task.phase, parallel=False,
+                        status=TaskStatus.RUNNING, line_num=0,
+                    )
+                    bfix_exit = _wait_for_subagent(
+                        bfix_task, build_fix_prompt,
+                        f"E2E-build-fix-{iteration}-{attempt}",
+                    )
+
+                    # Read what the fix agent said it did (last line of its log)
+                    bfix_log = self.log_dir / f"agent-{self.agent_counter}-{bfix_task.id}-{self.timestamp}.jsonl"
+                    fix_summary = "(fix agent exited)"
+                    if bfix_log.exists():
+                        try:
+                            lines, _, _, _ = read_stream_output(bfix_log, 0)
+                            if lines:
+                                fix_summary = lines[-1][:200]
+                        except Exception:
+                            pass
+                    prev_fix_summaries.append(fix_summary)
+                    e2e_log(f"  Build-fix {attempt}: {fix_summary}")
+
+                    if bfix_exit != 0:
+                        e2e_log(f"  Build-fix agent exited {bfix_exit} — continuing to retry build")
+
+                    # Clear build log and retry build
+                    if build_log.exists():
+                        build_log.unlink()
+                    if self._platform_manager.build_and_install(cap, project_dir, build_log):
+                        e2e_log(f"  Build succeeded on attempt {attempt}")
+                        build_fixed = True
+                        break
+                    else:
+                        e2e_log(f"  Build still failing after attempt {attempt}")
+
+                if not build_fixed:
+                    e2e_log(f"Build-fix loop exhausted ({BUILD_FIX_MAX_ATTEMPTS} attempts) for {cap} — skipping verify")
+                    rebuild_ok = False
+
+            if not rebuild_ok:
+                state["history"].append({
+                    "iteration": iteration, "phase": "rebuild",
+                    "result": "failed",
+                    "note": f"Build-fix loop failed after {BUILD_FIX_MAX_ATTEMPTS} attempts",
+                })
+                state_file.write_text(json.dumps(state, indent=2))
+                e2e_log("Rebuild failed — skipping verify, continuing to next iteration")
+                continue
 
             # ── Phase 4: VERIFY (with MCP) ──
             e2e_log(f"Phase 4: Verify fixes")
@@ -5540,9 +6006,9 @@ class Runner:
                 _mark_task_done(task_file, task.id)
                 break
 
-        # Teardown platform runtimes
+        # Teardown platform runtimes and backend services
         if hasattr(self, '_platform_manager'):
-            self._platform_manager.teardown_all()
+            self._platform_manager.teardown_all(project_dir=Path(spec_dir).parent if spec_dir else None)
 
     def _build_e2e_explore_prompt(self, spec_dir: str, findings_file: Path,
                                    ui_flow: str, spec_content: str,
@@ -5557,17 +6023,40 @@ class Runner:
         if guidance_file.exists():
             guidance = guidance_file.read_text()
 
+        progress = ""
+        progress_file = e2e_dir / "progress.md"
+        if progress_file.exists():
+            progress = progress_file.read_text()
+
+        # Load backend service connection info if available
+        backend_env = ""
+        project_dir = Path(spec_dir).parent if spec_dir else Path.cwd()
+        env_file = project_dir / "test" / "e2e" / ".state" / "env"
+        if env_file.exists():
+            backend_env = env_file.read_text()
+
         return f"""You are an E2E exploration agent with access to MCP tools that let you interact with a running app.
 
 ## Your mission
 
 Explore the running app systematically, comparing actual behavior against the specification. Find AS MANY BUGS AS POSSIBLE in this single run. Do not stop after finding one bug — keep exploring every screen, every flow, every edge case.
 
+## CRITICAL: Context window management
+
+You are running inside a context window with limited capacity. Accumulating too many screenshots will crash you mid-session. Follow these rules strictly:
+
+1. **Prefer DumpHierarchy/Snapshot over Screenshot** — text-based view trees use far less context than images. Only take a screenshot when you need to verify visual layout, colors, or styling that the hierarchy can't show.
+2. **Maximum 15 screenshots per session** — count them. If you need more, prefer hierarchy dumps.
+3. **Save screenshots to disk, don't view them repeatedly** — once you've captured a screenshot to `{e2e_dir}/screenshots/`, reference it by path in your findings. Don't re-read screenshots you've already analyzed.
+4. **Write findings incrementally** — update `{findings_file}` after each screen/flow you complete, not just at the end. If you crash, the next agent can pick up from your partial findings.
+5. **Write a progress checkpoint** — after completing each screen or flow, append a line to `{e2e_dir}/progress.md` noting what you covered (e.g., "Settings screen: validated all sections, dropdowns, OTEL field"). The next iteration reads this to skip already-validated areas.
+6. **If you're running low on context** (you've taken 10+ screenshots or made 100+ tool calls), write your current findings and progress immediately, then stop gracefully.
+
 ## Available MCP tools
 
 You have access to platform MCP tools. Use them to:
-- **Screenshot**: Take screenshots to see what's on screen
-- **Snapshot/DumpHierarchy**: Read the accessibility/view tree to find element selectors
+- **Screenshot**: Take screenshots to see what's on screen (**use sparingly — prefer DumpHierarchy**)
+- **Snapshot/DumpHierarchy**: Read the accessibility/view tree to find element selectors (**prefer this**)
 - **Click/ClickBySelector**: Tap on UI elements
 - **Swipe**: Scroll or swipe gestures
 - **Type/SetText**: Enter text into fields
@@ -5577,16 +6066,17 @@ You have access to platform MCP tools. Use them to:
 
 ## How to explore
 
-1. Launch the app
-2. Take a screenshot and read the view tree to understand the current screen
-3. Compare what you see against the UI_FLOW.md specification below
-4. Try both happy paths AND error paths for each flow
-5. When you find a bug, document it with:
-   - Screenshot (save to `{e2e_dir}/screenshots/`)
+1. **Check progress first** — read `{e2e_dir}/progress.md` if it exists. Skip screens/flows already marked as validated.
+2. Launch the app (if not already running)
+3. **Use DumpHierarchy first** to understand the current screen, then take a screenshot only if needed
+4. Compare what you see against the UI_FLOW.md specification below
+5. Try both happy paths AND error paths for each flow
+6. When you find a bug, document it with:
    - Steps to reproduce
    - Expected vs actual behavior
-6. Navigate to the next screen/flow and repeat
-7. Keep going until you've covered every screen and flow
+   - Screenshot path (save to `{e2e_dir}/screenshots/` — take one screenshot per bug, not per step)
+7. **Update findings and progress files after each screen**
+8. Navigate to the next screen/flow and repeat
 
 ## Flows to test (from UI_FLOW.md)
 
@@ -5608,6 +6098,26 @@ The supervisor has provided the following guidance for this iteration:
 {guidance}
 </guidance>
 ''' if guidance else ''}
+
+{f'''## Previous exploration progress
+
+These screens/flows have already been validated by previous iterations. **Skip them** unless you have reason to believe they regressed:
+
+<progress>
+{progress}
+</progress>
+''' if progress else '## No previous progress — this is the first exploration. Start from the beginning.'}
+
+{f'''## Backend service connection info
+
+The following backend services are running. Use these values to connect the app to real infrastructure (e.g., inject auth keys, verify daemon connectivity, test pairing/signing flows):
+
+```
+{backend_env}
+```
+
+Read `test/e2e/setup.sh` in the project to understand what each service does and how to interact with it.
+''' if backend_env else ''}
 
 {f'''## Previous findings
 
@@ -5647,13 +6157,15 @@ Write your findings to `{findings_file}` as JSON:
 
 ## Rules
 
-- Explore EVERY screen and flow — do not stop early
-- Take screenshots liberally — they help the fix agent understand the bug
+- Explore EVERY screen and flow not already covered in `{e2e_dir}/progress.md`
+- **Use DumpHierarchy as primary inspection tool** — only screenshot for visual bugs or one screenshot per bug found
 - Test error paths: invalid inputs, back navigation, interruptions
 - Test state persistence: navigate away and back
 - Do NOT fix bugs — only document them
 - Do NOT modify source code
-- Create the screenshots directory: `mkdir -p {e2e_dir}/screenshots/`
+- Create directories: `mkdir -p {e2e_dir}/screenshots/`
+- **Update findings and progress after each screen** — don't wait until the end
+- If you feel you're running low on context (many tool calls), save your work and stop gracefully
 """
 
     def _build_e2e_fix_prompt(self, spec_dir: str, findings_file: Path,
@@ -5677,7 +6189,10 @@ Write your findings to `{findings_file}` as JSON:
    b. Find the relevant source code
    c. Fix the root cause (not just the symptom)
 3. Fix ALL bugs before stopping — do not fix one and then quit
-4. After fixing all bugs, run any available unit tests to make sure you haven't broken anything
+4. **Run the project's test suite** to make sure your fixes don't break existing functionality:
+   - Read `CLAUDE.md` or `Makefile` to find the test command (e.g., `make test`, `./gradlew test`, `npm test`, `go test ./...`)
+   - Run **all** test suites, not just the ones related to your changes — E2E fixes often touch shared code
+   - If tests fail, fix them before committing. If a test failure is pre-existing (not caused by your changes), note it but don't block on it.
 5. Commit all changes with a conventional commit message
 
 ## Rules
@@ -5686,6 +6201,7 @@ Write your findings to `{findings_file}` as JSON:
 - Do NOT modify `{findings_file}` — the verify agent will update it
 - Do NOT skip bugs — if you can't fix one, add a comment in the code explaining why
 - Prefer fixing the app code over fixing tests (tests are the spec)
+- **Do NOT skip tests** — if you can't find a test command, look harder (CLAUDE.md, Makefile, package.json, build.gradle)
 - Record any non-obvious learnings to `{learnings_file}`
 """
 
@@ -5696,9 +6212,20 @@ Write your findings to `{findings_file}` as JSON:
 
         return f"""You are an E2E verify agent with access to MCP tools. Your job is to verify bug fixes and find new bugs.
 
+## CRITICAL: Context window management
+
+Follow these rules to avoid crashing from context overflow:
+
+1. **Prefer DumpHierarchy/Snapshot over Screenshot** — only screenshot when you need visual verification.
+2. **Maximum 10 screenshots per session** — one per bug being verified is enough.
+3. **Save screenshots to disk** at `{e2e_dir}/screenshots/` and reference by path. Don't re-read them.
+4. **Update findings incrementally** — write to `{findings_file}` after verifying each bug, not all at once at the end.
+
 ## Available MCP tools
 
 Same tools as the explore agent: Screenshot, Snapshot/DumpHierarchy, Click, Swipe, Type, WaitForElement, Press, GetScreenInfo.
+
+**Prefer DumpHierarchy over Screenshot** to conserve context window space.
 
 ## Previous findings to verify
 
@@ -5710,11 +6237,11 @@ Same tools as the explore agent: Screenshot, Snapshot/DumpHierarchy, Click, Swip
 
 1. For each bug with status "new" in the findings:
    a. Follow the steps to reproduce exactly
-   b. Take a screenshot
+   b. Use DumpHierarchy to check the state; take a screenshot only if visual verification is needed
    c. If the bug is fixed: update status to "fixed"
    d. If the bug still exists: update status to "verified_broken"
-2. While re-testing, if you discover NEW bugs, add them with status "new"
-3. Write the updated findings back to `{findings_file}`
+2. **Update `{findings_file}` after EACH bug** — don't wait until the end
+3. While re-testing, if you discover NEW bugs, add them with status "new"
 
 ## UI_FLOW.md for reference
 
@@ -5725,7 +6252,7 @@ Same tools as the explore agent: Screenshot, Snapshot/DumpHierarchy, Click, Swip
 ## Rules
 
 - Test EVERY bug in the findings — do not skip any
-- Take screenshots for verification (save to `{e2e_dir}/screenshots/`)
+- Save screenshots to `{e2e_dir}/screenshots/` — one per bug max
 - Add any newly discovered bugs
 - Do NOT modify source code — only update `{findings_file}`
 """
@@ -5804,6 +6331,82 @@ Write the new strategy to `{e2e_dir}/guidance.md`.
 - If the same bug has been "fixed" and "verified_broken" more than 3 times, that's a sign the fix approach is wrong
 - If total iterations > 30 with diminishing returns, suggest stopping
 - Consider token cost: each iteration is ~100k tokens. Is continued exploration worth it?
+"""
+
+    def _build_e2e_crash_supervisor_prompt(self, spec_dir: str, e2e_dir: Path,
+                                            state: dict, ui_flow: str,
+                                            exit_code: int, stderr: str,
+                                            result_info: str,
+                                            iteration: int) -> str:
+        """Build a supervisor prompt specifically for an explore agent crash."""
+        state_json = json.dumps(state, indent=2)
+        return f"""You are an E2E supervisor agent. The explore agent just **crashed** (non-zero exit). Diagnose the failure and decide whether retrying could help or if human intervention is needed.
+
+## Crash details
+
+- **Exit code**: {exit_code}
+- **Iteration**: {iteration}
+- **Stderr output**:
+```
+{stderr if stderr else "(empty — no stderr captured)"}
+```
+
+{f'''- **JSONL result/error info** (from the agent's log — this is often more informative than stderr):
+```
+{result_info}
+```
+''' if result_info else '- **JSONL result info**: (none extracted)'}
+
+## Loop state
+
+<state>
+{state_json}
+</state>
+
+## Your job
+
+Analyze ALL available crash information to determine the root cause. **Check the JSONL result info first** — it often contains the real error when stderr is empty.
+
+Common crash causes:
+- **MCP config invalid**: "Does not adhere to MCP server configuration schema" → config file format is wrong. STOP.
+- **MCP server not running**: connection refused, timeout → emulator/browser not booted. STOP.
+- **MCP server status "failed"**: The MCP server failed to initialize — check if the emulator/service is running. STOP.
+- **Auth failure**: API key expired or missing → credential issue. STOP.
+- **API image limit**: "image in the conversation exceeds the dimension limit" → agent accumulated too many screenshots and hit the Claude API multi-image limit. This is a **context overflow**, not an infra issue. The agent was working but ran out of context. CONTINUE (the next iteration will pick up from progress.md).
+- **OOM / timeout**: resource exhaustion → may be transient, CONTINUE to retry once.
+- **Emulator died**: adb device not found → emulator crashed mid-test. May be transient.
+
+Write your decision to `{e2e_dir}/supervisor-decision.md`:
+
+### If the crash is an infrastructure/config issue (not transient):
+```
+# STOP — HUMAN INTERVENTION NEEDED
+
+[Root cause diagnosis]
+[What the human needs to fix]
+```
+
+### If the crash is a context overflow (too many images/tokens):
+```
+# CONTINUE
+
+Agent hit context window limits after doing real work. The next iteration will resume from progress.md.
+```
+
+### If the crash looks transient (OOM, timeout, flaky emulator):
+```
+# CONTINUE
+
+[Why you think a retry will succeed]
+```
+
+## Rules
+
+- **Read ALL crash info before deciding** — empty stderr does NOT mean the agent did nothing. Check the JSONL result info.
+- Be decisive — if the error clearly shows a config/setup issue, say STOP immediately
+- A crash that happened once might be transient. The same crash twice is a pattern — check state.history for prior crashes
+- Don't suggest retrying if the error message indicates a deterministic failure (bad config, missing binary, schema error)
+- Context overflow crashes (image limits, token limits) are expected and recoverable — always CONTINUE
 """
 
     def _run_ci_loop(self, task: Task, spec_dir: str, task_file: Path,

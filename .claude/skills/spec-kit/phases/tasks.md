@@ -186,10 +186,19 @@ Browser and iOS tasks can run in parallel with each other (different runtimes), 
 
 **Single platform projects**: If the project targets only one platform (e.g., Android only), do NOT mark scenario tasks as `[P]` — they all share one emulator and must run sequentially. Only non-runtime tasks (prompt writing, config files) can be parallelized. See `reference/e2e-runtime.md § Single-runtime constraint on parallelism`.
 
+**Nix-first projects**: If `interview-notes.md` records `Nix available: yes`, the E2E setup phase MUST include a task that adds `nix-mcp-debugkit` as a flake input in `flake.nix` and exposes `mcp-android`, `mcp-browser`, and/or `mcp-ios` as packages. This pins the MCP debug toolkit version in `flake.lock` and lets the runner use `.#mcp-<platform>` instead of an unpinned `github:` URI. Example flake input:
+
+```nix
+inputs.nix-mcp-debugkit.url = "github:mmmaxwwwell/nix-mcp-debugkit";
+```
+
+The runner automatically detects the flake input and uses the pinned reference — no additional wiring is needed beyond adding the input.
+
 **Prerequisites**: The E2E exploration task should depend on:
 - `UI_FLOW.md` existing and being complete
 - The app building successfully for the target platform
 - Any test bypass mechanisms being in place (mock biometrics, deep links, etc.)
+- (Nix-first) `nix-mcp-debugkit` added as a flake input
 
 ### Build environment gap analysis (MANDATORY)
 

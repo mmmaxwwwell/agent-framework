@@ -148,6 +148,56 @@ Every N iterations (default 10), a supervisor agent reviews progress:
 | `verified_broken` | Fix attempt failed, bug still exists |
 | `wont_fix` | Intentional behavior or out of scope |
 
+## Context window management
+
+MCP explore and verify agents accumulate screenshots and view hierarchy dumps in their conversation context. Without management, the agent will hit the Claude API's multi-image dimension limit and crash mid-session with:
+
+> "An image in the conversation exceeds the dimension limit for many-image requests (2000px)"
+
+### Rules the runner enforces via prompts
+
+1. **Prefer DumpHierarchy/Snapshot over Screenshot** — text-based view trees use ~100x less context than images. Only screenshot when visual verification is needed (colors, layout, styling).
+2. **Maximum 15 screenshots per explore session, 10 per verify session** — agents count and stop taking screenshots after the limit.
+3. **Save screenshots to disk, don't re-read** — once captured to `validate/e2e/screenshots/`, reference by path in findings. Don't re-read images already analyzed.
+4. **Write findings incrementally** — update `findings.json` after each screen/flow, not at the end. If the agent crashes, the next iteration picks up from partial findings.
+5. **Write progress checkpoints** — after each screen/flow, append to `validate/e2e/progress.md`. The next iteration reads this and skips already-validated areas.
+6. **Graceful exit on low context** — if 10+ screenshots taken or 100+ tool calls made, write current findings and progress, then stop.
+
+### Token reporting
+
+The runner reads cumulative token usage from the JSONL result entry (authoritative), not from individual assistant messages. Synthetic error messages (model `"<synthetic>"`) have zeroed-out usage and are ignored to prevent false "0k tok" reporting.
+
+### Crash recovery
+
+When an explore agent crashes (exit non-zero), the crash supervisor receives:
+- stderr output (if any)
+- The JSONL result entry (real error message, num_turns, duration, cost)
+- Full loop state history
+
+Context overflow crashes (image limits, token limits) are classified as **recoverable** — the supervisor says CONTINUE and the next iteration resumes from `progress.md`. Infrastructure crashes (MCP server down, auth failure) are classified as **STOP — human intervention needed**.
+
+## Skip rebuild when no changes
+
+After the fix agent completes, the runner checks `git diff --stat HEAD` and compares HEAD against the pre-fix commit. If the fix agent made no code changes (already fixed in a prior iteration, or couldn't fix), the runner skips the rebuild and verify phases entirely, logging "Fix agent made no code changes — skipping rebuild and verify." This prevents wasted iterations where the fix agent discovers everything was already fixed.
+
+## Backend service connection info
+
+When `test/e2e/setup.sh` starts backend services, it writes connection info to `test/e2e/.state/env` as shell-style key=value pairs:
+
+```bash
+HEADSCALE_PORT=18080
+HOST_AUTH_KEY=tskey-preauth-...
+PHONE_AUTH_KEY=tskey-preauth-...
+HOST_TAILSCALE_IP=100.64.0.1
+SSH_AUTH_SOCK=/tmp/.../agent.sock
+CONTROL_SOCKET=/tmp/.../control.sock
+```
+
+The runner reads this file and includes it in the explore agent's prompt so the agent knows how to connect to backend services. The explore agent can use this info to:
+- Inject the phone auth key into the app (via deep link or adb instrumentation)
+- Verify the host daemon is reachable at the Tailscale IP
+- Test sign requests through the real infrastructure
+
 ## Platform runtimes
 
 The runner has built-in knowledge of three platform runtimes:
@@ -157,6 +207,29 @@ The runner has built-in knowledge of three platform runtimes:
 | Android | `mcp-android` | Emulator via `start-emulator` or `emulator @avd` | `gradlew assembleDebug` + `adb install` | `nix-mcp-debugkit#mcp-android` |
 | Browser | `mcp-browser` | Bundled with MCP server | N/A | `nix-mcp-debugkit#mcp-browser` |
 | iOS | `mcp-ios` | `xcrun simctl boot` | `xcodebuild build` + `simctl install` | `nix-mcp-debugkit#mcp-ios` |
+
+## Nix-first projects: pin MCP servers in flake.nix
+
+If the project uses Nix (`flake.nix` exists), `nix-mcp-debugkit` MUST be added as a flake input rather than referenced via unpinned `github:` URIs. This follows the nix-first principle: all dependencies are version-pinned in `flake.lock`.
+
+```nix
+# flake.nix
+{
+  inputs.nix-mcp-debugkit.url = "github:mmmaxwwwell/nix-mcp-debugkit";
+
+  outputs = { self, nixpkgs, nix-mcp-debugkit, ... }:
+    # Expose MCP servers as packages so the runner can use .#mcp-android etc.
+    packages.x86_64-linux = {
+      mcp-android = nix-mcp-debugkit.packages.x86_64-linux.mcp-android;
+      mcp-browser = nix-mcp-debugkit.packages.x86_64-linux.mcp-browser;
+      mcp-ios = nix-mcp-debugkit.packages.x86_64-linux.mcp-ios;
+    };
+}
+```
+
+The parallel runner automatically detects the flake input: if `"nix-mcp-debugkit"` appears in `flake.nix`, it uses `nix run .#mcp-<platform>` (pinned) instead of `nix run github:mmmaxwwwell/nix-mcp-debugkit#mcp-<platform>` (unpinned). No config changes needed — just add the input.
+
+**Why this matters**: Without pinning, every `nix run github:...` fetches whatever `main` currently points to. A breaking change upstream silently breaks your E2E tests. With a flake input, you control when to update via `nix flake update nix-mcp-debugkit`.
 
 ## MCP tools available to agents
 
