@@ -5798,7 +5798,7 @@ class Runner:
                 explore_exit = _wait_for_subagent(explore_task, explore_prompt,
                                    f"E2E-explore-{iteration}",
                                    mcp_configs=mcp_config_paths,
-                                   model="sonnet")
+                                   model="opus")
                 e2e_log(f"DEBUG: explore_exit={explore_exit}")
             except Exception as exc:
                 import traceback
@@ -6315,7 +6315,7 @@ This is build-fix attempt {attempt} of {BUILD_FIX_MAX_ATTEMPTS}.
             _wait_for_subagent(verify_task, verify_prompt,
                                f"E2E-verify-{iteration}",
                                mcp_configs=mcp_config_paths,
-                               model="sonnet")
+                               model="opus")
 
             # Re-read findings after verify
             try:
