@@ -6003,8 +6003,38 @@ This is build-fix attempt {attempt} of {BUILD_FIX_MAX_ATTEMPTS}.
 
             if not still_open:
                 e2e_log("All bugs fixed — E2E loop complete!")
-                _mark_task_done(task_file, task.id)
                 break
+
+        # ── Post-loop: full test suite validation ──
+        # After the E2E loop finishes (all bugs fixed OR supervisor stopped),
+        # run the project's full test suite to catch regressions from E2E fixes.
+        e2e_log("Phase 5: Post-E2E regression check — running full test suite")
+        regression_prompt = self._build_e2e_regression_prompt(spec_dir, e2e_dir)
+        regression_task = Task(
+            id=f"E2E-regression-check",
+            description="Post-E2E full test suite validation",
+            phase=task.phase, parallel=False,
+            status=TaskStatus.RUNNING, line_num=0,
+        )
+        regression_exit = _wait_for_subagent(
+            regression_task, regression_prompt, "E2E-regression-check"
+        )
+
+        if regression_exit != 0:
+            e2e_log("Regression check agent failed (non-zero exit) — check logs")
+        else:
+            # Check if the agent reported failures
+            regression_report = e2e_dir / "regression-report.md"
+            if regression_report.exists():
+                report = regression_report.read_text()
+                if "ALL TESTS PASSED" in report.upper():
+                    e2e_log("Regression check: all tests passed")
+                else:
+                    e2e_log("Regression check: issues found — see regression-report.md")
+            else:
+                e2e_log("Regression check: no report produced")
+
+        _mark_task_done(task_file, task.id)
 
         # Teardown platform runtimes and backend services
         if hasattr(self, '_platform_manager'):
@@ -6331,6 +6361,60 @@ Write the new strategy to `{e2e_dir}/guidance.md`.
 - If the same bug has been "fixed" and "verified_broken" more than 3 times, that's a sign the fix approach is wrong
 - If total iterations > 30 with diminishing returns, suggest stopping
 - Consider token cost: each iteration is ~100k tokens. Is continued exploration worth it?
+"""
+
+    def _build_e2e_regression_prompt(self, spec_dir: str, e2e_dir: Path) -> str:
+        """Build prompt for the post-E2E regression check agent."""
+        return f"""You are a regression check agent. The E2E bug-fix loop just completed — multiple rounds of fixes were applied to resolve UI/behavioral bugs found during E2E exploration. Your job is to run the project's FULL test suite to make sure nothing was broken.
+
+## Instructions
+
+1. Read `CLAUDE.md` in the project root to find ALL test commands. Look for:
+   - `make test`, `make validate`, or similar Makefile targets
+   - `go test ./...` or language-specific test runners
+   - `./gradlew test` or `./gradlew testDebugUnitTest` for Android
+   - `npm test`, `pytest`, `cargo test`, etc.
+   - Any other test commands documented in the project
+
+2. Run EVERY test suite you find — not just one. Projects often have multiple:
+   - Host/backend tests (Go, Rust, Python, etc.)
+   - Android/iOS unit tests (Gradle, Xcode)
+   - Lint checks (`make lint`, `golangci-lint`, `ktlint`)
+   - Type checks, format checks
+
+3. For each test suite:
+   - Run it and capture the output
+   - If it PASSES: note it in your report
+   - If it FAILS: analyze the failures. Determine if they were caused by E2E fixes (check `git log` for recent commits) or pre-existing.
+     - If caused by E2E fixes: **fix the regression**, run tests again to confirm, commit the fix
+     - If pre-existing: note it but don't block on it
+
+4. Write your results to `{e2e_dir}/regression-report.md`:
+
+```markdown
+# Post-E2E Regression Report
+
+## Test suites run
+
+- [PASS/FAIL] <test command> — <summary>
+- [PASS/FAIL] <test command> — <summary>
+
+## Regressions found and fixed
+- <description of regression and fix, if any>
+
+## Pre-existing failures (not caused by E2E fixes)
+- <description, if any>
+
+## Result
+ALL TESTS PASSED / REGRESSIONS FIXED / FAILURES REMAIN
+```
+
+## Rules
+
+- Run ALL test suites, not just the obvious ones
+- Do NOT skip tests because they're slow — run everything
+- If you fix regressions, commit them with a descriptive message
+- Be thorough — this is the last check before the task is marked done
 """
 
     def _build_e2e_crash_supervisor_prompt(self, spec_dir: str, e2e_dir: Path,

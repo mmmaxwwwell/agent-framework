@@ -80,7 +80,28 @@ The `e2e-loop` capability tells the runner to use the explore-fix-verify cycle i
           └────────────┬────────────┘
                        │
                   Loop until clean
+                       │
+          ┌────────────▼────────────┐
+          │  REGRESSION agent       │
+          │  - Run ALL test suites  │
+          │  - Fix any regressions  │
+          │  - Report results       │
+          │  → regression-report.md │
+          └─────────────────────────┘
 ```
+
+### Post-loop regression check
+
+After the explore-fix-verify loop finishes (all bugs fixed or supervisor stops), the runner spawns a **regression check agent** that runs the project's full test suite. E2E fixes often touch shared code (screens, view models, navigation) and can break existing unit tests, lint checks, or instrumented tests.
+
+The regression agent:
+1. Reads `CLAUDE.md` to find all test commands (make test, gradlew test, go test, lint, etc.)
+2. Runs every test suite — not just the ones related to E2E changes
+3. If a test fails due to an E2E fix: fixes the regression and commits
+4. If a test failure is pre-existing: notes it but doesn't block
+5. Writes results to `validate/e2e/regression-report.md`
+
+The task is only marked done after the regression check completes.
 
 ### Explore agent
 
