@@ -2284,6 +2284,32 @@ def check_rate_limited(stderr_path: Path, log_path: Optional[Path] = None) -> Op
     return None
 
 
+def check_overloaded(log_path: Path) -> bool:
+    """Check if the agent died from a 529 overloaded error."""
+    try:
+        for raw_line in reversed(log_path.read_text().splitlines()):
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                msg = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("type") == "result" and msg.get("is_error"):
+                result = str(msg.get("result", ""))
+                if "529" in result or "overloaded" in result.lower():
+                    return True
+            if msg.get("type") == "assistant":
+                for block in msg.get("message", {}).get("content", []):
+                    if block.get("type") == "text":
+                        text = block.get("text", "")
+                        if "529" in text and "overloaded" in text.lower():
+                            return True
+    except Exception:
+        pass
+    return False
+
+
 def check_auth_error(log_path: Path) -> Optional[str]:
     """Check if the agent died from a permanent auth error (not retryable).
 
@@ -5779,6 +5805,30 @@ class Runner:
                 e2e_log(f"DEBUG: spawn/wait FAILED: {exc}")
                 e2e_log(f"DEBUG: {traceback.format_exc()}")
                 break
+
+            # ── Overload detection: 529 → retry with opus ──
+            if explore_exit != 0:
+                explore_log_p = self.log_dir / f"agent-{self.agent_counter}-E2E-explore-{iteration}-{self.timestamp}.jsonl"
+                if explore_log_p.exists() and check_overloaded(explore_log_p):
+                    e2e_log(f"Explore agent hit 529 overloaded — retrying with opus")
+                    explore_task_retry = Task(
+                        id=f"E2E-explore-{iteration}",
+                        description=f"E2E explore iteration {iteration} (opus retry)",
+                        phase=task.phase, parallel=False,
+                        status=TaskStatus.RUNNING, line_num=0,
+                        capabilities=mcp_caps,
+                    )
+                    try:
+                        explore_exit = _wait_for_subagent(explore_task_retry, explore_prompt,
+                                           f"E2E-explore-{iteration}-opus",
+                                           mcp_configs=mcp_config_paths,
+                                           model="opus")
+                        e2e_log(f"DEBUG: opus retry explore_exit={explore_exit}")
+                    except Exception as exc:
+                        import traceback
+                        e2e_log(f"DEBUG: opus retry spawn/wait FAILED: {exc}")
+                        e2e_log(f"DEBUG: {traceback.format_exc()}")
+                        break
 
             # ── Crash detection: non-zero exit → immediate supervisor ──
             if explore_exit != 0:
