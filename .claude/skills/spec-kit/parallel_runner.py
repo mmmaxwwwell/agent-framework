@@ -5733,6 +5733,7 @@ class Runner:
         consecutive_explore_failures = 0
         MAX_CONSECUTIVE_EXPLORE_FAILURES = 3
         e2e_loop_succeeded = False
+        fix_agent_ran = False
 
         # ── Main loop ──
         while not self._shutdown.is_set():
@@ -6140,6 +6141,7 @@ class Runner:
                     break
 
             # ── Phase 2: FIX (no MCP needed) ──
+            fix_agent_ran = True
             e2e_log(f"Phase 2: Fix ({len(open_bugs)} bugs)")
 
             # Snapshot HEAD before fix agent runs so we can detect if it changed anything
@@ -6393,8 +6395,15 @@ This is build-fix attempt {attempt} of {BUILD_FIX_MAX_ATTEMPTS}.
             return
 
         # ── Post-loop: full test suite validation ──
-        # After the E2E loop finishes (all bugs fixed OR supervisor stopped),
-        # run the project's full test suite to catch regressions from E2E fixes.
+        # Only run regression check if the fix agent actually modified code.
+        # Clean exploration passes (0 bugs) don't need regression checks.
+        if not fix_agent_ran:
+            e2e_log("No fixes applied — skipping regression check")
+            _mark_task_done(task_file, task.id)
+            if hasattr(self, '_platform_manager'):
+                self._platform_manager.teardown_all(project_dir=Path(spec_dir).parent if spec_dir else None)
+            return
+
         e2e_log("Phase 5: Post-E2E regression check — running full test suite")
         regression_prompt = self._build_e2e_regression_prompt(spec_dir, e2e_dir)
         regression_task = Task(
