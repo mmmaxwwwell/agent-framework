@@ -5915,9 +5915,7 @@ class Runner:
                     "result": "clean", "open_bugs": 0,
                 })
                 state_file.write_text(json.dumps(state, indent=2))
-
-                # Mark the task complete
-                _mark_task_done(task_file, task.id)
+                e2e_loop_succeeded = True
                 break
 
             state["total_bugs_found"] = len(findings.get("findings", []))
