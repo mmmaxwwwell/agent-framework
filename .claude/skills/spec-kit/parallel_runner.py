@@ -4912,6 +4912,7 @@ class Runner:
                         self.log(f"  Blocked by unmet deps: {', '.join(unmet)}")
                     break
                 self.log(f"No tasks ready ({consecutive_noop}/{max_consecutive_noop} before exit). Waiting...")
+                self._poll_agents()
                 time.sleep(5)
                 continue
             else:
@@ -4941,6 +4942,15 @@ class Runner:
                         self.log(f"CI loop thread for {task_id} completed")
                         del self._ci_threads[task_id]
                         # Remove the virtual agent slot
+                        with self._lock:
+                            self.agents = [a for a in self.agents if a.task.id != task_id]
+
+            # Check for completed E2E loop threads
+            if hasattr(self, '_e2e_threads'):
+                for task_id, thread in list(self._e2e_threads.items()):
+                    if not thread.is_alive():
+                        self.log(f"E2E loop thread for {task_id} completed")
+                        del self._e2e_threads[task_id]
                         with self._lock:
                             self.agents = [a for a in self.agents if a.task.id != task_id]
 
@@ -6463,7 +6473,7 @@ This is build-fix attempt {attempt} of {BUILD_FIX_MAX_ATTEMPTS}.
 
         # Load backend service connection info if available
         backend_env = ""
-        project_dir = Path(spec_dir).parent if spec_dir else Path.cwd()
+        project_dir = Path.cwd()
         env_file = project_dir / "test" / "e2e" / ".state" / "env"
         if env_file.exists():
             backend_env = env_file.read_text()
@@ -6528,6 +6538,7 @@ Tools are namespaced as `mcp__mcp-android__<name>`. Call them directly — do NO
    - Screenshot path (save to `{e2e_dir}/screenshots/` — take one screenshot per bug, not per step)
 7. **Update findings and progress files after each screen**
 8. Navigate to the next screen/flow and repeat
+9. **NEVER run interactive or long-lived commands** via Bash (e.g. `nix-key pair`, `nix-key daemon`, servers, watchers). These hang forever and block the entire session. Always set `"timeout": 10000` (10s) on any Bash call. If you need to test a CLI command, use a non-interactive flag or just verify the binary exists.
 
 ## Flows to test (from UI_FLOW.md)
 
