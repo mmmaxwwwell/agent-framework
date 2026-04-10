@@ -31,6 +31,10 @@ Every task MUST include a `Done when:` line — a concrete, verifiable completio
 1. **Must be verifiable** — not "implement mTLS" but "mutual TLS handshake succeeds with test certs; connection rejected with expired cert; both paths have unit tests"
 2. **Must add information beyond the task title** — if the done criterion just restates the description, omit it and write a better task description instead
 3. **Keep to 1-3 bullet points** — not a mini-spec. The FR in `spec.md` is the full spec; `Done when:` is the agent's stop-signal
+4. **"Write tests" means "tests pass on the target runtime"** — a done criterion like "write instrumented test verifying X" means the test must actually execute and pass, not just compile. If the task targets Android, the test must run on an emulator. If it targets a web runtime, it must run in a real browser. A test that was written but never executed is not a completed done criterion. Phrase criteria as "tests pass" not "tests exist."
+5. **Must not be satisfiable by a stub** — if the task says "implement X using library Y," the done criterion must require observable behavior that only the real library Y can produce. For example: "TailscaleManager connects to a headscale instance and receives a real IP" — a stub returning a hardcoded IP would not satisfy this. When a task wraps an external library, include a criterion that exercises the real library's behavior.
+6. **Must pin exact names when the spec defines them** — if the task says "show a STATUS column" or "log 'shutdown initiated'", the done criterion must assert the exact string. "Done when: `nix-key devices` output includes a column headed STATUS" — not just "shows device connectivity." This prevents synonym drift where the implementation uses a different word (SOURCE instead of STATUS, "shutting down" instead of "shutdown initiated") that satisfies the spirit but fails the letter of the spec. When the spec or task description uses a specific name, column header, field name, JSON key, log message, or UI label — the done criterion must repeat that exact string.
+7. **Cross-boundary tasks must assert both sides** — if the task involves one system writing data that another reads (Nix config → Go daemon, Go server → Kotlin client, API → frontend), the done criterion must verify BOTH the write side AND the read side produce/consume the correct format. "Done when: NixOS module writes `devices` to config.json with keys `name`, `tailscaleIp`, `port`, `certFingerprint`, `clientCertPath`, `clientKeyPath` AND Go daemon's Config struct deserializes all fields correctly" — not just one side.
 
 Example:
 ```markdown
@@ -110,6 +114,17 @@ When generating tasks from spec requirements, watch for these common ambiguities
 1. **"Compatible with X"** — specify the exact integration point. "Compatible with the test reporter" is vague; "aggregatable by `scripts/ci-summary.sh` into ci-summary.json" is precise. Name the tool, script, or interface that consumes the output.
 2. **Mode-scoped features** — if the project has multiple execution modes (CI vs local, debug vs release, server vs CLI), every requirement and task involving a mode-specific feature MUST explicitly state which mode it applies to. A supervisor agent that only runs in local mode must say so in the FR, not just in the task description. Ambiguity here causes implementing agents to wire features into the wrong mode.
 3. **Shared-resource parallelism claims** — if the Dependencies section claims user stories can run in parallel, verify they don't share a singleton resource (emulator, device, database). If they do, the section must say they run sequentially and explain why.
+
+### Cross-boundary contract tasks (MANDATORY for multi-language/multi-system projects)
+
+When a task involves one system producing data that another system consumes (Go writing JSON that Kotlin reads, Nix generating config that Go parses, a CLI producing output that a script greps), the task description MUST:
+
+1. **Enumerate exact field names / keys / column headers on both sides** — not "store device info" but "store `{name, tailscaleIp, port, certFingerprint, clientCertPath, clientKeyPath}`." If the producer uses `clientCertPath` and the consumer struct has `ClientCert`, the mismatch will be invisible to tests that only exercise one side.
+2. **Include a cross-boundary integration test** — a test that writes data from the producer and reads it with the consumer, asserting that every field round-trips correctly. This test catches JSON tag mismatches, protobuf field renames, and serialization format disagreements.
+3. **Reference the exact serialization format** — for JSON: specify the key casing convention (camelCase, snake_case) and nullable fields. For protobuf: reference the `.proto` field names. For CLI output: specify exact column headers.
+4. **Pin the format in the task description, not just in external docs** — don't say "matches the format defined in module.nix." Inline the actual field names so the implementing agent doesn't have to read the other system's code to know what format to produce/consume.
+
+This rule exists because the most common deficiency in multi-system projects is silent format disagreement — both sides compile, both sides' tests pass, but they disagree on a field name and the integration silently drops data.
 
 ### Non-goals awareness
 If the spec has a `## Non-Goals` section, reference it in the approach note so implementing agents know what NOT to build. Agents encountering an unlisted scenario should check Non-Goals before implementing — if it's listed there, skip it. If it's genuinely ambiguous and not in Non-Goals, proceed or write BLOCKED.md.
@@ -289,6 +304,8 @@ For every feature that involves async initialization (model loading, dependency 
 - Ensure the UI never shows "ready" or "idle" while initialization is still in progress
 - Handle initialization failures gracefully (show error with actionable guidance, not a cryptic crash)
 - Test the initialization sequence explicitly: verify the state transitions (idle → preparing → ready, and idle → preparing → error)
+
+**Exhaustive screen enumeration (MANDATORY for UI loading-state tasks):** When writing a task like "add loading states to all async screens," the task description MUST enumerate every screen by name that needs the loading state. Do NOT write "all screens" or "all async operations" without listing them — implementing agents will miss screens they don't think of. Audit the full screen inventory from `UI_FLOW.md` or the navigation graph, identify which ones perform async operations (data fetching, network calls, file I/O), and list each one explicitly in the task description. If a screen does NOT need a loading state (e.g., it only shows static content), note that too — so the implementing agent doesn't waste time on it and the reviewer can verify completeness.
 
 ### Pre-PR gate (foundational phase)
 Load `reference/pre-pr.md` before writing this task. Every project (except poc preset) MUST include a `make pre-pr` (or equivalent) target that runs all quality gates in a single command: build all stacks → test all suites → lint → security scan → non-vacuous assertion → E2E (if applicable) → CI workflow check (if modified). This target is the repeatable action that developers and agents run before every future PR — not just during initial implementation.

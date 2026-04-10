@@ -100,10 +100,66 @@ When one build system produces an artifact consumed by another (gomobile AAR con
 3. If `CLAUDE.md` lists explicit build/test commands, those take precedence over auto-discovered defaults for that build system
 4. Run ALL discovered build commands — a project with `go.mod` at root and `build.gradle.kts` in `android/` must build BOTH
 5. A phase passes validation only if ALL build systems pass. One failing build system = phase FAIL.
+6. **Unable to run a discovered build system = FAIL, not skip.** If a build manifest is discovered (e.g., `build.gradle.kts`) but its toolchain is unavailable (Android SDK missing, emulator won't boot, JDK not found), the validation is FAIL. The fix task must make the toolchain available — add it to `flake.nix`, configure the SDK, boot the emulator. A validation that tests only Go when the phase modified Kotlin is incomplete and MUST be recorded as FAIL.
 
 **Why this matters:** In multi-language projects (Go+Kotlin, Rust+TypeScript, Python+C++), agents routinely validate only the primary language's build. The secondary language's build fails silently, and the agent declares the phase "done." This rule makes secondary builds structurally un-skippable.
-4. **If validation passes** (all steps clean, zero security findings) → the agent writes `specs/<feature>/validate/phase3/1.md` with `PASS`. The runner marks the phase as validated and allows downstream phases to start.
-5. **If validation fails** (test failure, lint error, OR security finding) → the agent writes `specs/<feature>/validate/phase3/1.md` with `FAIL` including a **failure categories** summary (Build: PASS/FAIL, Test: PASS/FAIL, Lint: PASS/FAIL, Security: PASS/FAIL) plus per-step details (command, exit code, root cause summary, individual failures with file/line). This structured record lets the fix agent immediately see which steps failed without parsing raw output.
+
+#### Validation coverage proof (MANDATORY in every validation record)
+
+Every validation record — PASS or FAIL — MUST include a **coverage proof** section. This is a positive requirement: the validator must show what it tested, not just report results. A validation record without this section is invalid.
+
+**How to produce the coverage proof:**
+
+1. **Diff the phase's changed files** — run `git diff <base>...HEAD --name-only` to get every file modified in this phase.
+2. **Map changed files to build systems** — for each changed file, identify which build system owns it by file extension and directory:
+   - `.go` files → Go (`go test`)
+   - `.kt`, `.java` files under `android/` → Android/Gradle (`./gradlew testDebugUnitTest` + `./gradlew connectedDebugAndroidTest`)
+   - `.ts`, `.tsx`, `.js` files → Node/npm (`npm test`)
+   - `.py` files → Python (`pytest`)
+   - `.rs` files → Rust (`cargo test`)
+   - `.nix` files → Nix (`nix flake check`)
+   - `.yml` files under `.github/workflows/` → CI (reproduce commands locally)
+   - Config/docs only (`.md`, `.yml` not in workflows, `.toml`, `.json`, `Makefile`) → no executable tests needed
+3. **For each build system that has changed source files**: record whether tests were run and how many passed/failed. If tests were NOT run, the validation is FAIL — explain why and what needs to be fixed.
+4. **Write the coverage proof** in the validation record:
+
+```
+## Coverage proof
+**Files changed**: N files
+**Build systems modified**:
+- Go: 12 files changed → `go test ./...` → 45 passed, 0 failed
+- Android/Kotlin: 8 files changed → `./gradlew testDebugUnitTest` → 23 passed, 0 failed; `./gradlew connectedDebugAndroidTest` → 5 passed, 0 failed
+- Nix: 1 file changed → `nix flake check` → all checks passed
+
+**Unvalidated build systems**: None
+```
+
+If any build system has changed source files but could not be tested:
+```
+**Unvalidated build systems**:
+- Android/Kotlin: 8 files changed, CANNOT VALIDATE — Android SDK not available. This is a FAIL.
+```
+
+A validation with any entry in "Unvalidated build systems" is automatically FAIL. There is no exception. The fix task must resolve the environment issue so the build system can be tested.
+
+**Non-vacuous test results (MANDATORY):** For each build system tested, the test count must be greater than zero. A test run that reports 0 passed, 0 failed, 0 skipped is not validation — it means the test runner found nothing to run (wrong directory, missing test files, broken test discovery). Zero test results from a build system with changed source files = FAIL.
+
+**Stub detection (MANDATORY for phases that implement interfaces or integrations):** If the phase's tasks include implementing an interface, integration, bridge, or binding to an external library, the validator MUST verify the implementation is real:
+- Check DI modules, factory methods, and provider functions for implementations that only set boolean flags, return hardcoded values, or contain no calls to the external library they claim to wrap.
+- Check that the external library's imports/symbols are actually used in the implementation, not just in the interface definition.
+- If a production code path returns a hardcoded value where the spec requires a dynamic/computed value (e.g., returning `"100.100.100.100"` where a real Tailscale IP is expected), that is a stub and the validation is FAIL.
+- Test code (test doubles, mocks, fakes in test directories) is exempt — stubs in test code are expected. Stubs in production code (`src/main/`, `internal/`, `pkg/`, `cmd/`) are failures.
+
+**Cross-boundary contract verification (MANDATORY for phases with [produces:] or [consumes:] tags, or any task where one system writes data another reads):** The validation agent MUST verify that producer and consumer agree on the data format at every cross-boundary seam:
+1. **Identify cross-boundary seams in the phase**: look for tasks with `[produces: IC-xxx]` / `[consumes: IC-xxx]` tags, or any code where one language/system writes data (JSON, protobuf, config file, IPC message) that another language/system reads.
+2. **For each seam, verify field name agreement**: read the producer's output format (Go struct JSON tags, Nix attrset keys, protobuf field names, API response shape) and the consumer's input format (Go struct JSON tags, Kotlin data class fields, config parser keys). Every field name must match exactly. A mismatch (e.g., Nix writes `clientCertPath` but Go reads `clientCert`) is a validation FAIL.
+3. **For serialized data (JSON, YAML, protobuf)**: if the phase modified structs/classes that are serialized, verify the serialization tags (`json:"..."`, `@SerializedName`, proto field names) match what the other side expects. Run a grep for the specific field name across both codebases if needed.
+4. **If no integration test exercises the cross-boundary path**: flag this as a coverage gap. The path must be tested — not just both sides independently.
+
+This check catches the most insidious class of bugs: code that compiles, passes unit tests on both sides, but fails at runtime because the two sides disagree on field names, nesting, or types.
+
+4. **If validation passes** (all steps clean, zero security findings, coverage proof shows all modified build systems tested with non-zero results, no production stubs detected) → the agent writes `specs/<feature>/validate/phase3/1.md` with `PASS`. The runner marks the phase as validated and allows downstream phases to start.
+5. **If validation fails** (test failure, lint error, security finding, missing coverage for a modified build system, zero test results, OR production stub detected) → the agent writes `specs/<feature>/validate/phase3/1.md` with `FAIL` including a **failure categories** summary (Build: PASS/FAIL, Test: PASS/FAIL, Lint: PASS/FAIL, Security: PASS/FAIL, Coverage: COMPLETE/INCOMPLETE) plus per-step details (command, exit code, root cause summary, individual failures with file/line). This structured record lets the fix agent immediately see which steps failed without parsing raw output.
 6. **Next runner iteration** picks up `phase3-fix1` as a normal implementation task with fresh context — reads the full failure history from `validate/phase3/` (including structured failure categories), reads `test-logs/` and `test-logs/security/`, checks prior fix attempts to avoid repeating failed approaches, diagnoses and fixes. The fix agent runs build+test+lint locally before marking complete to catch cascading issues in a single pass.
 7. After the fix agent completes, the runner spawns another validation agent. If still failing → `validate/phase3/2.md`, appends `phase3-fix2`.
 8. After 10 failed fix attempts → validation agent writes `BLOCKED.md` and the runner stops.
@@ -117,25 +173,24 @@ Agents MUST NEVER classify a build, test, lint, or security failure as "expected
 1. **Fix the code** so the command passes
 2. **Write BLOCKED.md** if the failure genuinely requires human input (missing credentials, design ambiguity, hardware)
 
-The following rationalizations are PROHIBITED:
-- "The Android/frontend/secondary-language build is still a work in progress" — if tasks.md includes tasks for that component, its build must pass
-- "This test is flaky" — fix the flake or add retry logic, don't skip it
-- "This security finding is not relevant to our use case" — suppress with an inline justification comment (see security scan rules), don't ignore it
-- "CI will catch this later" — local validation exists precisely to catch it NOW
-- "The Gradle/Cargo/npm failure is expected because we haven't implemented X yet" — if X is in the task list and the phase depends on it, the phase must not pass until X works
-- "I created a stub/mock artifact because the real build tool is broken" — if the real build tool is broken, fix the build tool (update it, patch it, find a compatible version). A stub artifact is a rationalized failure that makes the compiler happy while the app crashes at runtime. This is the worst kind of rationalization because it passes ALL static checks (build, lint, unit tests) and only fails when a human or emulator actually runs the app.
-- "JVM unit tests pass so Android is working" — `./gradlew test` runs on the host JVM without Android runtime. It cannot detect missing native libraries, broken JNI bindings, or stub artifacts. Instrumented tests on an emulator (`./gradlew connectedDebugAndroidTest`) are required.
+**Why the coverage proof catches what prohibition lists don't:** Previous versions of this skill listed prohibited rationalizations ("don't say X," "don't claim Y"). Agents read those lists and found adjacent rationalizations not on the list. The coverage proof inverts the burden: instead of prohibiting excuses, it requires positive evidence. You must show which build systems were modified, which were tested, and how many tests ran. If the numbers don't add up, it's FAIL — no rationalization can change arithmetic.
 
-**Why this rule exists:** Agents are trained to be helpful and accommodating. When faced with a failing build they can't easily fix, the path of least resistance is to explain why it's OK and move on. This is the single most common cause of broken releases — the agent rationalizes a failure, marks the phase done, and the broken build propagates to CI where it fails in front of humans. The rule is absolute: failures are fixed or blocked, never rationalized.
+Examples of failures the coverage proof catches structurally:
+- Phase modifies 8 `.kt` files, validator runs only `go test` → coverage proof shows "Android/Kotlin: 8 files changed, NOT TESTED" → FAIL
+- Validator runs `./gradlew test` but gets 0 results because `gradlew` is missing → coverage proof shows "0 passed, 0 failed" → FAIL (non-vacuous)
+- Agent creates a stub `TailscaleBackend` returning hardcoded values → stub detection finds no calls to real library → FAIL
+- Security scanners not installed, `make security-scan` exits 0 with 0 findings → if scanners are in the project's tooling and were expected to run, the 0-findings result must be explained (were scanners actually invoked or just missing?)
+
+The rule is still absolute: failures are fixed or blocked, never rationalized. But the coverage proof makes the rule enforceable by requiring evidence rather than relying on agent honesty.
 
 Key properties:
-- **Runner-enforced** — validation is triggered by the scheduler, not by agent discretion
 - **Validation is per-phase, not per-task** — avoids wasting runs on intermediate states
 - **Downstream phases are blocked** until the upstream phase passes validation
 - **Each fix gets a fresh agent** with full context budget — no degradation from prior attempts
 - **Failure history accumulates on disk** in `validate/<phase>/` — nothing is lost between runs
 - **Tests are the spec** — fix the code, not the tests (unless a test is genuinely wrong)
 - **Security scans are part of validation** — a phase with security findings doesn't pass, same as a phase with test failures
+- **Coverage proof is part of validation** — a phase with unvalidated build systems doesn't pass, same as a phase with test failures
 - **Structured test output** is the primary feedback mechanism — agents read these rather than parsing raw test runner output
 
 ### Security scan in validation
@@ -177,8 +232,15 @@ Code review runs **after every phase**, not just at the end. It's structurally e
 After all tasks in a phase pass validation, the runner spawns a **review agent** that:
 
 1. **Reviews the phase's diff** using the appropriate code-review skill (React, Node, or general — auto-detected from `package.json`)
-2. **Auto-fixes bugs** — security vulnerabilities, correctness issues, broken error handling, missing input validation, anything that would cause runtime failures or data loss. Commits each fix.
-3. **Writes a review record** to `validate/<phase>/review-N.md` with one of two outcomes:
+2. **Spec-conformance check (MANDATORY)** — for each task in the phase, the review agent reads the task description and "Done when" criteria from `tasks.md`, then verifies the implementation matches:
+   - **Exact names**: if the task says a CLI should show a "STATUS" column, verify the code uses "STATUS" — not "STATE", "SOURCE", or any synonym. Same for struct field names, JSON tags, config keys, error messages, log messages, and UI labels.
+   - **All specified steps**: if the task describes a 5-step sequence (e.g., "log initiated → stop accepting → drain → hooks → flush"), verify ALL steps are present — not just the middle three. Count them.
+   - **Mechanism, not just behavior**: if the task says "validate using struct tags + custom validation," verify BOTH mechanisms exist — not just that validation works. Functionally equivalent but structurally different is a spec violation.
+   - **Cross-boundary data contracts**: if the task involves one system writing data that another reads (e.g., Nix module writes JSON, Go daemon reads it), verify the field names and types match on BOTH sides. Read the producer's output format and the consumer's input struct — they must agree on every key name, nesting, and type.
+   - **No stubs in production code**: if the task says "implement X using library Y," verify the production code actually calls library Y — not a stub returning hardcoded values. Test doubles in test directories are fine.
+   - **UI completeness**: if the task says "add loading states to all async screens," verify EVERY screen that performs async operations has a loading indicator — not just some of them. Cross-reference the list of screens mentioned in the task or spec.
+3. **Auto-fixes bugs** — security vulnerabilities, correctness issues, broken error handling, missing input validation, spec-conformance violations found in step 2, anything that would cause runtime failures or data loss. Commits each fix.
+4. **Writes a review record** to `validate/<phase>/review-N.md` with one of two outcomes:
    - **`REVIEW-CLEAN`** — no bugs found, code is clean. Phase is complete.
    - **`REVIEW-FIXES`** — fixes were applied. Runner spawns a validation agent to re-run tests.
 
