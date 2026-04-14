@@ -102,7 +102,10 @@ stateDiagram-v2
     Pending --> Skipped : parsed as [~]
     Pending --> Blocked : parsed as [?]
 
-    Running --> Complete : agent exits 0, no DEFER file
+    Running --> Claimed : agent exits 0, completion claim file exists
+    Running --> Complete : agent exits 0 + runner verification passes (legacy: agent marked [x] directly)
+    Claimed --> Complete : runner verification passes
+    Claimed --> Pending : runner verification fails (rejection file written)
     Running --> Deferred : agent exits 0, DEFER file exists
     Running --> RateLimited : stderr/log has rate limit signal
     Running --> AuthError : log has 401/auth error
@@ -236,10 +239,13 @@ stateDiagram-v2
     TestAndLintFailed --> TasksIncomplete : fix task appended (categorized FAIL record with both)
     LintFailed --> TasksIncomplete : fix task appended (categorized FAIL record)
     SecurityFailed --> TasksIncomplete : fix task appended (categorized FAIL record)
-    AllPassed_ReviewClean --> PhaseComplete : REVIEW-CLEAN written
+    AllPassed_ReviewClean --> RunnerVerify : REVIEW-CLEAN written
     AllPassed_ReviewFixes --> NeedsVR : needs re-validation of fixes (cycle N+1)
 
-    NeedsVR --> PhaseComplete : cycle > MAX_REVIEW_CYCLES (2)
+    RunnerVerify --> PhaseComplete : runner independently re-runs test commands, all exit 0
+    RunnerVerify --> TasksIncomplete : runner test commands fail (fix task appended)
+
+    NeedsVR --> RunnerVerify : cycle > MAX_REVIEW_CYCLES (2)
 
     PhaseComplete --> [*] : downstream phases unblocked
 ```

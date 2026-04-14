@@ -45,8 +45,9 @@ The runner parses `tasks.md` for phases, `[P]` markers, and the Phase Dependenci
 2. Each agent gets a fresh `claude` process with a prompt targeting its specific task (full context budget, no degradation)
 3. The agent reads the task list, learnings, and only the reference files relevant to its task
 4. Executes ONE task, following TDD
-5. Self-reviews, records learnings, marks complete, commits
-6. The runner re-parses `tasks.md` after each agent finishes to pick up changes and schedule the next wave
+5. Self-reviews, records learnings, writes a **completion claim** (`claims/completion-{task_id}.json`), commits
+6. The runner reads the claim, **verifies evidence deterministically** (re-runs commands, checks files exist, validates MCP screenshots for E2E tasks), and marks `[x]` only if verification passes. If verification fails, the task stays `[ ]` and a rejection file is written.
+7. The runner re-parses `tasks.md` after each agent finishes to pick up changes and schedule the next wave
 7. **When all tasks in a phase are complete**, the runner automatically spawns a dedicated **validation agent** (see below)
 
 ### Fix-validate loop
