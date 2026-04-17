@@ -2615,6 +2615,67 @@ def check_connection_error(log_path: Path) -> Optional[str]:
         return None
 
 
+def _find_prior_hang_diagnoses(log_dir: Path, task_id_prefix: str,
+                               *, limit: int = 2) -> list[Path]:
+    """Return up to `limit` most-recent hang.md files for a task id prefix.
+
+    Files are named `agent-<id>-<task>-<ts>.hang.md`. We glob by the task prefix
+    (e.g. 'VR-phase12-flutter-customer-app') so every retry for the same phase
+    picks up diagnoses from earlier agents in this session or previous ones.
+    Newest-first by filename (the timestamp sorts lexicographically).
+    """
+    if not log_dir.exists():
+        return []
+    # Glob pattern intentionally broad — agent-id may differ across runs.
+    # Normalize trailing dashes so callers can pass either 'VR-phase12-' or
+    # 'VR-phase12' without changing the match.
+    prefix = task_id_prefix.rstrip("-")
+    matches = sorted(log_dir.glob(f"agent-*-{prefix}-*.hang.md"))
+    return matches[-limit:] if matches else []
+
+
+def _format_hang_diagnoses_for_prompt(diag_files: list[Path]) -> str:
+    """Read diagnosis files and return a prompt-ready section.
+
+    Empty string when no files. Each file is truncated to ~3000 chars so the
+    prompt doesn't balloon when many retries accumulate.
+    """
+    if not diag_files:
+        return ""
+    chunks = []
+    for p in diag_files:
+        try:
+            text = p.read_text()
+        except OSError:
+            continue
+        if len(text) > 3000:
+            text = text[:3000] + "\n... (truncated)\n"
+        chunks.append(f"### {p.name}\n\n{text}")
+    if not chunks:
+        return ""
+    body = "\n\n".join(chunks)
+    return (
+        "## PRIOR HANG DIAGNOSES — READ BEFORE RUNNING ANYTHING\n\n"
+        "One or more previous attempts on this task hung and were killed by "
+        "the watchdog. The diagnoses below record the exact command that "
+        "deadlocked and its process state at kill time. **Do not repeat that "
+        "invocation.** If a whole-suite test command hung, run test files "
+        "individually with a per-file `timeout` wrapper. If the hang was in a "
+        "bwrap/fontconfig workaround, that workaround is not the root cause "
+        "— stop iterating on it.\n\n"
+        f"{body}\n\n"
+        "---\n\n"
+    )
+
+
+def _count_prior_hangs(log_dir: Path, task_id_prefix: str) -> int:
+    """Count how many hang.md files already exist for this task prefix."""
+    if not log_dir.exists():
+        return 0
+    prefix = task_id_prefix.rstrip("-")
+    return len(list(log_dir.glob(f"agent-*-{prefix}-*.hang.md")))
+
+
 def _task_idle_budget_s(task) -> int:
     """Return the idle-log timeout for this agent in seconds.
 
@@ -5727,6 +5788,10 @@ class Runner:
             # Single combined agent: runs tests, then reviews diff if tests
             # pass.  Replaces the old 3-section validate/review/revalidate.
             MAX_REVIEW_CYCLES = 2
+            # Stop respawning VR agents after this many consecutive watchdog
+            # kills on the same phase. The deadlock is external to the agent
+            # (toolchain bug, infinite-loop test); further retries waste tokens.
+            MAX_VR_HANGS = 3
             for phase in scheduler.phases_needing_validate_review():
                 if phase.slug in vr_phases:
                     continue  # already has an agent running
@@ -5749,10 +5814,50 @@ class Runner:
                     )
                     continue
 
+                # Stopgap: if this phase has hung and been killed >= MAX_VR_HANGS
+                # times, stop respawning. The deadlock is unfixable from inside
+                # the agent (likely a toolchain bug) and further retries just
+                # burn tokens.
+                vr_task_prefix = f"VR-{phase.slug}-"
+                prior_hangs = _count_prior_hangs(self.log_dir, vr_task_prefix)
+                if prior_hangs >= MAX_VR_HANGS:
+                    fail_file = phase_vdir / f"{cycle}.md"
+                    if not fail_file.exists():
+                        fail_file.write_text(
+                            f"# Phase {phase.slug} — Validation #{cycle}: FAIL (HANG CAP)\n\n"
+                            f"**Date**: {datetime.now().isoformat()}\n"
+                            f"**Assessment**: {prior_hangs} prior VR agents for this "
+                            f"phase were killed by the watchdog for deadlocked "
+                            f"background tasks. Not spawning further VR agents. "
+                            f"Review `logs/agent-*-{vr_task_prefix}*.hang.md` to "
+                            f"identify the hanging command and fix the underlying "
+                            f"test/toolchain issue before re-running the runner.\n"
+                        )
+                    self.log(
+                        f"VR hang cap ({MAX_VR_HANGS}) reached for {phase.name} — "
+                        f"not spawning (see {fail_file})"
+                    )
+                    continue
+
                 prompt = build_validate_review_prompt(
                     spec_dir, str(task_file), phase, str(learnings_file),
                     str(self.skills_dir), review_cycle=cycle
                 )
+
+                # Prepend prior hang diagnoses so this retry knows exactly what
+                # not to run. The VR prompt body also tells agents to check
+                # logs/*.hang.md, but an explicit prepend is load-bearing — the
+                # file-read instruction alone is unreliable.
+                diag_files = _find_prior_hang_diagnoses(
+                    self.log_dir, vr_task_prefix, limit=2
+                )
+                diag_section = _format_hang_diagnoses_for_prompt(diag_files)
+                if diag_section:
+                    prompt = diag_section + prompt
+                    self.log(
+                        f"VR cycle {cycle} for {phase.name}: prepending "
+                        f"{len(diag_files)} prior hang diagnosis file(s)"
+                    )
 
                 vr_task_id = f"VR-{phase.slug}-{cycle}"
                 vr_task = Task(
