@@ -112,7 +112,36 @@ Skip this section for stateless request/response services, pure-function librari
 - **Custom reporter** — For structured test output (required by fix-validate loop)
 - **Test tiers** — Unit, integration (per-boundary), user-flow integration (end-to-end chain), contract (cross-boundary format verification) — what goes where. **Contract tests are MANDATORY for multi-language/multi-system projects**: any seam where one language writes data another reads (Go→JSON→Kotlin, Nix→config→Go, API→JSON→frontend) MUST have a test that serializes on the producer side, deserializes on the consumer side, and asserts every field round-trips. These tests catch JSON tag mismatches, protobuf field renames, and serialization format drift that unit tests on each side independently will miss.
 - **User-flow test plan** — For each primary user flow in the spec, identify: the chain of boundaries crossed, the injectable seams for deterministic input (fixture files, pre-cached resources, test data), and the observable output to verify. See `reference/testing.md` § "User-flow integration tests". This plan ensures implementing agents know WHAT flows to test and HOW to make them deterministic.
-- **Real-runtime E2E strategy** — If the project targets a platform runtime (Android, iOS, web/PWA, desktop), load `reference/e2e-runtime.md` and decide: which runtimes to test on (emulator, simulator, headless browser), side-by-side vs nested architecture for multi-runtime tests, test bypass mechanisms for hardware features (camera, biometrics, NFC), UI automation framework (UI Automator, Playwright, XCUITest), and CI infrastructure (KVM, Xvfb, runner requirements). Present each decision to the user.
+- **Real-runtime E2E strategy** — If the project targets a platform runtime (Android, iOS, web/PWA, desktop), load `reference/e2e-runtime.md` AND `reference/mcp-e2e.md` and decide: which runtimes to test on (emulator, simulator, headless browser), side-by-side vs nested architecture for multi-runtime tests, test bypass mechanisms for hardware features (camera, biometrics, NFC), UI automation framework (UI Automator, Playwright, XCUITest), and CI infrastructure (KVM, Xvfb, runner requirements). Present each decision to the user.
+
+  **Also decide (MCP-specific, MANDATORY when any platform runtime is in scope):**
+  - **MCP server selection** — for each target platform: `mcp-android`, `mcp-ios`, `mcp-browser` from `nix-mcp-debugkit`, or explicitly deferred with a reason
+  - **Flake pinning** — `nix-mcp-debugkit` as flake input, `packages.mcp-<platform>` re-exported, `packages.mcp-<platform>-config` config writer producing a Nix-store-pinned `mcp/<platform>.json`
+  - **Permission allowlist** — concrete list of `Bash(...)` entries for `.claude/settings.json` covering `nix run .#mcp-*`, platform CLIs (`adb`, `xcrun simctl`), screencap, logcat, install/launch commands
+  - **Prereq checks** — KVM (Android), Xcode (iOS), display server (desktop) — scripted with fail-fast errors
+  - **`test/e2e/setup.sh` / `teardown.sh` inventory** — list every backend service the app needs for end-to-end operation (DB, auth, API, websockets, third-party stubs) so the script can be scoped correctly at task time
+  - **App build + install contract** — command the runner will invoke to rebuild+install the app between fix iterations (e.g., `flutter build apk --debug && adb install -r <path>`)
+  - **Scripted regression harness** — Playwright for web, Patrol for Flutter, XCUITest for iOS, UI Automator for Android native — complementary to MCP exploration, not a replacement
+
+  Record each decision in the plan with the owning task ID. These will be cross-checked against the mandatory checklist in `phases/tasks.md` during task generation.
+
+- **E2E scenario coverage pre-registration** — Before moving on, enumerate candidate E2E scenarios against this checklist. Each row either becomes a task in Phase 6 or gets an explicit "out of scope because X" line. **Do not skip categories silently.**
+
+  1. Happy path per user role (admin, customer, contributor, guest, etc.)
+  2. Every state machine (order, fulfillment, shipment, dispute, ticket, payment, inventory reservation, etc.) — walked start → all terminals
+  3. Every external adapter in BOTH stub and live-test modes (payments, tax, shipping, auth, email, push)
+  4. Every webhook — success, duplicate, out-of-order, bad-signature
+  5. Every edge case enumerated in the spec (`FR-E*` or `## Edge Cases`)
+  6. Every cross-app real-time propagation (admin action → other client sees within SLA)
+  7. Every guest → authenticated linking flow
+  8. Every refund / cancellation / reversal — full, partial, over-limit, audit-log presence
+  9. Every notification delivery path — trigger → channel → sink verified
+  10. Every rate/race (concurrent last-unit claim, duplicate submission, expiry race)
+  11. Security boundary sweep (auth, permission, injection, XSS, webhook tampering)
+  12. Upload / file-picker flows
+  13. Cross-platform parity (web vs native) when a flow exists in >1 client
+
+  This pre-registration exists because comprehensive E2E scope is routinely under-scoped at plan time and discovered too late. Making it a plan-phase artifact gives the tasks-phase gap-analysis checklist something concrete to verify against.
 - **Pre-PR gate** — Load `reference/pre-pr.md`. Every project (except poc) gets a `make pre-pr` target. Decide which checks to include based on the preset: build + test + lint + security (minimum), plus E2E, CI workflow validation, and contract tests (when applicable). Present the gate composition to the user.
 - **Test plan matrix** — Map every SC-xxx to a specific test shape. This bridges the gap between success criteria (what to verify) and implementation (how to verify it). For each SC:
 

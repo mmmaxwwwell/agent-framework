@@ -230,6 +230,26 @@ The regression agent:
 
 The task is only marked done after the regression check completes.
 
+### Regression test quality
+
+When task descriptions say "write a regression test for each bug fixed," agents tend to produce **shallow render tests** — they mock the ViewModel with a pre-set state and assert that a specific string appears on screen. These tests verify that Compose can render text, not that the app behaves correctly. They are brittle (break on any string change) and miss the actual bugs they're supposed to guard against.
+
+**Regression tests MUST be behavioral, not visual.** A behavioral test exercises a state transition, validates a data flow, or verifies an observable side effect. A render test just checks if text appears.
+
+| Bad (render test) | Good (behavioral test) |
+|---|---|
+| Mock ViewModel with `showWarning=true`, assert "Security Warning" text displayed | Call `viewModel.setPolicy(AUTO_APPROVE)` → assert warning flag true + policy unchanged. Call `confirmAutoApprove()` → assert warning flag false + policy changed. |
+| Mock state with `error="Invalid format"`, assert error text displayed | Call `isValidAuthKeyFormat("")` → false. Call `isValidAuthKeyFormat("tskey-auth-abc")` → true. |
+| Mock ViewModel with `isUnlocked=true`, assert "Lock Key" button exists | Create real `KeyUnlockManager`, call `unlock(key)` → assert `isUnlocked(fingerprint)` true. Call `lock(fingerprint)` → assert false. |
+| Pre-set clipboard content, assert text matches | Click "Copy" button on real screen, then read system clipboard and assert content matches public key string. |
+
+**Rules for regression test task descriptions:**
+
+1. **"Done when" must specify the state transition to test**, not the text to assert. "Done when: setting policy to AUTO_APPROVE triggers warning, dismissing preserves original policy, confirming changes policy" — not "Done when: dialog shows 'Security Warning' text."
+2. **Prefer testing with real objects over mocks.** If `KeyUnlockManager` is a simple in-memory class, instantiate it. If `KeyManager` needs Android context, use `InstrumentationRegistry`. Only mock things that have complex external dependencies (network, biometrics).
+3. **Test the ViewModel/Manager layer, not the Compose layer.** ViewModel state transitions are the behavioral contract. Compose rendering is a presentation detail that changes frequently.
+4. **A render test is only justified for exact text that is a security/compliance contract** — e.g., the exact wording of a security warning that legal reviewed. Even then, pair it with a behavioral test of the underlying state machine.
+
 ### Explore agent
 
 The explore agent has MCP tools and reads:

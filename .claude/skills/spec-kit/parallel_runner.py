@@ -1459,8 +1459,8 @@ Append any useful discoveries to `{learnings_file}`. Keep entries concise — ma
   "mcp_interactions": 0
 }}}}
 ```
-3. Do NOT change task checkboxes in `{task_file}` — the runner verifies your claim and marks completion.
-4. Commit all changes (including the claim file) with a conventional commit message including the task ID (e.g., `feat({task.id}): ...`)
+3. Mark this task complete in `{task_file}`: change `- [ ] {task.id}` to `- [x] {task.id}`. This is mandatory.
+4. Commit all changes (including the claim file and updated task list) with a conventional commit message including the task ID (e.g., `feat({task.id}): ...`)
 
 """
 
@@ -1550,10 +1550,86 @@ Use this information to proceed with the task. Do NOT write BLOCKED.md again for
 - Prefer minimal changes that satisfy the task description
 - If a task is unnecessary (already done, obsolete), mark it `- [~]` with a reason and move to the next task
 - ALWAYS update `{learnings_file}` if you discovered anything non-obvious (max 3 concise bullets per task)
-- NEVER mark a task `[x]` in tasks.md — write a completion claim JSON file instead. The runner verifies your claim and marks completion. If you edit the checkbox directly, the runner will revert it.
+- When your task is complete, mark it `[x]` in tasks.md by changing `- [ ]` to `- [x]`. This is mandatory — if you don't mark it, the runner will re-spawn you.
 - NEVER write a completion claim if any required command from the task description did not exit 0. If a command fails and you cannot fix it, write BLOCKED.md — do not claim a "Partial" result
 """
     return prompt
+
+
+def build_vr_fix_prompt(spec_dir: str, task_file: str, learnings_file: str,
+                        phase: Phase, failure_file: Path) -> str:
+    """Build a prompt for a fix agent dispatched after a phase VR failure.
+
+    The fix agent reads the VR failure report, diagnoses the root cause,
+    and fixes the code. The runner then re-runs VR automatically.
+    """
+    phase_slug = phase.slug
+    task_ids = ", ".join(t.id for t in phase.tasks)
+    validate_dir = f"{spec_dir}/validate/{phase_slug}"
+
+    # Read the failure report
+    try:
+        failure_text = failure_file.read_text()
+    except OSError:
+        failure_text = "(could not read failure report)"
+
+    # Collect all prior failure files for context
+    prior_failures = []
+    vdir = Path(validate_dir)
+    if vdir.exists():
+        for f in sorted(vdir.glob("*.md")):
+            if not f.name.startswith("review-"):
+                try:
+                    header = f.read_text().splitlines()[0] if f.stat().st_size > 0 else ""
+                    prior_failures.append(f"{f.name}: {header}")
+                except OSError:
+                    pass
+
+    prior_section = ""
+    if len(prior_failures) > 1:
+        prior_section = "## Prior validation attempts\n" + "\n".join(f"- {p}" for p in prior_failures) + "\n"
+
+    nix_note = ""
+    if (Path.cwd() / "flake.nix").exists():
+        nix_note = (
+            "\n**Environment**: This project uses Nix (`flake.nix`). Your PATH "
+            "already includes all tools from the nix devshell — run commands "
+            "directly. Do NOT prefix commands with `nix develop --command`.\n"
+        )
+
+    return f"""You are a fix agent for phase **{phase.name}** ({phase_slug}). A validation agent
+ran tests/linting and found failures. Your job is to fix them.
+{nix_note}
+## Context
+
+- **Phase**: {phase.name} ({phase_slug})
+- **Tasks in this phase**: {task_ids}
+- **Task file**: `{task_file}`
+- **Learnings file**: `{learnings_file}`
+- **Validation directory**: `{validate_dir}/`
+
+{prior_section}
+## Latest validation failure
+
+{failure_text}
+
+## Instructions
+
+1. Read the failure report above carefully. Identify every distinct failure.
+2. Read the relevant source files to understand the root cause of each failure.
+3. Read `{task_file}` to understand what each task in this phase was supposed to do.
+4. Read `{learnings_file}` for any prior context or gotchas.
+5. Fix each failure with minimal, targeted changes. Do not refactor unrelated code.
+6. After fixing, run the same commands that failed to verify your fixes work:
+   - If tests failed, re-run the test command
+   - If lint failed, re-run the lint command
+   - If build failed, re-run the build command
+7. Update `{learnings_file}` with any new discoveries relevant to future phases.
+8. Commit your fixes with a descriptive commit message.
+
+**Do NOT modify the task list** — the runner manages task status.
+**Do NOT write validation files** — the runner will re-run VR after you finish.
+"""
 
 
 def build_validate_review_prompt(spec_dir: str, task_file: str, phase: Phase,
@@ -1751,6 +1827,13 @@ Run these steps **in order**, stopping at the first failure category. Do NOT ski
 
 **Code coverage is mandatory for every test suite in the project.** If the project's test commands do not already collect coverage, fix them — add the standard coverage tool for that language/framework (every mainstream ecosystem has one) and wire it into the test command. Coverage MUST produce both terminal output and a file report in `coverage/` (JSON, XML, LCOV, or equivalent). See `reference/testing.md` § Code coverage collection for details.
 
+**Detect hung tests — don't wait forever on a deadlocked test runner.** Whole-suite test invocations sometimes deadlock on a single bad test file (unawaited futures in `setUp`, platform-channel calls without mocks, coverage-collector deadlocks). Use these rules:
+
+1. When a test suite has more than ~4 test files, **run them individually in sequence** rather than as one `<runner> test` invocation. Example (Flutter): `for f in test/*.dart; do flutter test --coverage "$f" > "logs/$(basename $f).log" 2>&1 || echo "FAIL: $f"; done`. Individual runs fail fast and isolate hanging files.
+2. When you must run the whole suite in background, wrap the runner in `timeout`: `timeout 600 flutter test --coverage 2>&1`. Never use `TaskOutput` with a 600s timeout on an unbounded test process — the outer runner has its own watchdog and will kill you if your background task stops making progress.
+3. If a prior attempt wrote `agent-<id>-<task>-*.hang.md` in `logs/`, read it first — it identifies exactly which command hung on the previous run. Don't repeat the same invocation.
+4. If any single test file hangs (no output for 60 seconds), it's a bug in that test. Record it in the FAIL output with file path and append a fix task — don't keep retrying the whole suite.
+
 **Fix missing tools before reporting failure.** If a build/test command fails because a tool is not installed (e.g. `eslint: command not found`, `tsc: not found`, missing npm packages), YOU MUST install it — do not skip it or call it a "pre-existing issue":
 - Missing npm package (referenced in scripts but not in devDependencies) → `npm install --save-dev <package> --ignore-scripts` to add it, then `npm rebuild <pkg>` only if native compilation needed
 - Already in devDependencies but not installed → `npm install --ignore-scripts`
@@ -1828,9 +1911,8 @@ For each cross-boundary seam (e.g., Nix module writes JSON that Go reads, Go ser
    (relevant portions of stdout/stderr, organized by step)
    ```
    Fill in PASS/FAIL/SKIPPED for every category based on what you ran. Include Coverage: INCOMPLETE if any modified build system was not tested. This lets fix agents immediately see which steps failed without parsing raw output.
-2. If {attempt_num} < 10: append a fix task to `{task_file}` at the end of phase "{phase.name}":
-   `- [ ] {phase_slug}-fix{attempt_num} Fix phase validation failure: read {validate_dir}/ for failure history`
-3. If {attempt_num} >= 10: write `BLOCKED.md` with the full failure history
+2. **Do NOT modify `{task_file}`** — the runner dispatches fix agents automatically.
+3. If {attempt_num} >= 10: write `BLOCKED.md` with the full failure history.
 4. **Do NOT proceed to Part 2.** Exit now.
 
 ### If tests PASS — write PASS record, then continue to Part 2
@@ -2012,7 +2094,7 @@ def _build_sandbox_cmd(project_dir: Path, inner_cmd: list[str]) -> list[str]:
       - /etc/hosts          (ro)  — localhost resolution (needed by test servers)
       - /etc/ssl/certs      (ro)  — TLS certificate bundle
       - /etc/static         (ro)  — NixOS resolv.conf / hosts symlink targets
-      - ANTHROPIC_API_KEY   (env) — sole credential, passed as env var
+      - Credentials         (env) — CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY
 
     Nothing else is mounted: no home dir, no ~/.claude/, no ~/.ssh/,
     no cloud credentials, no global bin dirs outside /nix/store.
@@ -2109,14 +2191,21 @@ def _build_sandbox_cmd(project_dir: Path, inner_cmd: list[str]) -> list[str]:
     if emu_auth.is_file():
         cmd += ["--ro-bind", str(emu_auth), str(emu_auth)]
 
-    # Claude CLI auth: mount ONLY .credentials.json (read-only).
-    # The CLI needs this for its OAuth flow (token refresh, proper headers).
-    # Nothing else from ~/.claude/ is exposed.
-    claude_creds = home / ".claude" / ".credentials.json"
-    if claude_creds.is_file():
-        claude_dir = home / ".claude"
-        cmd += ["--dir", str(claude_dir)]
-        cmd += ["--ro-bind", str(claude_creds), str(claude_creds)]
+    # Claude CLI auth: if a long-lived token exists in ~/.claude/token or
+    # CLAUDE_CODE_OAUTH_TOKEN env, it's passed via env var in _build_sandbox_env()
+    # and no credentials file mount is needed.  Otherwise fall back to mounting
+    # .credentials.json (read-only) for the short-lived OAuth flow.
+    token_file = home / ".claude" / "token"
+    has_long_lived_token = (
+        os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+        or (token_file.is_file() and token_file.read_text().strip())
+    )
+    if not has_long_lived_token:
+        claude_creds = home / ".claude" / ".credentials.json"
+        if claude_creds.is_file():
+            claude_dir = home / ".claude"
+            cmd += ["--dir", str(claude_dir)]
+            cmd += ["--ro-bind", str(claude_creds), str(claude_creds)]
 
     # Claude CLI auth: credentials are passed via env vars set in the
     # subprocess environment (Popen env=), NOT via bwrap --setenv, to
@@ -2157,10 +2246,18 @@ def _build_sandbox_env(capabilities: set[str] | None = None) -> dict[str, str]:
         "PATH": os.environ.get("PATH", "/run/current-system/sw/bin:/usr/bin:/bin"),
     }
 
-    # Auth: the CLI needs ~/.claude/.credentials.json for its full OAuth
-    # flow (token refresh, proper headers).  Passing the token as an env
-    # var doesn't work — the API rejects bare OAuth tokens.
-    # The credentials file is mounted read-only by _build_sandbox_cmd().
+    # Auth: prefer a long-lived OAuth token from ~/.claude/token (generated
+    # by `claude setup-token`).  This avoids the short-lived credentials.json
+    # token that expires mid-run inside sandboxes that can't refresh it.
+    token_file = home / ".claude" / "token"
+    claude_oauth = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+    if not claude_oauth and token_file.is_file():
+        try:
+            claude_oauth = token_file.read_text().strip()
+        except OSError:
+            pass
+    if claude_oauth:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = claude_oauth
 
     # API key fallback (alternative auth path).
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -2276,16 +2373,27 @@ def spawn_agent(task: Task, prompt: str, log_path: Path,
         env = dict(os.environ)
         env.pop("CLAUDECODE", None)
         env.pop("CLAUDE_CODE_ENTRYPOINT", None)
-        # Also inject auth token for non-sandbox mode.
-        claude_creds = Path.home() / ".claude" / ".credentials.json"
-        if claude_creds.is_file():
+        # Auth: prefer long-lived token from ~/.claude/token, fall back
+        # to short-lived credentials.json access token.
+        token_file = Path.home() / ".claude" / "token"
+        claude_oauth = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+        if not claude_oauth and token_file.is_file():
             try:
-                creds = json.loads(claude_creds.read_text())
-                tok = creds.get("claudeAiOauth", {}).get("accessToken", "")
-                if tok and "ANTHROPIC_AUTH_TOKEN" not in env:
-                    env["ANTHROPIC_AUTH_TOKEN"] = tok
-            except (json.JSONDecodeError, OSError):
+                claude_oauth = token_file.read_text().strip()
+            except OSError:
                 pass
+        if claude_oauth:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = claude_oauth
+        else:
+            claude_creds = Path.home() / ".claude" / ".credentials.json"
+            if claude_creds.is_file():
+                try:
+                    creds = json.loads(claude_creds.read_text())
+                    tok = creds.get("claudeAiOauth", {}).get("accessToken", "")
+                    if tok and "ANTHROPIC_AUTH_TOKEN" not in env:
+                        env["ANTHROPIC_AUTH_TOKEN"] = tok
+                except (json.JSONDecodeError, OSError):
+                    pass
         # Inject GH_TOKEN for non-sandboxed mode too (capability-gated).
         if "gh" in all_caps and "GH_TOKEN" not in env:
             token = _acquire_gh_token()
@@ -2507,6 +2615,208 @@ def check_connection_error(log_path: Path) -> Optional[str]:
         return None
 
 
+def _task_idle_budget_s(task) -> int:
+    """Return the idle-log timeout for this agent in seconds.
+
+    Long-running task categories get a larger budget because the inner agent
+    legitimately waits on tool results (e.g. `flutter test`, `nix flake check`)
+    without emitting stream-json events for many minutes.
+    """
+    tid = getattr(task, "id", "") or ""
+    # VR / validation agents block on full build+test suites
+    if tid.startswith("VR-"):
+        return 30 * 60
+    # E2E loops drive long MCP browser/simulator sessions
+    if tid.startswith("e2e-") or tid.startswith("E2E-"):
+        return 45 * 60
+    return AGENT_IDLE_TIMEOUT_S
+
+
+def _read_last_bash_bg_task(log_path: Path) -> Optional[dict]:
+    """Find the most recent `run_in_background=true` Bash tool_use in the log.
+
+    Returns a dict with `tool_use_id`, `command`, `started_at` (ts of the line),
+    or None if no such call exists. The started_at is derived from the file's
+    structure — we just use the line's position as a proxy since stream-json
+    doesn't timestamp individual messages reliably.
+    """
+    try:
+        content = log_path.read_text()
+    except OSError:
+        return None
+    last: Optional[dict] = None
+    for raw in content.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if msg.get("type") != "assistant":
+            continue
+        for block in msg.get("message", {}).get("content", []) or []:
+            if (isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("name") == "Bash"
+                    and block.get("input", {}).get("run_in_background")):
+                last = {
+                    "tool_use_id": block.get("id"),
+                    "command": block.get("input", {}).get("command", ""),
+                    "description": block.get("input", {}).get("description", ""),
+                }
+    return last
+
+
+def _find_bg_bash_pids(agent_pid: int, command_snippet: str) -> list[int]:
+    """Find pids of the background bash descendant matching the command.
+
+    Walks `ps --ppid` transitively from agent_pid. The command_snippet is a
+    short prefix of the Bash `command` field; we grep each child's cmdline for
+    it. Returns all matching pids (including children of the matched bash, so
+    callers can measure cumulative CPU activity).
+    """
+    if agent_pid <= 0 or not command_snippet:
+        return []
+    try:
+        # BFS over descendants via `pgrep -P` repeatedly (portable enough).
+        all_desc: list[int] = []
+        frontier = [agent_pid]
+        seen = {agent_pid}
+        while frontier:
+            next_frontier = []
+            for ppid in frontier:
+                r = subprocess.run(
+                    ["pgrep", "-P", str(ppid)],
+                    capture_output=True, text=True, timeout=5,
+                )
+                for ln in r.stdout.splitlines():
+                    try:
+                        cpid = int(ln.strip())
+                    except ValueError:
+                        continue
+                    if cpid in seen:
+                        continue
+                    seen.add(cpid)
+                    all_desc.append(cpid)
+                    next_frontier.append(cpid)
+            frontier = next_frontier
+    except (subprocess.SubprocessError, OSError):
+        return []
+    # Filter to processes whose cmdline contains a distinctive fragment of the
+    # background command. Use up to the first 40 chars after skipping common
+    # prefixes (bash -c, bwrap flags). Cheap substring match is sufficient.
+    probe = command_snippet.strip()[:40]
+    matched: list[int] = []
+    if not probe:
+        return []
+    for cpid in all_desc:
+        try:
+            with open(f"/proc/{cpid}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\0", b" ").decode("utf-8", "ignore")
+            if probe in cmd:
+                matched.append(cpid)
+                # Include the matched bash's entire subtree — that's where the
+                # actual work (flutter_tester etc.) runs.
+                try:
+                    r2 = subprocess.run(
+                        ["pgrep", "-P", str(cpid)],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    for ln in r2.stdout.splitlines():
+                        try:
+                            matched.append(int(ln.strip()))
+                        except ValueError:
+                            continue
+                except (subprocess.SubprocessError, OSError):
+                    pass
+        except (OSError, IOError):
+            continue
+    return matched
+
+
+def _cumulative_cpu_ticks(pids: list[int]) -> int:
+    """Sum user+system jiffies for the given pids. 0 if none exist."""
+    total = 0
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                parts = f.read().split()
+            # fields 14 (utime) + 15 (stime) — 1-indexed per procfs docs,
+            # 0-indexed here means parts[13] and parts[14]
+            total += int(parts[13]) + int(parts[14])
+        except (OSError, IOError, IndexError, ValueError):
+            continue
+    return total
+
+
+def _write_hang_diagnosis(
+    log_dir: Path, agent_id: int, task_id: str, timestamp: str,
+    *, reason: str, log_path: Optional[Path], agent_pid: Optional[int],
+    bg_info: Optional[dict], bg_pids: list[int],
+) -> Path:
+    """Write a markdown diagnosis file for a killed agent.
+
+    The next attempt's prompt can reference this to avoid repeating the hang.
+    """
+    diag_path = log_dir / f"agent-{agent_id}-{task_id}-{timestamp}.hang.md"
+    lines = [
+        f"# Hang diagnosis — agent {agent_id} ({task_id})",
+        "",
+        f"**Killed reason:** {reason}",
+        f"**Agent pid:** {agent_pid}",
+        "",
+    ]
+    # Last 30 non-empty lines of stream-json log (raw, truncated)
+    if log_path and log_path.exists():
+        try:
+            raw = log_path.read_text().splitlines()
+            tail = [ln for ln in raw if ln.strip()][-30:]
+            lines.append("## Last 30 log lines")
+            lines.append("```")
+            for ln in tail:
+                lines.append(ln[:500])
+            lines.append("```")
+            lines.append("")
+        except OSError:
+            pass
+    # Background bash info
+    if bg_info:
+        lines.append("## Last background Bash call")
+        lines.append(f"- **description:** {bg_info.get('description', '')}")
+        lines.append(f"- **command:** `{bg_info.get('command', '')[:500]}`")
+        lines.append(f"- **tool_use_id:** {bg_info.get('tool_use_id', '')}")
+        lines.append("")
+    # Process snapshot
+    if bg_pids:
+        lines.append("## Background process snapshot at kill")
+        lines.append("```")
+        for pid in bg_pids[:20]:
+            try:
+                with open(f"/proc/{pid}/stat", "rb") as f:
+                    parts = f.read().split()
+                state = parts[2].decode("ascii", "ignore") if len(parts) > 2 else "?"
+                utime = int(parts[13]) if len(parts) > 13 else 0
+                stime = int(parts[14]) if len(parts) > 14 else 0
+                with open(f"/proc/{pid}/wchan", "rb") as f:
+                    wchan = f.read().decode("ascii", "ignore").strip() or "-"
+                with open(f"/proc/{pid}/comm", "rb") as f:
+                    comm = f.read().decode("ascii", "ignore").strip()
+                lines.append(
+                    f"pid={pid} comm={comm} state={state} wchan={wchan} "
+                    f"utime={utime} stime={stime}"
+                )
+            except (OSError, IOError, IndexError, ValueError):
+                lines.append(f"pid={pid} (gone)")
+        lines.append("```")
+        lines.append("")
+    try:
+        diag_path.write_text("\n".join(lines) + "\n")
+    except OSError:
+        pass
+    return diag_path
+
+
 def extract_attempt_summary(log_path: Path) -> dict:
     """Extract a structured summary of what an agent attempted from its jsonl log.
 
@@ -2694,18 +3004,6 @@ def _write_e2e_completion_claim(spec_dir: str, task_id: str, e2e_dir: Path,
     claim_path.write_text(json.dumps(claim, indent=2))
 
 
-def _revert_agent_checkbox(task_file: Path, task_id: str):
-    """Revert an agent's [x] back to [ ] so the runner controls completion."""
-    content = task_file.read_text()
-    pattern = re.compile(
-        r'^(- \[)x\](\s+' + re.escape(task_id) + r'\s)',
-        re.MULTILINE,
-    )
-    new_content = pattern.sub(r'\1 ]\2', content)
-    if new_content != content:
-        task_file.write_text(new_content)
-
-
 def _discover_test_commands() -> list[tuple[str, str]]:
     """Discover build/test/lint commands from CLAUDE.md and Makefile.
 
@@ -2754,362 +3052,6 @@ def _discover_test_commands() -> list[tuple[str, str]]:
         commands.append(("pytest", "pytest"))
 
     return commands
-
-
-def _build_rejection_report(
-    task: "Task",
-    reason: str,
-    spec_dir: str,
-) -> str:
-    """Build a detailed rejection report from the verifier's verdict.
-
-    Reads the structured verdict JSON and produces a markdown report that
-    tells the next agent exactly what failed and what to do about it.
-    """
-    verdict_path = Path(spec_dir) / "claims" / f"verdict-{task.id}.json"
-    verdict = None
-    if verdict_path.exists():
-        try:
-            verdict = json.loads(verdict_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    lines = [f"# Verification REJECTED for {task.id}\n"]
-
-    # Summary
-    lines.append(f"## Why it was rejected\n\n{reason}\n")
-
-    # Criteria breakdown from verifier
-    if verdict and verdict.get("criteria_met"):
-        lines.append("## Criteria assessment\n")
-        lines.append("| Criterion | Met? | Evidence |")
-        lines.append("|-----------|------|----------|")
-        for c in verdict["criteria_met"]:
-            met = "YES" if c.get("met") else "**NO**"
-            criterion = c.get("criterion", "?")
-            evidence = c.get("evidence", "?")
-            lines.append(f"| {criterion} | {met} | {evidence} |")
-        lines.append("")
-
-        # Extract the specific failures
-        failures = [c for c in verdict["criteria_met"] if not c.get("met")]
-        if failures:
-            lines.append("## What you must fix\n")
-            for i, f in enumerate(failures, 1):
-                lines.append(f"{i}. **{f.get('criterion', '?')}**: {f.get('evidence', '?')}")
-            lines.append("")
-
-    if verdict and verdict.get("rationalization_detected"):
-        lines.append(
-            "## Rationalization detected\n\n"
-            "The verifier flagged rationalization in your completion. "
-            "Do NOT explain away failures as 'environment issues', "
-            "'known limitations', or 'Partial' results. Either fix "
-            "the root cause or write BLOCKED.md.\n"
-        )
-
-    # Actionable next steps
-    lines.append("## Next steps\n")
-    lines.append("1. Read the failures above carefully")
-    lines.append("2. Fix each failing criterion — do not skip any")
-    lines.append("3. If a criterion genuinely cannot be met (e.g., emulator won't boot), write BLOCKED.md instead of claiming completion")
-    lines.append("4. Write a new completion claim to `claims/completion-" + task.id + ".json`")
-    lines.append("5. Do NOT mark `[x]` in tasks.md — the runner handles that after verification\n")
-
-    return "\n".join(lines)
-
-
-def _read_completion_claim(spec_dir: str, task_id: str) -> Optional[dict]:
-    """Read a completion claim JSON file written by an agent."""
-    claim_path = Path(spec_dir) / "claims" / f"completion-{task_id}.json"
-    if not claim_path.exists():
-        return None
-    try:
-        return json.loads(claim_path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def _extract_verify_commands(task_description: str) -> list[str]:
-    """Extract explicit **Verify**: commands from a task description.
-
-    Looks for the pattern: **Verify**: `command here`
-    Returns a list of shell commands to execute.
-    """
-    commands = []
-    for m in re.finditer(r'\*\*Verify\*\*:\s*`([^`]+)`', task_description):
-        commands.append(m.group(1))
-    return commands
-
-
-def _extract_done_when_commands(task_description: str) -> list[str]:
-    """Extract shell commands from Done when: that look executable.
-
-    Only extracts backtick-wrapped strings that look like shell commands
-    (start with ./, make, nix-key, gradlew, npm, cargo, go, pytest, etc.)
-    """
-    # Find the Done when section
-    m = re.search(
-        r'\*\*Done when\*\*:(.+?)(?:\n\n|\n-\s|\n##|\Z)',
-        task_description, re.DOTALL
-    )
-    if not m:
-        return []
-    done_when = m.group(1)
-    # Extract backtick-wrapped commands that look like shell invocations
-    cmd_pattern = re.compile(r'`((?:\./|make\s|nix-key\s|gradlew\s|npm\s|cargo\s|go\s|pytest\s|bash\s)[^`]+)`')
-    return cmd_pattern.findall(done_when)
-
-
-def _build_verifier_prompt(
-    task: "Task",
-    claim: Optional[dict],
-    spec_dir: str,
-    task_file: Path,
-) -> str:
-    """Build the prompt for the independent verifier agent.
-
-    The verifier is read-only — it assesses whether the task agent's work
-    satisfies the "Done when" criteria without re-running commands.
-    """
-    # Get the task block from tasks.md
-    task_block = _extract_task_block(str(task_file), task.id)
-
-    # Get the git diff for this task's changes
-    diff_cmd = "git diff HEAD~1 --stat && echo '---' && git diff HEAD~1"
-    try:
-        diff_result = subprocess.run(
-            diff_cmd, shell=True, capture_output=True, text=True, timeout=30,
-        )
-        diff_text = diff_result.stdout[:15000] if diff_result.returncode == 0 else "(could not get diff)"
-    except (subprocess.TimeoutExpired, OSError):
-        diff_text = "(could not get diff)"
-
-    claim_text = json.dumps(claim, indent=2) if claim else "(no completion claim file found)"
-
-    return f"""You are an independent verification agent. Your ONLY job is to assess whether
-a task agent's work satisfies the task's "Done when" criteria. You are the last
-line of defense against incomplete or rationalized work.
-
-## Rules
-
-- You have READ-ONLY access. Do NOT modify any files.
-- You are false-negative-averse: rejecting good work costs a $5 retry.
-  Accepting bad work costs hours of wasted downstream effort. When in doubt, REJECT.
-- "Environment issue", "infrastructure concern", "known limitation", and "Partial"
-  are NOT valid reasons to accept. If the task says a command must exit 0 and it
-  didn't, that's a REJECT.
-- Code review does NOT satisfy E2E validation requirements. If the task requires
-  live interaction (MCP screenshots, emulator testing), code review is insufficient.
-
-## Task to verify
-
-```
-{task_block}
-```
-
-## Agent's completion claim
-
-```json
-{claim_text}
-```
-
-## Agent's changes (git diff)
-
-```
-{diff_text}
-```
-
-## Your assessment
-
-1. Read the task description and "Done when" criteria carefully.
-2. Read the git diff to see what was actually changed.
-3. Read the completion claim to see what the agent says it did.
-4. For each "Done when" criterion, assess whether the evidence supports it.
-5. Check for rationalization: did the agent skip a requirement and explain it away?
-6. Check for vacuous tests: do any new test files contain assertions that always pass?
-
-## Output
-
-Write your verdict to `{spec_dir}/claims/verdict-{task.id}.json` as:
-
-```json
-{{{{
-  "task_id": "{task.id}",
-  "verdict": "ACCEPT" or "REJECT",
-  "confidence": 0.0 to 1.0,
-  "criteria_met": [
-    {{{{"criterion": "description", "met": true/false, "evidence": "why"}}}}
-  ],
-  "rationalization_detected": false,
-  "reason": "One-line summary of your verdict"
-}}}}
-```
-
-Be thorough but concise. Read the actual files if you need to verify test quality.
-"""
-
-
-def _run_verifier_agent(
-    task: "Task",
-    claim: Optional[dict],
-    spec_dir: str,
-    task_file: Path,
-    log_dir: Path,
-    agent_counter: int,
-    timestamp: str,
-    log_fn=None,
-) -> tuple[bool, str]:
-    """Spawn an Opus verifier agent and wait for its verdict.
-
-    Returns (passed, reason). Blocks until the verifier finishes.
-    """
-    if log_fn is None:
-        log_fn = lambda msg: None  # noqa: E731
-
-    prompt = _build_verifier_prompt(task, claim, spec_dir, task_file)
-
-    verifier_task = Task(
-        id=f"verify-{task.id}",
-        description=f"Verify completion of {task.id}",
-        phase=task.phase,
-        parallel=False,
-        status=TaskStatus.RUNNING,
-        line_num=0,
-    )
-
-    log_path = log_dir / f"agent-{agent_counter}-verify-{task.id}-{timestamp}.jsonl"
-    stderr_path = log_dir / f"agent-{agent_counter}-verify-{task.id}-{timestamp}.stderr"
-
-    log_fn(f"  Spawning Opus verifier agent for {task.id}...")
-    proc = spawn_agent(verifier_task, prompt, log_path, stderr_path, model="opus")
-
-    # Wait for completion (blocks — verifier should be fast, ~30-60s)
-    proc.wait()
-    log_fn(f"  Verifier exited with code {proc.returncode}")
-
-    if proc.returncode != 0:
-        return False, f"Verifier agent crashed (exit {proc.returncode})"
-
-    # Read the verdict file
-    verdict_path = Path(spec_dir) / "claims" / f"verdict-{task.id}.json"
-    if not verdict_path.exists():
-        return False, "Verifier agent produced no verdict file"
-
-    try:
-        verdict = json.loads(verdict_path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return False, "Verifier verdict file is malformed JSON"
-
-    decision = verdict.get("verdict", "").upper()
-    reason = verdict.get("reason", "(no reason given)")
-    confidence = verdict.get("confidence", 0.0)
-    rationalization = verdict.get("rationalization_detected", False)
-
-    log_fn(f"  Verdict: {decision} (confidence: {confidence}, rationalization: {rationalization})")
-    log_fn(f"  Reason: {reason}")
-
-    if decision == "ACCEPT" and not rationalization:
-        return True, reason
-    elif decision == "ACCEPT" and rationalization:
-        return False, f"ACCEPT with rationalization detected — treating as REJECT: {reason}"
-    else:
-        return False, reason
-
-
-def _verify_completion_claim(
-    task: "Task",
-    claim: Optional[dict],
-    spec_dir: str,
-    task_file: Path,
-    log_dir: Path,
-    agent_counter: int,
-    timestamp: str,
-    log_fn=None,
-) -> tuple[bool, str]:
-    """Verify a task completion claim.
-
-    Two-layer verification:
-    1. Deterministic hard checks (Python code — cannot be rationalized)
-    2. Opus verifier agent for soft checks (reads diff, assesses criteria)
-
-    Returns (passed, reason).
-    """
-    if log_fn is None:
-        log_fn = lambda msg: None  # noqa: E731
-
-    task_desc = task.description or ""
-    mcp_caps = task.capabilities & _MCP_CAPABILITIES if hasattr(task, 'capabilities') else set()
-
-    # ══════════════════════════════════════════════════════════════════
-    # LAYER 1: Deterministic hard checks (Python — no LLM involved)
-    # These cannot be rationalized around. They check physical evidence.
-    # ══════════════════════════════════════════════════════════════════
-
-    # ── Hard check 1: MCP tasks must have live evidence ──
-    if mcp_caps:
-        screenshots = claim.get("screenshots", []) if claim else []
-        mcp_count = claim.get("mcp_interactions", 0) if claim else 0
-        real_screenshots = [s for s in screenshots if Path(s).exists()]
-        if not real_screenshots and mcp_count == 0:
-            # Fallback: check agent logs for MCP tool calls.  The e2e-loop
-            # agents may have used MCP tools (State-Tool, Click-Tool, etc.)
-            # without the count being recorded in the claim.
-            mcp_log_count = 0
-            if log_dir:
-                for log_file in sorted(log_dir.glob("agent-*-E2E-*.jsonl")):
-                    try:
-                        log_text = log_file.read_text()
-                        mcp_log_count += log_text.count('"mcp__mcp-android__')
-                        mcp_log_count += log_text.count('"mcp__mcp-ios__')
-                        mcp_log_count += log_text.count('"mcp__mcp-browser__')
-                    except OSError:
-                        pass
-            if mcp_log_count > 0:
-                log_fn(f"  MCP evidence from agent logs: {mcp_log_count} tool calls")
-            else:
-                return False, (
-                    f"MCP task {task.id} has no live evidence: "
-                    f"0 screenshots on disk, 0 MCP interactions claimed, "
-                    f"0 MCP tool calls in agent logs. "
-                    f"Code review does not satisfy E2E validation."
-                )
-        log_fn(f"  MCP evidence: {len(real_screenshots)} screenshots, {mcp_count} interactions")
-
-    # ── Hard check 2: Explicit **Verify** commands ──
-    verify_cmds = _extract_verify_commands(task_desc)
-    for cmd in verify_cmds:
-        log_fn(f"  Running verify command: {cmd}")
-        try:
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=300,
-            )
-            if result.returncode != 0:
-                return False, (
-                    f"Verify command failed (exit {result.returncode}): {cmd}\n"
-                    f"stderr: {result.stderr[:500]}"
-                )
-        except subprocess.TimeoutExpired:
-            return False, f"Verify command timed out after 300s: {cmd}"
-
-    # ── Hard check 3: Claimed files exist on disk ──
-    if claim:
-        for f in claim.get("files_created", []):
-            if not Path(f).exists():
-                return False, f"Claimed file does not exist: {f}"
-
-    # ══════════════════════════════════════════════════════════════════
-    # LAYER 2: Opus verifier agent (soft checks — reads diff, assesses)
-    # Catches rationalization, vacuous tests, incomplete implementations
-    # that pass the hard checks but don't actually satisfy "Done when".
-    # ══════════════════════════════════════════════════════════════════
-
-    passed, reason = _run_verifier_agent(
-        task, claim, spec_dir, task_file,
-        log_dir, agent_counter, timestamp, log_fn,
-    )
-
-    return passed, reason
 
 
 # ── Capability request parsing ────────────────────────────────────────
@@ -4275,6 +4217,16 @@ CI_LOOP_DIR = "ci-debug"
 CI_AGENT_IDLE_TIMEOUT_S = 15 * 60   # kill after 15 min of log silence
 CI_AGENT_HARD_TIMEOUT_S = 60 * 60   # absolute cap as a safety net
 
+# Main-loop watchdog: kill VR / task agents if they go idle.
+# VR agents legitimately wait on long tool results (flutter test, nix build) so
+# the default idle budget is generous. The hard cap prevents runaway loops.
+AGENT_IDLE_TIMEOUT_S = 20 * 60      # default: kill after 20 min of log silence
+AGENT_HARD_TIMEOUT_S = 90 * 60      # absolute wall-clock cap per agent
+# When a background bash task has 0 CPU while its owner agent is log-silent,
+# treat that as a deadlock after this window (shorter than AGENT_IDLE_TIMEOUT_S
+# because a CPU-idle background task is unambiguous evidence of a hang).
+AGENT_BG_DEADLOCK_S = 5 * 60
+
 
 def _get_https_remote_url() -> Optional[str]:
     """Convert the origin remote URL to HTTPS form for GH_TOKEN auth.
@@ -5080,6 +5032,21 @@ class Runner:
         else:
             print(line, flush=True)
 
+    def _write_event(self, event_type: str, spec_dir: str, **fields):
+        """Append a structured event to {spec_dir}/run-log.jsonl."""
+        record = {
+            "timestamp": datetime.now().isoformat(),
+            "session": self.session_id,
+            "event": event_type,
+            **fields,
+        }
+        log_path = Path(spec_dir) / "run-log.jsonl"
+        try:
+            with open(log_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError:
+            pass  # Don't crash the runner over a log write failure
+
     def _cleanup_stale_run(self):
         """Kill any orphaned agents from a previous runner that crashed.
 
@@ -5313,6 +5280,8 @@ class Runner:
         validated_phases = scan_validated_phases(spec_dir)
         # Track which phases currently have a validate+review agent running
         vr_phases: set[str] = set()
+        # Track which phases need a fix agent after VR failure
+        vr_fix_phases: set[str] = set()
 
         # Setup TUI for this feature
         if not self.headless:
@@ -5321,6 +5290,10 @@ class Runner:
 
         self.log(f"=== Feature: {Path(spec_dir).name} ===")
         self.log(f"Remaining: {scheduler.remaining_count()} | Completed: {scheduler.completed_count()}")
+        self._write_event("session_start", spec_dir,
+                          feature=Path(spec_dir).name,
+                          remaining=scheduler.remaining_count(),
+                          completed=scheduler.completed_count())
         if validated_phases:
             self.log(f"Already validated: {', '.join(sorted(validated_phases))}")
 
@@ -5386,45 +5359,91 @@ class Runner:
             # Re-parse task file to pick up changes from agents
             phases, phase_deps = parse_task_file(task_file)
 
-            # ── Deterministic completion verification ──
-            # If an agent marked a task [x] directly (or wrote a claim),
-            # verify the evidence before accepting completion.
+            # Safety net: if an agent completed successfully but didn't
+            # mark the task [x], the runner marks it. Without this,
+            # the task stays [ ] and gets re-spawned forever.
+            marked_any = False
+            if hasattr(self, '_agent_done_tasks'):
+                for done_id in list(self._agent_done_tasks):
+                    for phase in phases:
+                        for t in phase.tasks:
+                            if t.id == done_id and t.status != TaskStatus.COMPLETE:
+                                self.log(f"Runner marking {t.id} [x] (agent completed but didn't mark)")
+                                _mark_task_done(task_file, t.id)
+                                marked_any = True
+                    self._agent_done_tasks.discard(done_id)
+                if marked_any:
+                    phases, phase_deps = parse_task_file(task_file)
+
+            # Accept task completions — verification happens at phase level (VR agents)
             for phase in phases:
                 for t in phase.tasks:
-                    if t.status != TaskStatus.COMPLETE:
-                        continue
-                    if t.id in previously_complete:
-                        continue  # Already verified in a prior iteration
-
-                    # This task just became [x] — verify it
-                    claim = _read_completion_claim(spec_dir, t.id)
-                    self.log(f"Verifying completion of {t.id}...")
-                    self.agent_counter += 1
-                    passed, reason = _verify_completion_claim(
-                        t, claim, spec_dir, task_file,
-                        log_dir=self.log_dir,
-                        agent_counter=self.agent_counter,
-                        timestamp=self.timestamp,
-                        log_fn=self.log,
-                    )
-                    if passed:
-                        self.log(f"  {t.id}: verification PASSED — {reason}")
+                    if t.status == TaskStatus.COMPLETE and t.id not in previously_complete:
+                        self.log(f"Task {t.id} marked complete by agent")
                         previously_complete.add(t.id)
-                    else:
-                        self.log(f"  {t.id}: verification FAILED — {reason}")
-                        # Revert the [x] the agent wrote
-                        _revert_agent_checkbox(task_file, t.id)
-                        # Build detailed rejection from the verifier's verdict
-                        reject_dir = Path(spec_dir) / "claims"
-                        reject_dir.mkdir(parents=True, exist_ok=True)
-                        rejection = _build_rejection_report(
-                            t, reason, spec_dir,
-                        )
-                        (reject_dir / f"rejection-{t.id}.md").write_text(rejection)
-                        # Re-parse since we modified the file
-                        phases, phase_deps = parse_task_file(task_file)
 
             # Re-scan phase validation states (validation/review/re-validation lifecycle)
+            phase_states = scan_phase_validation_states(spec_dir)
+
+            # Reset failed runner verifications when a fix agent has since
+            # completed.  A failed runner-verified.json is a dead end: the
+            # review is still marked clean, so phase_needs_validate_review()
+            # returns False and no VR agent spawns.  Deleting the runner
+            # verified file + review files sends the phase back through VR.
+            for phase in phases:
+                slug = phase.slug
+                state = phase_states.get(slug, PhaseValidationState())
+                if not state.validated or state.runner_verified:
+                    continue
+                rv_file = Path(spec_dir) / "validate" / slug / "runner-verified.json"
+                if not rv_file.exists():
+                    continue
+                try:
+                    rv_data = json.loads(rv_file.read_text())
+                except (json.JSONDecodeError, OSError):
+                    continue
+                if rv_data.get("passed", False):
+                    continue  # Passed — nothing to reset
+
+                # Runner verification failed. Check if any agent completed
+                # for this phase AFTER the rv file was written (fix agent).
+                rv_mtime = rv_file.stat().st_mtime
+                fix_ran_since = False
+                if hasattr(self, '_agent_done_tasks'):
+                    # _agent_done_tasks tracks recently completed task IDs
+                    for p in phases:
+                        if p.slug == slug:
+                            for t in p.tasks:
+                                if t.status == TaskStatus.COMPLETE and t.id not in previously_complete:
+                                    fix_ran_since = True
+                                    break
+                            break
+                # Also check if any VR-fix agent completed since the rv file
+                with self._lock:
+                    for a in self.agents:
+                        if a.task.phase == slug and a.task.id.startswith("VR-fix-") and a.status == "done":
+                            fix_ran_since = True
+                if not fix_ran_since:
+                    # Check file mtime as fallback — any validation/review
+                    # file newer than rv_file means work happened
+                    phase_vdir = Path(spec_dir) / "validate" / slug
+                    for f in phase_vdir.iterdir():
+                        if f.name != "runner-verified.json" and f.stat().st_mtime > rv_mtime:
+                            fix_ran_since = True
+                            break
+                if not fix_ran_since:
+                    continue
+
+                # Reset: delete runner-verified.json and review files so
+                # phase_needs_validate_review() returns True again
+                self.log(f"Resetting failed runner verification for {phase.name} — fix applied, re-validating")
+                rv_file.unlink(missing_ok=True)
+                phase_vdir = Path(spec_dir) / "validate" / slug
+                for rf in phase_vdir.glob("review-*.md"):
+                    rf.unlink(missing_ok=True)
+                    self.log(f"  Deleted {rf.name} to trigger re-validation")
+
+            # Re-scan after potential resets
             phase_states = scan_phase_validation_states(spec_dir)
             validated_phases = {s for s, st in phase_states.items() if st.complete}
             scheduler = Scheduler(phases, phase_deps, validated_phases, phase_states)
@@ -5661,6 +5680,10 @@ class Runner:
                 attempt_num = len(history) + 1 if history else 1
                 att_str = f" (attempt #{attempt_num})" if attempt_num > 1 else ""
                 self.log(f"Spawning Agent {agent_id} for task {task.id}{att_str}: {task.description[:60]}")
+                self._write_event("task_spawn", spec_dir,
+                                  task_id=task.id, agent_id=agent_id,
+                                  attempt=attempt_num, phase=task.phase,
+                                  description=task.description[:120])
 
                 # Pass any capabilities granted via BLOCKED.md auto-retry
                 extra_caps = None
@@ -5748,6 +5771,9 @@ class Runner:
                 stderr_path = self.log_dir / f"agent-{agent_id}-{vr_task_id}-{self.timestamp}.stderr"
 
                 self.log(f"Spawning validate+review Agent {agent_id} (cycle {cycle}) for {phase.name}")
+                self._write_event("vr_spawn", spec_dir,
+                                  phase=phase.slug, agent_id=agent_id,
+                                  cycle=cycle)
 
                 proc = spawn_agent(vr_task, prompt, log_path, stderr_path)
 
@@ -5777,10 +5803,110 @@ class Runner:
                 }
             vr_phases &= running_vr_slugs
 
+            # Also clean up vr_fix_phases: remove phases whose fix agent finished
+            with self._lock:
+                running_fix_slugs = {
+                    a.task.phase for a in self.agents
+                    if a.task.id.startswith("VR-fix-")
+                }
+            vr_fix_phases &= running_fix_slugs
+
+            # ── Dispatch fix agents for VR failures ───────────────────
+            # When a VR agent finished with FAIL and no fix agent is
+            # running, spawn one to address the failures.
+            MAX_VR_FIX_ATTEMPTS = 5
+            for phase in phases:
+                slug = phase.slug
+                if slug in vr_phases or slug in vr_fix_phases:
+                    continue  # VR or fix still running
+                if not scheduler.phase_tasks_complete(slug):
+                    continue  # Tasks not done yet
+
+                state = phase_states.get(slug, PhaseValidationState())
+                if state.complete or slug in validated_phases:
+                    continue  # Already fully validated
+
+                # Check if latest validation file is a FAIL
+                phase_vdir = Path(spec_dir) / "validate" / slug
+                if not phase_vdir.is_dir():
+                    continue
+                validation_files = sorted(
+                    f for f in phase_vdir.glob("*.md")
+                    if not f.name.startswith("review-")
+                )
+                if not validation_files:
+                    continue  # No validation yet — VR will be spawned
+
+                latest = validation_files[-1]
+                try:
+                    first_line = latest.read_text().splitlines()[0]
+                except (OSError, IndexError):
+                    continue
+                if "FAIL" not in first_line.upper():
+                    continue  # Latest validation passed — no fix needed
+
+                # Guard against infinite fix loops
+                fix_attempt = len(validation_files)
+                if fix_attempt > MAX_VR_FIX_ATTEMPTS:
+                    self.log(f"VR fix cap ({MAX_VR_FIX_ATTEMPTS}) reached for {phase.name} — skipping fix")
+                    continue
+
+                if available_slots <= 0:
+                    break
+
+                # Build and spawn a fix agent
+                prompt = build_vr_fix_prompt(
+                    spec_dir, str(task_file), str(learnings_file),
+                    phase, latest,
+                )
+
+                fix_task_id = f"VR-fix-{slug}-{fix_attempt}"
+                fix_task = Task(
+                    id=fix_task_id,
+                    description=f"Fix VR failure #{fix_attempt}: {phase.name}",
+                    phase=slug,
+                    parallel=False,
+                    status=TaskStatus.RUNNING,
+                    line_num=0,
+                )
+
+                self.agent_counter += 1
+                agent_id = self.agent_counter
+
+                log_path = self.log_dir / f"agent-{agent_id}-{fix_task_id}-{self.timestamp}.jsonl"
+                stderr_path = self.log_dir / f"agent-{agent_id}-{fix_task_id}-{self.timestamp}.stderr"
+
+                self.log(f"Spawning VR fix Agent {agent_id} (attempt {fix_attempt}) for {phase.name}")
+                self._write_event("vr_fix_spawn", spec_dir,
+                                  phase=slug, agent_id=agent_id,
+                                  attempt=fix_attempt,
+                                  failure_file=str(latest))
+
+                proc = spawn_agent(fix_task, prompt, log_path, stderr_path)
+
+                slot = AgentSlot(
+                    agent_id=agent_id,
+                    task=fix_task,
+                    process=proc,
+                    pid=proc.pid,
+                    start_time=time.time(),
+                    log_file=log_path,
+                    status="running",
+                )
+
+                with self._lock:
+                    self.agents.append(slot)
+
+                vr_fix_phases.add(slug)
+                available_slots -= 1
+                spawned += 1
+                total_runs += 1
+
             # ── Runner-side independent verification ──────────────────
             # After VR agents finish and a phase has validated + review_clean,
             # the runner independently re-runs test commands before accepting.
             # This is deterministic — no LLM involved.
+            runner_verified_any = False
             for phase in phases:
                 slug = phase.slug
                 state = phase_states.get(slug, PhaseValidationState())
@@ -5794,61 +5920,98 @@ class Runner:
                 phase_vdir = Path(spec_dir) / "validate" / slug
                 rv_file = phase_vdir / "runner-verified.json"
                 if rv_file.exists():
-                    continue  # Already attempted
+                    # If verification previously passed, skip.
+                    # If it failed, check if any agent has since completed
+                    # for this phase (fix agent, VR agent, etc.) by comparing
+                    # file mtimes. If newer work exists, retry verification.
+                    try:
+                        rv_data = json.loads(rv_file.read_text())
+                        if rv_data.get("passed", False):
+                            continue  # Already passed
+                        # Failed — check if anything changed since the failure
+                        rv_mtime = rv_file.stat().st_mtime
+                        # Check for newer validation/review files OR newer
+                        # source code changes (git tracks this)
+                        any_newer = False
+                        for f in phase_vdir.iterdir():
+                            if f.name != "runner-verified.json" and f.stat().st_mtime > rv_mtime:
+                                any_newer = True
+                                break
+                        if not any_newer:
+                            continue  # Nothing changed since failure
+                        self.log(f"Retrying runner verification for {phase.name} (prior attempt failed, newer files found)")
+                        rv_file.unlink()
+                    except (json.JSONDecodeError, OSError):
+                        continue
 
-                self.log(f"Runner verification for phase {phase.name}...")
+                try:
+                    self.log(f"Runner verification for phase {phase.name}...")
 
-                # Discover test commands from CLAUDE.md or Makefile
-                test_cmds = _discover_test_commands()
-                if not test_cmds:
-                    self.log(f"  No test commands discovered — accepting VR result")
+                    # Discover test commands from CLAUDE.md or Makefile
+                    test_cmds = _discover_test_commands()
+                    if not test_cmds:
+                        self.log(f"  No test commands discovered — accepting VR result")
+                        rv_file.write_text(json.dumps({
+                            "passed": True,
+                            "reason": "no test commands discovered",
+                            "commands": [],
+                        }, indent=2))
+                        runner_verified_any = True
+                        continue
+
+                    all_passed = True
+                    results = []
+                    for cmd, label in test_cmds:
+                        self.log(f"  Running: {label}")
+                        try:
+                            result = subprocess.run(
+                                cmd, shell=True, capture_output=True, text=True,
+                                timeout=600,
+                            )
+                            passed = result.returncode == 0
+                            results.append({
+                                "command": cmd, "label": label,
+                                "exit_code": result.returncode,
+                                "passed": passed,
+                            })
+                            if not passed:
+                                self.log(f"  FAILED (exit {result.returncode}): {label}")
+                                self.log(f"  stderr: {result.stderr[:300]}")
+                                all_passed = False
+                            else:
+                                self.log(f"  PASSED: {label}")
+                        except subprocess.TimeoutExpired:
+                            results.append({
+                                "command": cmd, "label": label,
+                                "exit_code": -1, "passed": False,
+                                "error": "timeout after 600s",
+                            })
+                            self.log(f"  TIMEOUT: {label}")
+                            all_passed = False
+
                     rv_file.write_text(json.dumps({
-                        "passed": True,
-                        "reason": "no test commands discovered",
+                        "passed": all_passed,
+                        "reason": "all commands passed" if all_passed else "some commands failed",
+                        "commands": results,
+                    }, indent=2))
+                    runner_verified_any = True
+
+                    if all_passed:
+                        self.log(f"Runner verification PASSED for {phase.name}")
+                    else:
+                        self.log(f"Runner verification FAILED for {phase.name} — phase NOT complete")
+                    self._write_event("runner_verify", spec_dir,
+                                      phase=slug, passed=all_passed,
+                                      commands=[r["label"] for r in results],
+                                      failed=[r["label"] for r in results if not r["passed"]])
+                except Exception as exc:
+                    self.log(f"Runner verification CRASHED for {phase.name}: {exc}")
+                    rv_file.write_text(json.dumps({
+                        "passed": False,
+                        "reason": f"runner verification crashed: {exc}",
                         "commands": [],
                     }, indent=2))
-                    continue
-
-                all_passed = True
-                results = []
-                for cmd, label in test_cmds:
-                    self.log(f"  Running: {label}")
-                    try:
-                        result = subprocess.run(
-                            cmd, shell=True, capture_output=True, text=True,
-                            timeout=600,
-                        )
-                        passed = result.returncode == 0
-                        results.append({
-                            "command": cmd, "label": label,
-                            "exit_code": result.returncode,
-                            "passed": passed,
-                        })
-                        if not passed:
-                            self.log(f"  FAILED (exit {result.returncode}): {label}")
-                            self.log(f"  stderr: {result.stderr[:300]}")
-                            all_passed = False
-                        else:
-                            self.log(f"  PASSED: {label}")
-                    except subprocess.TimeoutExpired:
-                        results.append({
-                            "command": cmd, "label": label,
-                            "exit_code": -1, "passed": False,
-                            "error": "timeout after 600s",
-                        })
-                        self.log(f"  TIMEOUT: {label}")
-                        all_passed = False
-
-                rv_file.write_text(json.dumps({
-                    "passed": all_passed,
-                    "reason": "all commands passed" if all_passed else "some commands failed",
-                    "commands": results,
-                }, indent=2))
-
-                if all_passed:
-                    self.log(f"Runner verification PASSED for {phase.name}")
-                else:
-                    self.log(f"Runner verification FAILED for {phase.name} — phase NOT complete")
+                    runner_verified_any = True
 
             # Update TUI
             if self.tui:
@@ -5858,9 +6021,11 @@ class Runner:
                 with self._lock:
                     self.logger.write_status(phases, phase_deps, list(self.agents))
 
-            # If nothing is running and nothing was spawned, we might be stuck
+            # If nothing is running and nothing was spawned, we might be stuck.
+            # Runner verification counts as progress — it writes runner-verified.json
+            # which unlocks dependent phases on the next iteration.
             with self._lock:
-                nothing_happening = len(self.agents) == 0 and spawned == 0
+                nothing_happening = len(self.agents) == 0 and spawned == 0 and not runner_verified_any
 
             if nothing_happening:
                 consecutive_noop += 1
@@ -5902,6 +6067,124 @@ class Runner:
 
         if self.tui:
             self.tui.stop()
+
+    def _check_agent_hang(self, agent) -> Optional[str]:
+        """Return a reason string if the agent should be killed, else None.
+
+        Three independent signals:
+          1. wall-clock exceeded AGENT_HARD_TIMEOUT_S
+          2. JSONL log idle for longer than the task's idle budget
+          3. background-bash deadlock: log stale AND the agent's most recent
+             run_in_background Bash command has a process subtree with 0 CPU
+             ticks accumulated over AGENT_BG_DEADLOCK_S
+
+        When killing, this method also writes a hang-diagnosis file that the
+        next attempt's prompt may reference.
+        """
+        now = time.time()
+        wall_s = now - (agent.start_time or now)
+        if wall_s > AGENT_HARD_TIMEOUT_S:
+            return self._finalize_hang(agent, f"wall-clock {int(wall_s)}s exceeded {AGENT_HARD_TIMEOUT_S}s")
+
+        try:
+            log_mtime = agent.log_file.stat().st_mtime
+        except OSError:
+            return None  # log not yet flushed; wait
+        idle_s = now - log_mtime
+
+        budget = _task_idle_budget_s(agent.task)
+        if idle_s > budget:
+            return self._finalize_hang(agent, f"log idle {int(idle_s)}s > budget {budget}s")
+
+        # Background-bash deadlock detection. Only probes when the log has been
+        # quiet for at least half the budget — avoids noisy ps/pgrep calls on
+        # healthy agents.
+        if idle_s < 60 or idle_s < AGENT_BG_DEADLOCK_S // 2:
+            return None
+
+        if not hasattr(self, "_hang_probes"):
+            self._hang_probes: dict[int, dict] = {}
+        probe = self._hang_probes.get(agent.agent_id)
+
+        bg_info = _read_last_bash_bg_task(agent.log_file)
+        if not bg_info:
+            # No background task outstanding; idle budget alone governs.
+            self._hang_probes.pop(agent.agent_id, None)
+            return None
+
+        # Identify the subtree running this bg command.
+        agent_pid = agent.pid or (agent.process.pid if agent.process else 0)
+        pids = _find_bg_bash_pids(agent_pid, bg_info.get("command", ""))
+        if not pids:
+            # Background task is recorded in log but process is gone (already
+            # finished) — the agent should pick up the result shortly. Skip.
+            self._hang_probes.pop(agent.agent_id, None)
+            return None
+
+        cpu_ticks = _cumulative_cpu_ticks(pids)
+        if probe is None or probe.get("tool_use_id") != bg_info.get("tool_use_id"):
+            # First time we see this bg task — record baseline and wait.
+            self._hang_probes[agent.agent_id] = {
+                "tool_use_id": bg_info.get("tool_use_id"),
+                "ticks": cpu_ticks,
+                "first_seen": now,
+                "pids": pids,
+                "bg_info": bg_info,
+            }
+            return None
+
+        # Same bg task as last probe: check if CPU advanced.
+        if cpu_ticks > probe["ticks"]:
+            # Making progress (CPU time accumulating). Refresh baseline.
+            probe["ticks"] = cpu_ticks
+            probe["first_seen"] = now
+            probe["pids"] = pids
+            return None
+
+        stuck_s = now - probe["first_seen"]
+        if stuck_s > AGENT_BG_DEADLOCK_S:
+            return self._finalize_hang(
+                agent,
+                f"background bash '{bg_info.get('description') or bg_info.get('command', '')[:60]}' "
+                f"had 0 CPU for {int(stuck_s)}s (pids={pids[:6]})",
+                bg_info=bg_info,
+                bg_pids=pids,
+            )
+        return None
+
+    def _finalize_hang(self, agent, reason: str,
+                       *, bg_info: Optional[dict] = None,
+                       bg_pids: Optional[list] = None) -> str:
+        """Emit diagnostic artifacts for a hanging agent, return the reason."""
+        agent_pid = agent.pid or (agent.process.pid if agent.process else None)
+        try:
+            _write_hang_diagnosis(
+                self.log_dir, agent.agent_id, agent.task.id, self.timestamp,
+                reason=reason, log_path=agent.log_file,
+                agent_pid=agent_pid,
+                bg_info=bg_info, bg_pids=bg_pids or [],
+            )
+        except Exception as e:
+            self.log(f"hang diagnosis write failed: {e}")
+        spec_dir = getattr(self, "_current_spec_dir", "")
+        if spec_dir:
+            try:
+                self._write_event(
+                    "agent_hang_kill", spec_dir,
+                    task_id=agent.task.id, agent_id=agent.agent_id,
+                    reason=reason,
+                )
+            except Exception:
+                pass
+        # Kill the background bash subtree too, so flutter_tester etc. go with
+        # the agent and don't linger as zombies for the next attempt.
+        for pid in (bg_pids or []):
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+        self._hang_probes.pop(agent.agent_id, None)
+        return reason
 
     def _poll_agents(self):
         """Poll running agents, read output, detect completion."""
@@ -5959,6 +6242,26 @@ class Runner:
                     if exit_code is not None:
                         agent.exit_code = exit_code
 
+                # Watchdog: kill agents that are idle or deadlocked.
+                # Only probe while the process is still alive — the completion
+                # branch below handles normal exits.
+                if (agent.process
+                        and agent.process.poll() is None
+                        and agent.log_file
+                        and not agent.is_ci_loop):
+                    killed_reason = self._check_agent_hang(agent)
+                    if killed_reason:
+                        self.log(
+                            f"Agent {agent.agent_id} ({agent.task.id}) "
+                            f"killed by watchdog: {killed_reason}"
+                        )
+                        try:
+                            agent.process.kill()
+                        except OSError:
+                            pass
+                        # Let the next iteration observe process exit and the
+                        # normal completion path handle status/recording.
+
                 # Check process status
                 if agent.process and agent.process.poll() is not None:
                     rc = agent.process.returncode
@@ -5972,6 +6275,11 @@ class Runner:
                         else:
                             agent.status = "done"
                             self.log(f"Agent {agent.agent_id} ({agent.task.id}) completed successfully")
+                            # Track for safety-net checkbox marking
+                            if not agent.task.id.startswith(("VR-", "verify-")):
+                                if not hasattr(self, '_agent_done_tasks'):
+                                    self._agent_done_tasks: set[str] = set()
+                                self._agent_done_tasks.add(agent.task.id)
                     elif (_rl := check_rate_limited(stderr_path, agent.log_file)):
                         agent.status = "rate_limited"
                         agent._resets_at = _rl
@@ -5995,6 +6303,19 @@ class Runner:
                         summary = extract_attempt_summary(agent.log_file) if agent.log_file else {}
                         write_attempt_record(spec_dir, agent.task.id, agent.agent_id, duration_s, summary,
                                              session_id=self.session_id)
+
+                    # Structured event log
+                    _sd = getattr(self, '_current_spec_dir', '')
+                    if _sd:
+                        evt_type = "vr_complete" if agent.task.id.startswith("VR-") else "task_complete"
+                        self._write_event(evt_type, _sd,
+                                          task_id=agent.task.id,
+                                          agent_id=agent.agent_id,
+                                          status=agent.status,
+                                          exit_code=rc,
+                                          duration_s=int(time.time() - agent.start_time),
+                                          input_tokens=agent.input_tokens,
+                                          output_tokens=agent.output_tokens)
 
                     finished.append(agent)
 
@@ -8208,6 +8529,7 @@ already failed and what the research agent recommends.
 - Prefer fixing the app code over fixing tests (tests are the spec)
 - **Do NOT skip tests** — if you can't find a test command, look harder (CLAUDE.md, Makefile, package.json, build.gradle)
 - Record any non-obvious learnings to `{learnings_file}`
+- **Regression test quality**: If the task says to write regression tests, they MUST be behavioral — test state transitions, side effects, and data flows, NOT just that text renders on screen. A test that mocks a ViewModel with a pre-set error string and asserts the string is displayed tests nothing useful. Instead: call the real validation function with invalid input and assert it returns false/throws. Call a ViewModel method and assert the state changes correctly. Use real Android context (InstrumentationRegistry) for persistence tests. See the task's "Done when" for specific behavioral assertions required.
 """
 
     def _build_e2e_verify_prompt(self, spec_dir: str, findings_file: Path,

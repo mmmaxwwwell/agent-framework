@@ -179,6 +179,52 @@ Load `reference/e2e-runtime.md` before writing E2E tasks for projects targeting 
 ### MCP-driven E2E exploration (if interview-notes specify MCP debug tools)
 Load `reference/mcp-e2e.md` before writing MCP E2E tasks. If the interview confirmed that agents should use MCP tools for visual E2E testing, include **per-screen E2E tasks** with the `[needs: mcp-<platform>, e2e-loop]` capabilities. Each task uses the runner's explore-research-fix-verify loop.
 
+### MANDATORY E2E + MCP gap-analysis checklist
+
+**Before finalizing the task list for any project that targets one or more platform runtimes, walk through this checklist and add any missing tasks. Missing a row here is the single most common cause of E2E-time surprises (discovered twice on production kanix build-out). Treat this as a forcing function — not optional.**
+
+#### Part A — MCP infrastructure tasks (one task per row, all MUST exist)
+
+For every platform runtime the project targets (Android / iOS / web / desktop), verify these tasks exist:
+
+| # | Task | Why it exists | Maps to |
+|---|------|---------------|---------|
+| 1 | Add `nix-mcp-debugkit` as flake input; re-export `packages.mcp-<platform>` and a `packages.mcp-<platform>-config` config-writer that pins MCP command to its Nix store path | Agents can only use MCP servers that are registered with pinned commands; `github:` URIs unpinned break reproducibility | `reference/mcp-e2e.md` §"Nix flake pinning" |
+| 2 | Register MCP servers + required permissions in `.claude/settings.json` (allowlist `nix run .#mcp-*`, platform CLIs like `adb`, `xcrun simctl`, screencap, logcat, emulator commands) | Without permission entries, the agent gets prompted mid-run and the explore-fix-verify loop stalls | `reference/mcp-e2e.md` §"Runner integration" |
+| 3 | Platform prereq verification script (KVM for Android, Xcode for iOS, display server for desktop) — fail fast with actionable error | Software emulation fallback is 10x slower; silent fallback masks the root cause | `reference/e2e-runtime.md` §"KVM access" |
+| 4 | `test/e2e/setup.sh` + `test/e2e/teardown.sh` — start/stop backend services, kill orphan processes on known ports, clean stale sockets, write `$STATE_DIR/env` with service URLs + test credentials, idempotent | The runner auto-invokes these before booting the emulator; no annotation needed | `reference/e2e-runtime.md` §"Backend service setup for MCP E2E loops" |
+| 5 | App build + install scripts (APK for Android, `.app` for iOS, static bundle for web) feeding into the runner's install step | The runner rebuilds+installs between fix iterations — this script is the contract | `reference/e2e-runtime.md` §"Runtime selection" |
+| 6 | Scripted regression harness per platform (Playwright for web, Patrol/UI Automator for Android, XCUITest for iOS) — emits structured JSON to `test-logs/e2e/` | MCP exploration finds bugs; scripted tests prevent regressions. Both are required. | `reference/e2e-runtime.md` §"MCP + scripted complementarity" |
+
+#### Part B — E2E scenario coverage checklist (enumerate, then map to tasks)
+
+For every category below, either (a) write a `[needs: mcp-*, e2e-loop]` task or a scripted E2E task, or (b) explicitly record in the task list that it's out of scope with a reason. **Do not leave a category silently uncovered.**
+
+1. **Primary happy path per user role** — one E2E per major role (admin, customer, contributor, guest, etc.)
+2. **Every state machine** — walk each state machine from start state through every terminal state, exercising at least one invalid transition per state
+3. **Every external-service adapter in both modes** — stub mode (offline) AND live mode (gated on test keys). Payments, tax, shipping, auth, email, push, analytics.
+4. **Every webhook + its idempotency** — duplicate delivery, out-of-order delivery, bad-signature rejection, race with internal state change
+5. **Every edge case from spec** — if spec.md has a `## Edge Cases` / `FR-E*` section, each one needs either an E2E test or an integration test citation in its "done when"
+6. **Every cross-app real-time propagation** — if the system has >1 client app or WebSocket subscribers, test admin action → other client sees update within SLA
+7. **Every guest → authenticated linking flow** — if the system supports both, verify the linking path end-to-end
+8. **Every refund / cancellation / reversal path** — full, partial, over-limit rejection, audit-log presence
+9. **Every notification delivery path** — trigger → channel (in-app/email/push) → delivery verified at sink (log file, WebSocket receipt, etc.)
+10. **Every rate/limit/race** — concurrent claim of last unit, concurrent duplicate submission, expiry race with late success
+11. **Security boundary sweep** — unauthenticated, wrong permission, injection, XSS, webhook signature tampering — one scripted API-level task covers all
+12. **Upload / file-picker flows** — size limits, type rejection, authorized access, unauthorized rejection
+13. **Cross-platform parity** — if a flow exists on web AND native apps, cover each platform (or explicitly defer one with a reason)
+
+#### Part C — Forcing function
+
+When generating tasks for a multi-runtime project:
+
+1. Read `interview-notes.md § Platform Runtime & E2E` first.
+2. Write the **E2E / MCP infrastructure phase** BEFORE the feature phases — make these prerequisites of Phase 1 or Phase 2, not an afterthought in the final phase.
+3. After drafting the integration/E2E phase, walk Part B categories 1–13 out loud in the task-generation response, mapping each to a specific task ID. If a category has no mapping, either add a task or add an explicit "deferred because X" line.
+4. If iOS, Android, web, or desktop is listed in the interview but no `mcp-<that-platform>` tasks exist, STOP and ask the user whether to include or explicitly defer.
+
+**This checklist is the mechanism. Without it, the initial kanix task list shipped with zero MCP setup tasks and missed six E2E categories — that's the failure mode this checklist prevents.**
+
 **CRITICAL: One screen per E2E task.** Each screen gets its own task. This gives each explore agent a fresh context window — screenshots and tool calls don't accumulate across screens, which avoids context overflow and keeps token usage ~5x lower. It also gets the research→fix→verify loop running faster and prevents one hard bug from blocking progress on other screens.
 
 Only bundle two screens in one task when they are **tightly coupled** (e.g., you must create an item on ScreenA before you can view ScreenB). If in doubt, split them.
@@ -213,9 +259,10 @@ Each task gets its own E2E loop with independent findings, per-bug research agen
 2. **Research** — per-bug research agent investigates (searches web, codebase, docs) before fix
 3. **Fix** — agent fixes bugs guided by research reports and supervisor guidance
 4. **Verify** — agent produces structured evidence (raw hierarchy XML, exact assertions)
-5. **Test writer** — writes UI Automator regression tests for verified fixes, then runs them
-6. **Bug supervisor** — after 3 failed fix attempts, reviews history and redirects or escalates
-7. **Regression check** — runs full test suite after loop completes
+5. **Bug supervisor** — after 3 failed fix attempts, reviews history and redirects or escalates
+6. **Regression check** — runs full test suite after loop completes
+
+**Regression test quality**: When task descriptions require regression tests, the "Done when" criteria MUST specify **behavioral assertions** (state transitions, side effects, data flows), NOT visual assertions (string rendering). See `reference/mcp-e2e.md § Regression test quality` for the full guidance and examples. A regression test that mocks a ViewModel with a pre-set state and asserts text appears is worthless — it tests Compose rendering, not app behavior.
 
 **These tasks are placed AFTER all implementation phases** — they depend on the app being buildable and functional. The runner handles the full lifecycle.
 
