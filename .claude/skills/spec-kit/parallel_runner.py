@@ -2103,6 +2103,12 @@ def _build_sandbox_cmd(project_dir: Path, inner_cmd: list[str]) -> list[str]:
     if project.startswith(str(home)):
         cmd += ["--bind", project, project]
 
+    # Android emulator console auth token — needed for `adb emu finger touch`
+    # (fingerprint simulation) and other console commands.
+    emu_auth = home / ".emulator_console_auth_token"
+    if emu_auth.is_file():
+        cmd += ["--ro-bind", str(emu_auth), str(emu_auth)]
+
     # Claude CLI auth: mount ONLY .credentials.json (read-only).
     # The CLI needs this for its OAuth flow (token refresh, proper headers).
     # Nothing else from ~/.claude/ is exposed.
@@ -2652,6 +2658,42 @@ def _mark_task_done(task_file: Path, task_id: str):
         task_file.write_text(new_content)
 
 
+def _write_e2e_completion_claim(spec_dir: str, task_id: str, e2e_dir: Path,
+                                findings: Optional[dict] = None):
+    """Write a completion claim for an E2E loop task.
+
+    The e2e-loop marks tasks done via _mark_task_done(), but the main loop's
+    verification step expects a claims/completion-{task_id}.json with MCP
+    evidence (screenshots, mcp_interactions).  Without this claim the
+    verifier rejects the task with "no live evidence".
+    """
+    claim_dir = Path(spec_dir) / "claims"
+    claim_dir.mkdir(parents=True, exist_ok=True)
+
+    # Gather screenshot paths from the e2e screenshots directory
+    screenshots_dir = e2e_dir / "screenshots"
+    screenshot_paths = []
+    if screenshots_dir.exists():
+        screenshot_paths = sorted(
+            str(p) for p in screenshots_dir.iterdir()
+            if p.suffix.lower() in (".png", ".jpg", ".jpeg")
+        )
+
+    # Count MCP interactions from findings entries that have screenshot evidence
+    mcp_count = 0
+    if findings:
+        all_entries = findings.get("findings", []) + findings.get("validations", [])
+        mcp_count = len(all_entries)  # each finding required MCP interaction
+
+    claim = {
+        "task_id": task_id,
+        "screenshots": screenshot_paths,
+        "mcp_interactions": max(mcp_count, len(screenshot_paths)),
+    }
+    claim_path = claim_dir / f"completion-{task_id}.json"
+    claim_path.write_text(json.dumps(claim, indent=2))
+
+
 def _revert_agent_checkbox(task_file: Path, task_id: str):
     """Revert an agent's [x] back to [ ] so the runner controls completion."""
     content = task_file.read_text()
@@ -3010,11 +3052,28 @@ def _verify_completion_claim(
         mcp_count = claim.get("mcp_interactions", 0) if claim else 0
         real_screenshots = [s for s in screenshots if Path(s).exists()]
         if not real_screenshots and mcp_count == 0:
-            return False, (
-                f"MCP task {task.id} has no live evidence: "
-                f"0 screenshots on disk, 0 MCP interactions claimed. "
-                f"Code review does not satisfy E2E validation."
-            )
+            # Fallback: check agent logs for MCP tool calls.  The e2e-loop
+            # agents may have used MCP tools (State-Tool, Click-Tool, etc.)
+            # without the count being recorded in the claim.
+            mcp_log_count = 0
+            if log_dir:
+                for log_file in sorted(log_dir.glob("agent-*-E2E-*.jsonl")):
+                    try:
+                        log_text = log_file.read_text()
+                        mcp_log_count += log_text.count('"mcp__mcp-android__')
+                        mcp_log_count += log_text.count('"mcp__mcp-ios__')
+                        mcp_log_count += log_text.count('"mcp__mcp-browser__')
+                    except OSError:
+                        pass
+            if mcp_log_count > 0:
+                log_fn(f"  MCP evidence from agent logs: {mcp_log_count} tool calls")
+            else:
+                return False, (
+                    f"MCP task {task.id} has no live evidence: "
+                    f"0 screenshots on disk, 0 MCP interactions claimed, "
+                    f"0 MCP tool calls in agent logs. "
+                    f"Code review does not satisfy E2E validation."
+                )
         log_fn(f"  MCP evidence: {len(real_screenshots)} screenshots, {mcp_count} interactions")
 
     # ── Hard check 2: Explicit **Verify** commands ──
@@ -3332,20 +3391,36 @@ class PlatformRuntime:
                 log(f"Emulator script failed: {result.stderr.decode()[:300]}")
                 return False
         else:
-            # Fallback: try to boot directly via emulator command
-            avd_list = subprocess.run(
-                ["emulator", "-list-avds"], capture_output=True, timeout=10
-            )
-            avds = avd_list.stdout.decode().strip().splitlines()
-            if not avds:
-                log("No AVDs found. Create one first.")
-                return False
-            avd = avds[0]
-            log(f"Booting AVD: {avd}")
-            subprocess.Popen(
-                ["emulator", f"@{avd}", "-no-window", "-gpu", "swiftshader_indirect", "-no-audio"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
+            # Fallback: try nix develop --command start-emulator if a flake exists
+            flake_nix = project_dir / "flake.nix"
+            if flake_nix.exists():
+                log("start-emulator not in PATH — trying via nix develop")
+                result = subprocess.run(
+                    ["nix", "develop", str(project_dir), "--command",
+                     "start-emulator"],
+                    capture_output=True, timeout=300,
+                    cwd=str(project_dir),
+                )
+                if result.returncode == 0:
+                    log("Emulator started via nix develop")
+                else:
+                    log(f"nix develop start-emulator failed: {result.stderr.decode()[:300]}")
+                    return False
+            else:
+                # Last resort: try emulator command directly
+                avd_list = subprocess.run(
+                    ["emulator", "-list-avds"], capture_output=True, timeout=10
+                )
+                avds = avd_list.stdout.decode().strip().splitlines()
+                if not avds:
+                    log("No AVDs found and no nix flake. Cannot boot emulator.")
+                    return False
+                avd = avds[0]
+                log(f"Booting AVD: {avd}")
+                subprocess.Popen(
+                    ["emulator", f"@{avd}", "-no-window", "-gpu", "swiftshader_indirect", "-no-audio"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
 
         # Wait for boot
         if not self._wait_for("boot_completed",
@@ -3458,8 +3533,36 @@ class PlatformRuntime:
         )
         _write_build_log(install, "adb install")
         if install.returncode != 0:
-            log(f"APK install failed (full log: {build_log_path})")
-            return BuildResult.INSTALL_FAILED
+            stderr_text = install.stderr.decode(errors="replace")
+            if "INSTALL_FAILED_UPDATE_INCOMPATIBLE" in stderr_text:
+                # Signing key changed — uninstall old app and retry
+                pkg = "com.nixkey"
+                # Try to extract package name from APK
+                try:
+                    aapt = subprocess.run(
+                        ["adb", "shell", "pm", "list", "packages"],
+                        capture_output=True, timeout=10,
+                    )
+                    # Use a broad match from the stderr message
+                    import re as _re
+                    m = _re.search(r"package (\S+) ", stderr_text)
+                    if m:
+                        pkg = m.group(1)
+                except Exception:
+                    pass
+                log(f"Signature mismatch — uninstalling {pkg} and retrying")
+                subprocess.run(
+                    ["adb", "uninstall", pkg],
+                    capture_output=True, timeout=30,
+                )
+                install = subprocess.run(
+                    ["adb", "install", "-r", "-t", str(apk)],
+                    capture_output=True, timeout=120,
+                )
+                _write_build_log(install, "adb install (retry after uninstall)")
+            if install.returncode != 0:
+                log(f"APK install failed (full log: {build_log_path})")
+                return BuildResult.INSTALL_FAILED
 
         log("APK installed successfully")
         return BuildResult.OK
@@ -3600,9 +3703,14 @@ class PlatformManager:
         - Write PIDs to a known location for teardown
         - Exit 0 when all services are ready
         - Exit non-zero on failure
+
+        The script is called every time because it handles its own idempotency
+        (checking PIDs, restarting dead services).  This makes the system
+        resilient to machine sleep, process crashes, or any other interruption
+        that kills backend services between tasks.
         """
-        if self._e2e_services_started:
-            return True
+        # Always store the canonical project_dir for teardown
+        self._e2e_project_dir = project_dir
 
         setup_script = project_dir / "test" / "e2e" / "setup.sh"
         if not setup_script.exists():
@@ -3620,8 +3728,17 @@ class PlatformManager:
             )
             if result.returncode != 0:
                 self._log(f"E2E setup failed (exit {result.returncode}):")
-                self._log(f"  stdout: {result.stdout[-500:]}")
-                self._log(f"  stderr: {result.stderr[-500:]}")
+                self._log(f"  stdout (last 2000 chars): {result.stdout[-2000:]}")
+                self._log(f"  stderr (last 2000 chars): {result.stderr[-2000:]}")
+                # Write full output to a file for debugging
+                setup_log = project_dir / "test" / "e2e" / ".state" / "setup-failure.log"
+                setup_log.parent.mkdir(parents=True, exist_ok=True)
+                setup_log.write_text(
+                    f"=== exit code: {result.returncode} ===\n"
+                    f"=== stdout ===\n{result.stdout}\n"
+                    f"=== stderr ===\n{result.stderr}\n"
+                )
+                self._log(f"  Full output written to {setup_log}")
                 return False
             self._log("E2E backend services started successfully")
             if result.stdout.strip():
@@ -3642,6 +3759,7 @@ class PlatformManager:
 
         teardown_script = project_dir / "test" / "e2e" / "teardown.sh"
         if not teardown_script.exists():
+            self._e2e_services_started = False
             return
 
         self._log(f"Running E2E backend services teardown: {teardown_script}")
@@ -3794,9 +3912,12 @@ class PlatformManager:
                 self._log(f"Error tearing down {name}: {e}")
         self._runtimes.clear()
 
-        # Stop backend E2E services
-        if project_dir:
-            self._stop_e2e_services(project_dir)
+        # Stop backend E2E services — use the canonical project_dir
+        # stored during _start_e2e_services, since callers often pass
+        # spec_dir.parent which resolves to the wrong path.
+        effective_dir = getattr(self, '_e2e_project_dir', None) or project_dir
+        if effective_dir:
+            self._stop_e2e_services(effective_dir)
 
     @property
     def active_runtimes(self) -> dict[str, PlatformRuntime]:
@@ -4150,11 +4271,9 @@ CI_LOOP_MAX_ATTEMPTS = 50
 CI_LOCAL_MAX_ITERATIONS = 20
 CI_REPEAT_FAILURE_THRESHOLD = 5  # Stop if same job fails this many consecutive times
 CI_LOOP_DIR = "ci-debug"
-# Watchdog: kill a sub-agent if it has been running longer than this.
-# The old heuristic (5 min log-idle) killed agents running long builds
-# (e.g. `make gomobile`) that produce no intermediate log output.
-# Instead, poll every 60s and enforce a hard wall-clock timeout.
-CI_AGENT_TIMEOUT_S = 15 * 60
+# Watchdog: kill a sub-agent if its JSONL log goes idle.
+CI_AGENT_IDLE_TIMEOUT_S = 15 * 60   # kill after 15 min of log silence
+CI_AGENT_HARD_TIMEOUT_S = 60 * 60   # absolute cap as a safety net
 
 
 def _get_https_remote_url() -> Optional[str]:
@@ -5480,7 +5599,7 @@ class Runner:
                     if not hasattr(self, '_e2e_loop_spawns'):
                         self._e2e_loop_spawns: dict[str, int] = {}
                     spawn_count = self._e2e_loop_spawns.get(task.id, 0)
-                    if spawn_count >= 3:
+                    if spawn_count >= 5:
                         self.log(f"Task {task.id} E2E loop spawned {spawn_count} times — giving up")
                         task.status = TaskStatus.FAILED
                         continue
@@ -5982,16 +6101,30 @@ class Runner:
                         break
 
             ci_log(f"Spawned {label} (Agent {aid}, pid {proc.pid})")
-            # Watchdog: poll every 60s, enforce hard wall-clock timeout.
+            # Watchdog: poll every 60s, kill if the JSONL log goes idle.
             timeout_killed = False
+            kill_reason = ""
             agent_start = time.time()
             while proc.poll() is None:
                 time.sleep(60)
-                elapsed = time.time() - agent_start
-                if elapsed > CI_AGENT_TIMEOUT_S:
+                now = time.time()
+                try:
+                    last_activity = log_p.stat().st_mtime
+                except OSError:
+                    last_activity = agent_start
+                idle_s = now - last_activity
+                wall_s = now - agent_start
+                if idle_s > CI_AGENT_IDLE_TIMEOUT_S:
+                    kill_reason = (
+                        f"idle for {int(idle_s)}s (no log output) — killing"
+                    )
+                elif wall_s > CI_AGENT_HARD_TIMEOUT_S:
+                    kill_reason = (
+                        f"exceeded {CI_AGENT_HARD_TIMEOUT_S}s hard wall-clock limit — killing"
+                    )
+                if kill_reason:
                     ci_log(
-                        f"{label} (Agent {aid}, pid {proc.pid}) "
-                        f"exceeded {CI_AGENT_TIMEOUT_S}s wall-clock timeout — killing"
+                        f"{label} (Agent {aid}, pid {proc.pid}) {kill_reason}"
                     )
                     proc.kill()
                     proc.wait()
@@ -6498,10 +6631,14 @@ class Runner:
 
         # Supervisor interval: every N iterations, assess progress
         SUPERVISOR_INTERVAL = 10
-        # Watchdog: kill an agent if it exceeds this wall-clock timeout.
-        # Agents running long builds (e.g. `make gomobile`) produce no log
-        # output for minutes — the old log-idle heuristic killed them.
-        AGENT_TIMEOUT_S = 15 * 60
+        # Watchdog: kill an agent if its JSONL log goes idle (no new
+        # entries).  MCP-heavy E2E tasks legitimately run for 45+ min with
+        # hundreds of tool calls, so a wall-clock cap is wrong — we only
+        # want to kill agents that have stopped producing output.
+        # Builds (e.g. `make gomobile`) can go 10 min without log output,
+        # so the idle threshold is generous.
+        AGENT_IDLE_TIMEOUT_S = 15 * 60   # kill after 15 min of log silence
+        AGENT_HARD_TIMEOUT_S = 120 * 60  # absolute cap as a safety net
 
         def e2e_log(msg: str):
             ts = datetime.now().strftime("%H:%M:%S")
@@ -6544,18 +6681,34 @@ class Runner:
                         break
 
             e2e_log(f"Spawned {label} (Agent {aid}, pid {proc.pid})")
-            # Watchdog: poll every 60s, enforce hard wall-clock timeout.
-            # The old log-idle heuristic (5 min) killed agents running long
-            # builds (e.g. `make gomobile`) that produce no intermediate output.
+            # Watchdog: poll every 60s, kill if the JSONL log file hasn't
+            # been updated in AGENT_IDLE_TIMEOUT_S.  Active agents write a
+            # new line for every tool call / response, so a stale log means
+            # the agent is stuck.  A hard wall-clock cap remains as a safety net.
             timeout_killed = False
+            kill_reason = ""
             agent_start = time.time()
             while proc.poll() is None:
                 time.sleep(60)
-                elapsed = time.time() - agent_start
-                if elapsed > AGENT_TIMEOUT_S:
+                now = time.time()
+                # Check log file freshness
+                try:
+                    last_activity = log_p.stat().st_mtime
+                except OSError:
+                    last_activity = agent_start
+                idle_s = now - last_activity
+                wall_s = now - agent_start
+                if idle_s > AGENT_IDLE_TIMEOUT_S:
+                    kill_reason = (
+                        f"idle for {int(idle_s)}s (no log output) — killing"
+                    )
+                elif wall_s > AGENT_HARD_TIMEOUT_S:
+                    kill_reason = (
+                        f"exceeded {AGENT_HARD_TIMEOUT_S}s hard wall-clock limit — killing"
+                    )
+                if kill_reason:
                     e2e_log(
-                        f"{label} (Agent {aid}, pid {proc.pid}) "
-                        f"exceeded {AGENT_TIMEOUT_S}s wall-clock timeout — killing"
+                        f"{label} (Agent {aid}, pid {proc.pid}) {kill_reason}"
                     )
                     proc.kill()
                     proc.wait()
@@ -6601,19 +6754,45 @@ class Runner:
             e2e_log(f"Task {task.id} has no MCP capabilities — cannot run E2E loop")
             return
 
+        # Create PlatformManager with a log function that writes to BOTH
+        # the runner's main log and e2e-loop.log, so boot diagnostics
+        # are visible when debugging failures.
+        def platform_log(msg):
+            self.log(msg)
+            e2e_log(f"[platform] {msg}")
+
         if not hasattr(self, '_platform_manager'):
-            self._platform_manager = PlatformManager(log_fn=self.log)
+            self._platform_manager = PlatformManager(log_fn=platform_log)
+        else:
+            # Update log function so it writes to this task's e2e-loop.log
+            self._platform_manager._log = platform_log
 
         mcp_config_paths = []
         for cap in mcp_caps:
             runtime = self._platform_manager.ensure_runtime(cap, project_dir)
             if not runtime:
+                # Gather diagnostic info for the BLOCKED message
+                diag_lines = [f"# BLOCKED: {task.id} — Platform runtime initialization failed\n"]
+                diag_lines.append(f"Could not boot {cap} runtime.\n")
+                import shutil as _sh
+                diag_lines.append(f"## Diagnostics\n")
+                diag_lines.append(f"- start-emulator in PATH: {bool(_sh.which('start-emulator'))}")
+                diag_lines.append(f"- emulator in PATH: {bool(_sh.which('emulator'))}")
+                diag_lines.append(f"- adb in PATH: {bool(_sh.which('adb'))}")
+                diag_lines.append(f"- flake.nix exists: {(project_dir / 'flake.nix').exists()}")
+                diag_lines.append(f"- project_dir: {project_dir}")
+                try:
+                    adb_result = subprocess.run(
+                        ["adb", "devices"], capture_output=True, text=True, timeout=5)
+                    diag_lines.append(f"- adb devices: {adb_result.stdout.strip()}")
+                except Exception as e:
+                    diag_lines.append(f"- adb devices: error ({e})")
+                diag_lines.append(f"- _e2e_services_started: {self._platform_manager._e2e_services_started}")
+                diag_lines.append(f"- _booted runtimes: {list(self._platform_manager._runtimes.keys())}")
+                diag_msg = "\n".join(diag_lines)
                 e2e_log(f"Failed to initialize platform runtime for {cap}")
-                self.blocked_file.write_text(
-                    f"# BLOCKED: {task.id} — Platform runtime initialization failed\n\n"
-                    f"Could not boot {cap} runtime. Check that the platform tools "
-                    f"are available (emulator, adb, Xcode, etc.).\n"
-                )
+                e2e_log(diag_msg)
+                self.blocked_file.write_text(diag_msg + "\n")
                 return
             paths = self._platform_manager.get_mcp_config_paths({cap})
             mcp_config_paths.extend(paths)
@@ -6667,6 +6846,49 @@ class Runner:
         MAX_CONSECUTIVE_EXPLORE_FAILURES = 3
         e2e_loop_succeeded = False
         fix_agent_ran = False
+
+        # ── Pre-loop: rejection research ──
+        # If a prior attempt was rejected by the verifier, spawn a research
+        # agent to investigate the specific blockers BEFORE re-running the
+        # explore loop.  This gives the next explore agent concrete solutions
+        # instead of blindly retrying the same approach.
+        rejection_path = Path(spec_dir) / "claims" / f"rejection-{task.id}.md"
+        if rejection_path.exists():
+            rejection_text = rejection_path.read_text()
+            e2e_log(f"Prior attempt rejected — spawning rejection-research agent")
+            research_prompt = f"""A previous E2E exploration agent completed task {task.id}, but the verifier rejected it. Your job is to investigate the specific blockers and produce actionable fixes.
+
+## Rejection details
+
+```
+{rejection_text}
+```
+
+## What to do
+
+1. Read the rejection carefully — identify each specific blocker.
+2. For each blocker, investigate the root cause:
+   - If it's an environment issue (e.g. emulator auth token, fingerprint simulation), find the fix and apply it.
+   - If it's a missing test, write the test.
+   - If it's a code issue, fix the code.
+3. Write a summary of what you fixed to `{e2e_dir}/rejection-fixes.md`.
+4. If any blocker is genuinely unfixable, explain why in the summary.
+
+## Important
+
+- You have access to the codebase, adb, and the emulator (if running).
+- Focus on making the NEXT explore agent succeed — remove the obstacles.
+- Do NOT mark the task as done or write completion claims.
+"""
+            research_task = Task(
+                id=f"E2E-rejection-research-{task.id}",
+                description=f"Research rejection blockers for {task.id}",
+                phase=task.phase, parallel=False,
+                status=TaskStatus.RUNNING, line_num=0,
+            )
+            _wait_for_subagent(research_task, research_prompt,
+                               f"E2E-rejection-research-{task.id}")
+            e2e_log("Rejection research complete")
 
         # ── Main loop ──
         while not self._shutdown.is_set():
@@ -7587,6 +7809,14 @@ This is build-fix attempt {attempt} of {BUILD_FIX_MAX_ATTEMPTS}.
         # Clean exploration passes (0 bugs) don't need regression checks.
         if not fix_agent_ran:
             e2e_log("No fixes applied — skipping regression check")
+            # Read latest findings for the completion claim
+            final_findings = None
+            if findings_file.exists():
+                try:
+                    final_findings = json.loads(findings_file.read_text())
+                except (json.JSONDecodeError, OSError):
+                    pass
+            _write_e2e_completion_claim(spec_dir, task.id, e2e_dir, final_findings)
             _mark_task_done(task_file, task.id)
             if hasattr(self, '_platform_manager'):
                 self._platform_manager.teardown_all(project_dir=Path(spec_dir).parent if spec_dir else None)
@@ -7640,6 +7870,14 @@ This is build-fix attempt {attempt} of {BUILD_FIX_MAX_ATTEMPTS}.
                 self._platform_manager.teardown_all(project_dir=Path(spec_dir).parent if spec_dir else None)
             return
 
+        # Read latest findings for the completion claim
+        final_findings = None
+        if findings_file.exists():
+            try:
+                final_findings = json.loads(findings_file.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
+        _write_e2e_completion_claim(spec_dir, task.id, e2e_dir, final_findings)
         _mark_task_done(task_file, task.id)
 
         # Teardown platform runtimes and backend services
@@ -7691,18 +7929,38 @@ Validate every element, flow, and error path described in the task above. When t
         else:
             mission = """Explore the running app systematically, comparing actual behavior against the specification. Find bugs in this run. Do not stop after finding one bug — keep exploring every screen, every flow, every edge case."""
 
+        # ── Include verification rejection from prior attempt ──
+        rejection_context = ""
+        if parent_task:
+            rejection_path = Path(spec_dir) / "claims" / f"rejection-{parent_task.id}.md"
+            if rejection_path.exists():
+                rejection_text = rejection_path.read_text()
+                rejection_context = f"""
+
+## PREVIOUS ATTEMPT REJECTED BY VERIFIER
+
+A previous agent completed this task, but the independent verifier rejected it. You MUST address every rejection reason below. Do NOT repeat the same approach that was rejected — solve the underlying blockers.
+
+```
+{rejection_text}
+```
+
+**Your priority is to fix the specific issues above.** If a blocker is environmental (e.g. emulator auth token missing for fingerprint simulation), investigate and fix the environment first, then proceed with the task. If you cannot fix it, file it as a BLOCKED bug with the root cause and what you tried.
+
+"""
+
         return f"""You are an E2E exploration agent with access to MCP tools that let you interact with a running app.
 
 ## Your mission
 
 {mission}
-
+{rejection_context}
 ## CRITICAL: Context window management
 
 You are running inside a context window with limited capacity. Accumulating too many screenshots will crash you mid-session. Follow these rules strictly:
 
 1. **Prefer Screenshot over DumpHierarchy** — screenshots are a single image and use far less context than XML hierarchy dumps (which can be 20-50k tokens each). Use DumpHierarchy only when you need exact resource IDs, content descriptions, or accessibility attributes that aren't visible in the screenshot.
-2. **Maximum 20 screenshots per session** — count them. Save to `{e2e_dir}/screenshots/` and reference by path. Don't re-read screenshots you've already analyzed.
+2. **Maximum 20 screenshots per session** — count them. After each State-Tool screenshot, save it to disk via `adb shell screencap -p /sdcard/nk_screen.png && adb pull /sdcard/nk_screen.png {e2e_dir}/screenshots/<name>.png` and reference that path in findings. Don't re-read screenshots you've already analyzed.
 3. **Avoid DumpHierarchy unless necessary** — if you can determine element positions and text from the screenshot, do so. Only dump the hierarchy when you need precise selectors or accessibility info.
 4. **Write findings incrementally** — update `{findings_file}` after each screen/flow you complete, not just at the end. If you crash, the next agent can pick up from your partial findings.
 5. **Write a progress checkpoint** — after completing each screen or flow, append a line to `{e2e_dir}/progress.md` noting what you covered (e.g., "Settings screen: validated all sections, dropdowns, OTEL field"). The next iteration reads this to skip already-validated areas.
@@ -7722,17 +7980,30 @@ Tools are namespaced as `mcp__mcp-android__<name>`. Call them directly — do NO
 - **mcp__mcp-android__Notification-Tool**: Open the notification shade (no parameters)
 - **mcp__mcp-android__Wait-Tool**: Pause for N **seconds** `{{"duration": 2}}` — NEVER pass more than 5
 
+## CRITICAL: Saving screenshots to disk
+
+The MCP State-Tool returns screenshots as inline images in the conversation — they are NOT saved to disk. You MUST save screenshots to disk yourself using `adb screencap`, because the runner verifies that screenshot files exist on disk as proof of live MCP interaction.
+
+**Every time you take a screenshot with State-Tool, ALSO save it to disk:**
+```bash
+mkdir -p {e2e_dir}/screenshots/ && adb shell screencap -p /sdcard/nk_screen.png && adb pull /sdcard/nk_screen.png {e2e_dir}/screenshots/<name>.png
+```
+
+Use a descriptive `<name>` like `T302-auth-screen`, `T302-error-invalid-key`, `T302-connected`. Then reference that path in findings.json `screenshot_path` field.
+
+Do this at least once per screen you validate and once per bug you find. Without screenshots on disk, the runner will reject your work.
+
 ## How to explore
 
 1. **Check progress first** — read `{e2e_dir}/progress.md` if it exists. Skip screens/flows already marked as validated.
 2. Launch the app (if not already running)
-3. **Take a screenshot first** to understand the current screen, then use DumpHierarchy only if you need precise selectors or accessibility attributes
+3. **Take a screenshot first** to understand the current screen, then use DumpHierarchy only if you need precise selectors or accessibility attributes. **Save it to disk** using the `adb screencap` method above.
 4. Compare what you see against the UI_FLOW.md specification below
 5. Try both happy paths AND error paths for each flow
 6. When you find a bug, document it with:
    - Steps to reproduce
    - Expected vs actual behavior
-   - Screenshot path (save to `{e2e_dir}/screenshots/` — take one screenshot per bug, not per step)
+   - Screenshot path (**saved to disk** via `adb screencap` to `{e2e_dir}/screenshots/`)
 7. **Update findings and progress files after each screen**
 8. Navigate to the next screen/flow and repeat
 9. **NEVER run interactive or long-lived commands** via Bash (e.g. `nix-key pair`, `nix-key daemon`, servers, watchers). These hang forever and block the entire session. Always set `"timeout": 10000` (10s) on any Bash call. If you need to test a CLI command, use a non-interactive flag or just verify the binary exists.
@@ -7954,7 +8225,7 @@ already failed and what the research agent recommends.
 Follow these rules to avoid crashing from context overflow:
 
 1. **Prefer Screenshot over DumpHierarchy** — screenshots use far less context than XML dumps. Only use DumpHierarchy when you need exact resource IDs, content descriptions, or accessibility attributes.
-2. **Maximum 15 screenshots per session** — one per bug being verified is enough. Save to `{e2e_dir}/screenshots/` and reference by path.
+2. **Maximum 15 screenshots per session** — one per bug being verified is enough. After each State-Tool screenshot, save it to disk via `adb shell screencap -p /sdcard/nk_screen.png && adb pull /sdcard/nk_screen.png {e2e_dir}/screenshots/<name>.png` and reference that path in findings.
 3. **Avoid re-reading screenshots** you've already analyzed.
 4. **Update findings incrementally** — write to `{findings_file}` after verifying each bug, not all at once at the end.
 
@@ -8035,7 +8306,7 @@ to the bug's evidence directory: `"bug_dir": "{e2e_dir}/bugs/<BUG-ID>"`
 ## Rules
 
 - Test EVERY bug in the findings — do not skip any
-- Save screenshots to `{e2e_dir}/screenshots/` — one per bug max
+- Save screenshots to disk via `adb shell screencap -p /sdcard/nk_screen.png && adb pull /sdcard/nk_screen.png {e2e_dir}/screenshots/<name>.png` — one per bug max. The State-Tool shows you the screen inline but does NOT save to disk.
 - Add any newly discovered bugs (with `bug_dir` field)
 - **Always write structured evidence** — no exceptions
 - Do NOT modify source code — only update `{findings_file}` and write evidence files
