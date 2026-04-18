@@ -3722,6 +3722,8 @@ class PlatformManager:
             return True
 
         self._log(f"Running E2E backend services setup: {setup_script}")
+        setup_log = project_dir / "test" / "e2e" / ".state" / "setup-failure.log"
+        setup_log.parent.mkdir(parents=True, exist_ok=True)
         try:
             result = subprocess.run(
                 ["bash", str(setup_script)],
@@ -3733,9 +3735,6 @@ class PlatformManager:
                 self._log(f"E2E setup failed (exit {result.returncode}):")
                 self._log(f"  stdout (last 2000 chars): {result.stdout[-2000:]}")
                 self._log(f"  stderr (last 2000 chars): {result.stderr[-2000:]}")
-                # Write full output to a file for debugging
-                setup_log = project_dir / "test" / "e2e" / ".state" / "setup-failure.log"
-                setup_log.parent.mkdir(parents=True, exist_ok=True)
                 setup_log.write_text(
                     f"=== exit code: {result.returncode} ===\n"
                     f"=== stdout ===\n{result.stdout}\n"
@@ -3748,11 +3747,33 @@ class PlatformManager:
                 self._log(f"  setup output: {result.stdout.strip()[:200]}")
             self._e2e_services_started = True
             return True
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
+            # Capture partial output from the killed process so the fix-agent
+            # has something to debug.
+            partial_stdout = (e.stdout or b"")
+            partial_stderr = (e.stderr or b"")
+            if isinstance(partial_stdout, bytes):
+                partial_stdout = partial_stdout.decode("utf-8", errors="replace")
+            if isinstance(partial_stderr, bytes):
+                partial_stderr = partial_stderr.decode("utf-8", errors="replace")
             self._log("E2E setup timed out after 300s")
+            if partial_stdout.strip():
+                self._log(f"  stdout (last 2000 chars): {partial_stdout[-2000:]}")
+            if partial_stderr.strip():
+                self._log(f"  stderr (last 2000 chars): {partial_stderr[-2000:]}")
+            setup_log.write_text(
+                f"=== timed out after 300s ===\n"
+                f"=== stdout ===\n{partial_stdout}\n"
+                f"=== stderr ===\n{partial_stderr}\n"
+            )
+            self._log(f"  Full output written to {setup_log}")
             return False
         except Exception as e:
             self._log(f"E2E setup error: {e}")
+            try:
+                setup_log.write_text(f"=== exception: {e!r} ===\n")
+            except OSError:
+                pass
             return False
 
     def _stop_e2e_services(self, project_dir: Path):
@@ -7193,35 +7214,422 @@ class Runner:
             # Update log function so it writes to this task's e2e-loop.log
             self._platform_manager._log = platform_log
 
+        PLATFORM_INIT_MAX_ATTEMPTS = 10
+        fix_history_path = project_dir / "test" / "e2e" / ".state" / "fix-history.md"
+        playbook_path = self.script_dir / "reference" / "fix-agent-playbook.md"
+        patterns_path = self.script_dir / "reference" / "e2e-failure-patterns.md"
+
+        def _load_reference(path: Path) -> str:
+            try:
+                return path.read_text()
+            except OSError:
+                return ""
+
+        def _parse_setup_failure(setup_log: Path) -> dict:
+            """Extract the failing service + port from setup-failure.log.
+
+            Returns a dict with optional keys: timed_out (bool), exit_code (int),
+            failed_service (str), failed_port (int), error_line (str),
+            full_text (str).
+            """
+            out: dict = {"full_text": ""}
+            if not setup_log.exists():
+                return out
+            try:
+                text = setup_log.read_text()
+            except OSError:
+                return out
+            out["full_text"] = text
+            if "timed out after" in text.split("\n", 2)[0]:
+                out["timed_out"] = True
+            m = re.search(r"===\s*exit code:\s*(-?\d+)\s*===", text)
+            if m:
+                out["exit_code"] = int(m.group(1))
+            # Match the e2e-setup ERROR line that says which service+port timed out.
+            # Examples:
+            #   "ERROR: API server did not start within 30s on port 3000"
+            #   "ERROR: Astro site did not start within 30s on port 4321"
+            #   "ERROR: SuperTokens did not respond at http://127.0.0.1:3567/hello within 60s"
+            m = re.search(
+                r"ERROR:\s*(.+?)\s+did not (?:start|respond).*?(?:port\s+(\d+)|:(\d+)/)",
+                text,
+            )
+            if m:
+                out["error_line"] = m.group(0)
+                out["failed_service"] = m.group(1).strip()
+                port = m.group(2) or m.group(3)
+                if port:
+                    out["failed_port"] = int(port)
+            else:
+                # Fallback: last non-empty line that contains "ERROR"
+                for line in reversed([l for l in text.splitlines() if l.strip()]):
+                    if "ERROR" in line.upper():
+                        out["error_line"] = line.strip()
+                        break
+            return out
+
+        def _service_log_for(service: str) -> Optional[Path]:
+            """Map the service name from setup-failure.log to its log file."""
+            if not service:
+                return None
+            s = service.lower()
+            candidates = {
+                "api server": "api.log",
+                "api": "api.log",
+                "astro site": "astro.log",
+                "astro": "astro.log",
+                "postgresql": "postgres.log",
+                "postgres": "postgres.log",
+                "supertokens": "supertokens.log",
+            }
+            for key, fname in candidates.items():
+                if key in s:
+                    return project_dir / ".dev" / "e2e-state" / fname
+            # Fallback: <service-slug>.log
+            slug = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+            return project_dir / ".dev" / "e2e-state" / f"{slug}.log"
+
+        def _port_binding(port: int) -> str:
+            """Run `ss -tlnp` for the port. Returns its output or a note."""
+            try:
+                r = subprocess.run(
+                    ["ss", "-tlnp"], capture_output=True, text=True, timeout=5)
+                matches = [l for l in r.stdout.splitlines() if f":{port} " in l or f":{port}\t" in l]
+                if matches:
+                    return "\n".join(matches)
+                return f"(no listener on port {port})"
+            except Exception as e:
+                return f"(ss failed: {e})"
+
+        def _match_patterns(failure: dict, service_log_tail: str) -> list[str]:
+            """Match the failure signature against the pattern library.
+
+            Returns a list of pattern *names* whose signature matches. The runner
+            then extracts just those sections from e2e-failure-patterns.md.
+            """
+            matched: list[str] = []
+            if failure.get("timed_out") or "did not start" in failure.get("error_line", "") \
+                    or "did not respond" in failure.get("error_line", ""):
+                # If the service log mentions "ready" / "listening" / "started"
+                # but wait_for_port still failed, it's the IPv6/IPv4 pattern.
+                tail_lc = service_log_tail.lower()
+                if any(k in tail_lc for k in ["ready", "listening", "started", "accepting connections"]):
+                    matched.append("port-timeout-but-service-ready")
+                else:
+                    matched.append("service-crash-on-boot")
+            log_lc = service_log_tail.lower()
+            if "config validation failed" in log_lc or "missing required config" in log_lc:
+                matched.append("config-validation-missing-required")
+            if any(k in log_lc for k in [
+                "duplicate key", "already exists", "unexpected checksum",
+            ]) and "migrate" in service_log_tail.lower():
+                matched.append("migration-already-applied")
+            if "emulator" in failure.get("error_line", "").lower() or \
+               (failure.get("failed_service") or "").lower().startswith("emulator"):
+                matched.append("emulator-boot-timeout")
+            # Stale process heuristic: if service log is older than ~2 minutes
+            # but the current attempt is happening now, caller should inject this.
+            return matched
+
+        def _extract_pattern_sections(names: list[str]) -> str:
+            """Pull just the matching `## Signature: <name>` sections from the
+            pattern library, so the fix-agent gets only relevant hints."""
+            if not names:
+                return ""
+            library = _load_reference(patterns_path)
+            if not library:
+                return ""
+            # Split on the `## Signature:` boundaries.
+            parts = re.split(r"(?m)^##\s+Signature:\s*", library)
+            sections: list[str] = []
+            for part in parts[1:]:  # parts[0] is the preamble
+                first_line, _, rest = part.partition("\n")
+                name = first_line.strip()
+                if name in names:
+                    sections.append(f"## Signature: {name}\n{rest.rstrip()}")
+            if not sections:
+                return ""
+            return "\n\n---\n\n".join(sections)
+
+        def _prior_attempts_summary() -> str:
+            """Read fix-history.md — a rolling log of prior fix-agent attempts."""
+            if not fix_history_path.exists():
+                return ""
+            try:
+                return fix_history_path.read_text()
+            except OSError:
+                return ""
+
+        def _prior_attempts_diff(since_attempt: int) -> str:
+            """Show what previous fix-agents changed, so this one doesn't repeat."""
+            if since_attempt < 1:
+                return ""
+            try:
+                # Look back a generous number of commits in case fix-agents
+                # made multiple commits per attempt, then filter to those that
+                # touched e2e / .env / api config.
+                r = subprocess.run(
+                    ["git", "log", "--oneline", "-30", "--",
+                     "test/", ".env", "api/src/config/", "site/", "admin/", "customer/"],
+                    capture_output=True, text=True, timeout=10, cwd=str(project_dir))
+                if r.returncode == 0 and r.stdout.strip():
+                    return r.stdout.strip()
+            except Exception:
+                pass
+            return ""
+
+        def _record_attempt(attempt: int, failure: dict, matched: list[str]):
+            """Append a terse line to fix-history.md so the next fix-agent
+            sees prior attempts at a glance."""
+            try:
+                fix_history_path.parent.mkdir(parents=True, exist_ok=True)
+                line = (
+                    f"- attempt {attempt}: service={failure.get('failed_service', '?')} "
+                    f"port={failure.get('failed_port', '?')} "
+                    f"patterns={','.join(matched) or 'none'} "
+                    f"at={datetime.now().isoformat(timespec='seconds')}"
+                )
+                with open(fix_history_path, "a") as f:
+                    f.write(line + "\n")
+            except OSError:
+                pass
+
+        def _build_platform_diag(cap: str, attempt: int) -> str:
+            """Build a focused diagnostic. Instead of dumping every log, this
+            identifies the failing service and attaches only its tail + port
+            binding + matched failure patterns."""
+            import shutil as _sh
+            lines: list[str] = [f"Could not boot `{cap}` runtime.\n", "## Platform diagnostics\n"]
+            lines.append(f"- start-emulator in PATH: {bool(_sh.which('start-emulator'))}")
+            lines.append(f"- emulator in PATH: {bool(_sh.which('emulator'))}")
+            lines.append(f"- adb in PATH: {bool(_sh.which('adb'))}")
+            lines.append(f"- flake.nix exists: {(project_dir / 'flake.nix').exists()}")
+            lines.append(f"- project_dir: {project_dir}")
+            try:
+                adb_result = subprocess.run(
+                    ["adb", "devices"], capture_output=True, text=True, timeout=5)
+                lines.append(f"- adb devices: {adb_result.stdout.strip()}")
+            except Exception as e:
+                lines.append(f"- adb devices: error ({e})")
+            lines.append(f"- _e2e_services_started: {self._platform_manager._e2e_services_started}")
+            lines.append(f"- _booted runtimes: {list(self._platform_manager._runtimes.keys())}")
+
+            setup_log = project_dir / "test" / "e2e" / ".state" / "setup-failure.log"
+            failure = _parse_setup_failure(setup_log)
+
+            if failure.get("error_line"):
+                lines.append(f"\n## Failing step\n\n`{failure['error_line']}`")
+            if failure.get("timed_out"):
+                lines.append("\n*setup.sh was killed by the runner after 300s (timeout).*")
+
+            service_log_tail = ""
+            if failure.get("failed_service"):
+                svc_log = _service_log_for(failure["failed_service"])
+                if svc_log and svc_log.exists():
+                    try:
+                        raw = svc_log.read_text().splitlines()
+                        service_log_tail = "\n".join(raw[-80:])
+                        lines.append(
+                            f"\n## Tail of `{svc_log.relative_to(project_dir)}` "
+                            f"(last 80 lines — this is the service that failed)\n"
+                        )
+                        lines.append("```")
+                        lines.append(service_log_tail)
+                        lines.append("```")
+                        try:
+                            mtime = datetime.fromtimestamp(svc_log.stat().st_mtime)
+                            lines.append(f"\n*log mtime: {mtime.isoformat(timespec='seconds')}"
+                                         f" — if this is stale vs. now, a prior broken process "
+                                         f"may still be running (see stale-process pattern).*")
+                        except OSError:
+                            pass
+                    except OSError:
+                        pass
+
+            if failure.get("failed_port"):
+                binding = _port_binding(failure["failed_port"])
+                lines.append(
+                    f"\n## Port binding for {failure['failed_port']}\n\n"
+                    f"```\n{binding}\n```"
+                )
+
+            matched = _match_patterns(failure, service_log_tail)
+            pattern_section = _extract_pattern_sections(matched)
+            if pattern_section:
+                lines.append(
+                    f"\n## Matching failure patterns\n\n"
+                    f"The runner's pattern library matched **{', '.join(matched)}**. "
+                    f"Use the guidance below before exploring other hypotheses.\n"
+                )
+                lines.append(pattern_section)
+
+            prior = _prior_attempts_summary()
+            if prior:
+                lines.append("\n## Prior fix-agent attempts for this boot\n")
+                lines.append("```")
+                lines.append(prior.rstrip())
+                lines.append("```")
+
+            prior_diff = _prior_attempts_diff(attempt)
+            if prior_diff:
+                lines.append("\n## Recent git commits touching E2E-relevant paths\n")
+                lines.append("```")
+                lines.append(prior_diff)
+                lines.append("```")
+                lines.append(
+                    "\n*If one of the commits above matches what you were about to try, "
+                    "pick a different approach — it already failed.*"
+                )
+
+            # Always include the raw tail of setup-failure.log as a last resort,
+            # but shorter now that we've already extracted the salient parts.
+            if failure.get("full_text"):
+                lines.append("\n## Raw setup-failure.log (last 1500 chars — context only)\n")
+                lines.append("```")
+                lines.append(failure["full_text"][-1500:])
+                lines.append("```")
+
+            # Stash for the caller so _record_attempt can use the same parse.
+            self._last_platform_failure = {"failure": failure, "matched": matched}
+            return "\n".join(lines)
+
+        _PLATFORM_FIX_PLAYBOOK = _load_reference(playbook_path)
+
+        def _build_platform_fix_prompt(cap: str, attempt: int, diag: str) -> str:
+            playbook_section = ""
+            if _PLATFORM_FIX_PLAYBOOK:
+                playbook_section = (
+                    "\n## Fix-agent playbook (general debugging heuristics)\n\n"
+                    "These apply to every fix-agent. Read them before diving in.\n\n"
+                    + _PLATFORM_FIX_PLAYBOOK
+                )
+            return f"""You are fixing a platform runtime initialization failure for task {task.id}.
+
+The runner tried to boot the `{cap}` platform runtime so it could run an E2E
+test loop, but the boot failed. This is attempt **{attempt}/{PLATFORM_INIT_MAX_ATTEMPTS}**.
+If you don't fix it, the runner will spawn another fix-agent with updated
+diagnostics. After {PLATFORM_INIT_MAX_ATTEMPTS} failed attempts, the runner
+writes BLOCKED.md and stops.
+
+## What "boot the runtime" means
+
+- `mcp-browser`: the runner runs `test/e2e/setup.sh` to start backend services
+  (Postgres, SuperTokens, API, Astro, etc.). Chromium is bundled with the MCP
+  server — no separate browser boot. A `mcp-browser` failure almost always
+  means `test/e2e/setup.sh` failed or timed out (cap 300s).
+- `mcp-android`: runs `test/e2e/setup.sh`, then boots the Android emulator
+  via `start-emulator` / `emulator -list-avds`.
+- `mcp-ios`: uses `xcrun simctl`.
+
+{diag}
+{playbook_section}
+
+## Your job
+
+1. **Read the diagnostics above first.** The runner has already identified
+   the failing service, attached its log tail, shown the port binding, and
+   matched the failure against known patterns. Use that — don't re-explore
+   the repo from scratch.
+2. If a pattern matched, its "Fix options" section lists ranked preferences.
+   Start there.
+3. Form a hypothesis, apply the smallest fix that addresses it, then
+   **verify by reproducing from a clean state** (kill stale processes,
+   remove `.dev/e2e-state/*.pid`, re-run `bash test/e2e/setup.sh`, confirm
+   exit 0). Verification is required — "exit 0 from the guarded happy path"
+   is not the same as a real fix.
+4. On your final message, follow the "Finishing" section of the playbook
+   (root cause / fix / verification / residual risk).
+
+## Constraints
+
+- Do NOT write `BLOCKED.md`, `DEFER-*.md`, or any "skip this" file. The
+  runner decides when to give up.
+- Do NOT disable tests, mark them `.skip`, or add long sleeps to mask races.
+- Do NOT modify `specs/` or mark tasks complete.
+- Do NOT expand scope — if the bug is in setup.sh, fix setup.sh and stop.
+- If a fix requires a real user secret (e.g. a real Stripe live key),
+  prefer a test-mode default or an E2E-optional config path. Only if
+  that's impossible, document it clearly in your final message.
+
+Succeed = exit 0 from a cold re-run of setup.sh (or the relevant boot step).
+"""
+
         mcp_config_paths = []
+        platform_init_failed = False
         for cap in mcp_caps:
-            runtime = self._platform_manager.ensure_runtime(cap, project_dir)
-            if not runtime:
-                # Gather diagnostic info for the BLOCKED message
-                diag_lines = [f"# BLOCKED: {task.id} — Platform runtime initialization failed\n"]
-                diag_lines.append(f"Could not boot {cap} runtime.\n")
-                import shutil as _sh
-                diag_lines.append(f"## Diagnostics\n")
-                diag_lines.append(f"- start-emulator in PATH: {bool(_sh.which('start-emulator'))}")
-                diag_lines.append(f"- emulator in PATH: {bool(_sh.which('emulator'))}")
-                diag_lines.append(f"- adb in PATH: {bool(_sh.which('adb'))}")
-                diag_lines.append(f"- flake.nix exists: {(project_dir / 'flake.nix').exists()}")
-                diag_lines.append(f"- project_dir: {project_dir}")
+            attempt = 0
+            runtime = None
+            last_diag = ""
+            while attempt < PLATFORM_INIT_MAX_ATTEMPTS:
+                if self._shutdown.is_set() or self._draining.is_set():
+                    e2e_log("Shutdown/drain requested during platform init — aborting retry loop")
+                    platform_init_failed = True
+                    break
+                attempt += 1
+                e2e_log(f"Platform runtime init for {cap}: attempt {attempt}/{PLATFORM_INIT_MAX_ATTEMPTS}")
+                runtime = self._platform_manager.ensure_runtime(cap, project_dir)
+                if runtime:
+                    e2e_log(f"Platform runtime {cap} initialized on attempt {attempt}")
+                    break
+
+                last_diag = _build_platform_diag(cap, attempt)
+                e2e_log(f"Failed to initialize platform runtime for {cap} (attempt {attempt}/{PLATFORM_INIT_MAX_ATTEMPTS})")
+                e2e_log(last_diag)
+                # Persist a terse line to fix-history.md for the next fix-agent.
+                parsed = getattr(self, "_last_platform_failure", {}) or {}
+                _record_attempt(attempt, parsed.get("failure", {}), parsed.get("matched", []))
+                self._write_event(
+                    "platform_init_fail", spec_dir,
+                    task_id=task.id, capability=cap, attempt=attempt,
+                    failed_service=(parsed.get("failure") or {}).get("failed_service"),
+                    failed_port=(parsed.get("failure") or {}).get("failed_port"),
+                    patterns=parsed.get("matched") or [],
+                )
+
+                if attempt >= PLATFORM_INIT_MAX_ATTEMPTS:
+                    break
+
+                # Spawn a fix agent to diagnose and repair the runtime boot.
+                fix_task = Task(
+                    id=f"{task.id}-platform-fix-{attempt}",
+                    description=f"Fix platform runtime init failure for {cap} (attempt {attempt})",
+                    phase=task.phase, parallel=False,
+                    status=TaskStatus.RUNNING, line_num=0,
+                    capabilities=task.capabilities,
+                )
+                fix_prompt = _build_platform_fix_prompt(cap, attempt, last_diag)
+                self._write_event(
+                    "platform_fix_spawn", spec_dir,
+                    task_id=task.id, capability=cap, attempt=attempt,
+                )
                 try:
-                    adb_result = subprocess.run(
-                        ["adb", "devices"], capture_output=True, text=True, timeout=5)
-                    diag_lines.append(f"- adb devices: {adb_result.stdout.strip()}")
-                except Exception as e:
-                    diag_lines.append(f"- adb devices: error ({e})")
-                diag_lines.append(f"- _e2e_services_started: {self._platform_manager._e2e_services_started}")
-                diag_lines.append(f"- _booted runtimes: {list(self._platform_manager._runtimes.keys())}")
-                diag_msg = "\n".join(diag_lines)
-                e2e_log(f"Failed to initialize platform runtime for {cap}")
-                e2e_log(diag_msg)
+                    _wait_for_subagent(
+                        fix_task, fix_prompt,
+                        f"Platform fix agent ({cap}, attempt {attempt})",
+                        caps=task.capabilities,
+                    )
+                except AgentAuthError:
+                    # Auth errors are fatal — let the outer handler surface them.
+                    raise
+                except Exception as exc:
+                    e2e_log(f"Platform fix agent raised {exc!r} — continuing retry loop")
+
+            if not runtime:
+                platform_init_failed = True
+                diag_msg = (
+                    f"# BLOCKED: {task.id} — Platform runtime initialization failed\n\n"
+                    f"Gave up after {PLATFORM_INIT_MAX_ATTEMPTS} fix attempts.\n\n"
+                    + last_diag
+                )
+                e2e_log(f"Platform runtime {cap} still failing after {PLATFORM_INIT_MAX_ATTEMPTS} attempts — writing BLOCKED.md")
                 self.blocked_file.write_text(diag_msg + "\n")
-                return
+                break
+
             paths = self._platform_manager.get_mcp_config_paths({cap})
             mcp_config_paths.extend(paths)
+
+        if platform_init_failed:
+            return
 
         e2e_log(f"Platform runtimes initialized: {', '.join(c.replace('mcp-', '') for c in mcp_caps)}")
 
@@ -7501,7 +7909,8 @@ The crash log is also saved at `{crash_log_file}`.
                 e2e_log(f"DEBUG: task_block length={len(task_block)}")
                 explore_prompt = self._build_e2e_explore_prompt(
                     spec_dir, findings_file, ui_flow_content, spec_content,
-                    iteration, e2e_dir, task, task_block
+                    iteration, e2e_dir, task, task_block,
+                    mcp_caps=mcp_caps,
                 )
                 e2e_log(f"DEBUG: prompt built, length={len(explore_prompt)}")
             except Exception as exc:
@@ -8314,7 +8723,8 @@ This is build-fix attempt {attempt} of {BUILD_FIX_MAX_ATTEMPTS}.
                                    ui_flow: str, spec_content: str,
                                    iteration: int, e2e_dir: Path,
                                    parent_task: "Task | None" = None,
-                                   task_block: str = "") -> str:
+                                   task_block: str = "",
+                                   mcp_caps: set[str] | None = None) -> str:
         """Build the prompt for the E2E explore agent.
 
         When parent_task and task_block are provided, the agent is scoped to
@@ -8355,6 +8765,153 @@ Validate every element, flow, and error path described in the task above. When t
         else:
             mission = """Explore the running app systematically, comparing actual behavior against the specification. Find bugs in this run. Do not stop after finding one bug — keep exploring every screen, every flow, every edge case."""
 
+        # ── Capability-specific tool + screenshot guidance ──
+        # The MCP tools available to this agent depend on which platform
+        # runtime is booted. Historically this prompt hardcoded Android;
+        # browser/iOS tasks got no tool docs at all and fell back to curl.
+        caps = mcp_caps or set()
+        primary_cap = None
+        for c in ("mcp-browser", "mcp-android", "mcp-ios"):
+            if c in caps:
+                primary_cap = c
+                break
+
+        if primary_cap == "mcp-browser":
+            tools_section = f"""## Available MCP tools
+
+You have `mcp-browser` (Playwright). Tools are namespaced as
+`mcp__mcp-browser__<name>`. Call them directly — do NOT use ToolSearch
+to discover them.
+
+Common tools (the exact menu depends on server version — the runtime
+expose function schemas; read those, don't guess):
+
+- **browser_navigate** — go to a URL. `{{"url": "http://127.0.0.1:4321/kanix/"}}`.
+- **browser_snapshot** — return the accessibility tree of the current
+  page. **Prefer this over screenshots** — it's cheaper, and it gives
+  you the exact `ref` IDs you need for click/type.
+- **browser_click** — click an element by `ref` from the snapshot.
+- **browser_type** — type into an input (also by `ref`).
+- **browser_fill_form** — fill multiple fields at once (cheaper than
+  one `browser_type` per field).
+- **browser_take_screenshot** — PNG snapshot. Use sparingly; screenshots
+  are expensive in context.
+- **browser_wait_for** — wait for text/selector. Prefer this over sleeps.
+- **browser_evaluate** — run JS in the page. Use for reading computed
+  state that isn't in the accessibility tree.
+- **browser_network_requests** / **browser_console_messages** — capture
+  requests or console output when debugging.
+
+**Do NOT call `browser_install`.** The browser is pre-provisioned by
+Nix (`mcp-browser` wrapper points at Nix's chromium via
+`--executable-path`). `browser_install` triggers a Google-Chrome
+download that hangs forever inside the agent sandbox. If a tool error
+claims the browser is missing, that's a configuration bug — file it as
+a finding and stop; do NOT try to "fix" it by downloading.
+
+## Do NOT use curl / wget / fetch as a substitute
+
+The whole point of an E2E run is to exercise the app through a real
+browser: JS executes, cookies persist across requests, Astro's client
+islands hydrate, SuperTokens sets session headers, Stripe loads in an
+iframe, etc.
+
+- `curl`, `wget`, `http`, `fetch`, `node -e "fetch(...)"` and similar
+  **do not count as E2E validation** and must not be used to exercise
+  the app. If you catch yourself reaching for curl, switch to the
+  browser tools.
+- The **only** legitimate curl uses during an E2E run are: checking
+  that a backend service is up (`curl -sf http://127.0.0.1:3000/health`)
+  or reading a raw API response for cross-checking what the UI
+  displayed. Never as a replacement for a navigation flow.
+- If the browser tools aren't working, record that as a finding and
+  stop — do not fall back to curl to claim you validated the flow.
+
+## Saving screenshots to disk
+
+When you need a screenshot (use sparingly), call `browser_take_screenshot`
+with a full path in the `filename` parameter so it lands on disk — the
+runner verifies screenshot files exist as proof of live MCP interaction.
+
+```
+browser_take_screenshot {{
+  "filename": "{e2e_dir}/screenshots/T096-cart.png",
+  "fullPage": true
+}}
+```
+
+Use descriptive names like `T096-home`, `T096-cart`, `T096-checkout-error`.
+Reference the path in `findings.json` as `screenshot_path`.
+"""
+            screenshot_section = ""  # folded into tools_section above
+        elif primary_cap == "mcp-android":
+            tools_section = f"""## Available MCP tools
+
+Tools are namespaced as `mcp__mcp-android__<name>`. Call them directly — do NOT use ToolSearch to discover them.
+
+- **mcp__mcp-android__State-Tool**: Get device state. Pass `{{"use_vision": true}}` to include a screenshot image (**prefer this — cheaper than hierarchy dumps**). Without `use_vision`, returns the UI element tree as text.
+- **mcp__mcp-android__Click-Tool**: Tap at coordinates `{{"x": 540, "y": 1200}}`
+- **mcp__mcp-android__Long-Click-Tool**: Long-press at coordinates `{{"x": 540, "y": 1200}}`
+- **mcp__mcp-android__Swipe-Tool**: Swipe from one point to another `{{"x1": 540, "y1": 1600, "x2": 540, "y2": 400}}` (for scrolling)
+- **mcp__mcp-android__Type-Tool**: Type text at coordinates `{{"text": "hello", "x": 540, "y": 600, "clear": true}}` (set `clear: true` to replace existing text)
+- **mcp__mcp-android__Drag-Tool**: Drag and drop `{{"x1": 100, "y1": 200, "x2": 300, "y2": 400}}`
+- **mcp__mcp-android__Press-Tool**: Press a button `{{"button": "back"}}` (also: "home", "enter", "recent")
+- **mcp__mcp-android__Notification-Tool**: Open the notification shade (no parameters)
+- **mcp__mcp-android__Wait-Tool**: Pause for N **seconds** `{{"duration": 2}}` — NEVER pass more than 5
+
+## Do NOT use curl / adb shell am start as a substitute
+
+E2E validation means driving the *UI* — not hitting the app's internal
+APIs or launching intents from shell. `curl`, `adb shell am start`,
+and direct HTTP calls to the app's backend do not prove the user
+experience works. Use the MCP tools above for every interaction.
+
+The only legitimate non-MCP uses are:
+
+- `adb shell screencap` / `adb pull` for saving screenshots (see below).
+- `curl http://127.0.0.1:<port>/health` for verifying a backend service
+  is up before you start driving the UI.
+- Reading logs via `adb logcat` for debugging a finding.
+"""
+            screenshot_section = f"""## CRITICAL: Saving screenshots to disk
+
+The MCP State-Tool returns screenshots as inline images in the conversation — they are NOT saved to disk. You MUST save screenshots to disk yourself using `adb screencap`, because the runner verifies that screenshot files exist on disk as proof of live MCP interaction.
+
+**Every time you take a screenshot with State-Tool, ALSO save it to disk:**
+```bash
+mkdir -p {e2e_dir}/screenshots/ && adb shell screencap -p /sdcard/nk_screen.png && adb pull /sdcard/nk_screen.png {e2e_dir}/screenshots/<name>.png
+```
+
+Use a descriptive `<name>` like `T302-auth-screen`, `T302-error-invalid-key`, `T302-connected`. Then reference that path in findings.json `screenshot_path` field.
+
+Do this at least once per screen you validate and once per bug you find. Without screenshots on disk, the runner will reject your work.
+"""
+        elif primary_cap == "mcp-ios":
+            tools_section = """## Available MCP tools
+
+You have `mcp-ios` (via `xcrun simctl` / XCTest bridge). Tools are
+namespaced as `mcp__mcp-ios__<name>`. Call them directly — do NOT use
+ToolSearch to discover them. Read the function schemas to see the exact
+tool menu your runtime exposes.
+
+## Do NOT use curl or shell commands as a substitute
+
+E2E validation means driving the *UI* through simulator input. `curl`,
+direct HTTP calls, and shell intents do not prove the user experience
+works. Use the MCP tools for every interaction.
+"""
+            screenshot_section = ""
+        else:
+            # Unknown / no capability — keep prompt usable but weak.
+            tools_section = """## Available MCP tools
+
+No platform-specific MCP capability was declared for this task. Read
+the function schemas to see what tools are exposed. Do NOT fall back to
+curl/wget/fetch to drive the app — if no UI-driving tools are available
+stop and file a finding.
+"""
+            screenshot_section = ""
+
         # ── Include verification rejection from prior attempt ──
         rejection_context = ""
         if parent_task:
@@ -8385,53 +8942,28 @@ A previous agent completed this task, but the independent verifier rejected it. 
 
 You are running inside a context window with limited capacity. Accumulating too many screenshots will crash you mid-session. Follow these rules strictly:
 
-1. **Prefer Screenshot over DumpHierarchy** — screenshots are a single image and use far less context than XML hierarchy dumps (which can be 20-50k tokens each). Use DumpHierarchy only when you need exact resource IDs, content descriptions, or accessibility attributes that aren't visible in the screenshot.
-2. **Maximum 20 screenshots per session** — count them. After each State-Tool screenshot, save it to disk via `adb shell screencap -p /sdcard/nk_screen.png && adb pull /sdcard/nk_screen.png {e2e_dir}/screenshots/<name>.png` and reference that path in findings. Don't re-read screenshots you've already analyzed.
-3. **Avoid DumpHierarchy unless necessary** — if you can determine element positions and text from the screenshot, do so. Only dump the hierarchy when you need precise selectors or accessibility info.
+1. **Prefer structured state (snapshot/hierarchy) over screenshots** for decisions — screenshots are useful for human review and bug evidence, not for tree traversal. For browser MCP, `browser_snapshot` is the cheap path; for Android MCP, prefer a no-vision `State-Tool` call and only add `use_vision` when you need to *see* something.
+2. **Maximum 20 screenshots per session** — count them. Always save screenshots to disk (see your platform's section below) and reference paths in findings rather than re-reading images.
+3. **Don't re-read screenshots you've already analyzed.**
 4. **Write findings incrementally** — update `{findings_file}` after each screen/flow you complete, not just at the end. If you crash, the next agent can pick up from your partial findings.
-5. **Write a progress checkpoint** — after completing each screen or flow, append a line to `{e2e_dir}/progress.md` noting what you covered (e.g., "Settings screen: validated all sections, dropdowns, OTEL field"). The next iteration reads this to skip already-validated areas.
-6. **If you're running low on context** (you've taken 10+ screenshots or made 100+ tool calls), write your current findings and progress immediately, then stop gracefully.
+5. **Write a progress checkpoint** — after completing each screen or flow, append a line to `{e2e_dir}/progress.md` noting what you covered (e.g., "Cart screen: validated add/remove, coupon errors"). The next iteration reads this to skip already-validated areas.
+6. **If you're running low on context** (10+ screenshots or 100+ tool calls), write your current findings and progress immediately, then stop gracefully.
 
-## Available MCP tools
-
-Tools are namespaced as `mcp__mcp-android__<name>`. Call them directly — do NOT use ToolSearch to discover them.
-
-- **mcp__mcp-android__State-Tool**: Get device state. Pass `{{"use_vision": true}}` to include a screenshot image (**prefer this — cheaper than hierarchy dumps**). Without `use_vision`, returns the UI element tree as text.
-- **mcp__mcp-android__Click-Tool**: Tap at coordinates `{{"x": 540, "y": 1200}}`
-- **mcp__mcp-android__Long-Click-Tool**: Long-press at coordinates `{{"x": 540, "y": 1200}}`
-- **mcp__mcp-android__Swipe-Tool**: Swipe from one point to another `{{"x1": 540, "y1": 1600, "x2": 540, "y2": 400}}` (for scrolling)
-- **mcp__mcp-android__Type-Tool**: Type text at coordinates `{{"text": "hello", "x": 540, "y": 600, "clear": true}}` (set `clear: true` to replace existing text)
-- **mcp__mcp-android__Drag-Tool**: Drag and drop `{{"x1": 100, "y1": 200, "x2": 300, "y2": 400}}`
-- **mcp__mcp-android__Press-Tool**: Press a button `{{"button": "back"}}` (also: "home", "enter", "recent")
-- **mcp__mcp-android__Notification-Tool**: Open the notification shade (no parameters)
-- **mcp__mcp-android__Wait-Tool**: Pause for N **seconds** `{{"duration": 2}}` — NEVER pass more than 5
-
-## CRITICAL: Saving screenshots to disk
-
-The MCP State-Tool returns screenshots as inline images in the conversation — they are NOT saved to disk. You MUST save screenshots to disk yourself using `adb screencap`, because the runner verifies that screenshot files exist on disk as proof of live MCP interaction.
-
-**Every time you take a screenshot with State-Tool, ALSO save it to disk:**
-```bash
-mkdir -p {e2e_dir}/screenshots/ && adb shell screencap -p /sdcard/nk_screen.png && adb pull /sdcard/nk_screen.png {e2e_dir}/screenshots/<name>.png
-```
-
-Use a descriptive `<name>` like `T302-auth-screen`, `T302-error-invalid-key`, `T302-connected`. Then reference that path in findings.json `screenshot_path` field.
-
-Do this at least once per screen you validate and once per bug you find. Without screenshots on disk, the runner will reject your work.
-
+{tools_section}
+{screenshot_section}
 ## How to explore
 
 1. **Check progress first** — read `{e2e_dir}/progress.md` if it exists. Skip screens/flows already marked as validated.
-2. Launch the app (if not already running)
-3. **Take a screenshot first** to understand the current screen, then use DumpHierarchy only if you need precise selectors or accessibility attributes. **Save it to disk** using the `adb screencap` method above.
-4. Compare what you see against the UI_FLOW.md specification below
-5. Try both happy paths AND error paths for each flow
+2. Open the app using the platform's MCP tools (for browser: `browser_navigate` to the appropriate URL from the backend env; for Android: launch via `adb shell am start` or the intent helper).
+3. **Inspect the current screen** using the cheapest structured tool available (`browser_snapshot` for web, `State-Tool` without vision for Android). Only take a screenshot when you need visual evidence or when the structured state is insufficient.
+4. Compare what you see against the UI_FLOW.md specification below.
+5. Try both happy paths AND error paths for each flow.
 6. When you find a bug, document it with:
-   - Steps to reproduce
+   - Steps to reproduce (exact tool calls and inputs)
    - Expected vs actual behavior
-   - Screenshot path (**saved to disk** via `adb screencap` to `{e2e_dir}/screenshots/`)
-7. **Update findings and progress files after each screen**
-8. Navigate to the next screen/flow and repeat
+   - Screenshot path under `{e2e_dir}/screenshots/`
+7. **Update findings and progress files after each screen.**
+8. Navigate to the next screen/flow and repeat.
 9. **NEVER run interactive or long-lived commands** via Bash (e.g. `nix-key pair`, `nix-key daemon`, servers, watchers). These hang forever and block the entire session. Always set `"timeout": 10000` (10s) on any Bash call. If you need to test a CLI command, use a non-interactive flag or just verify the binary exists.
 
 ## Flows to test (from UI_FLOW.md)
@@ -8516,7 +9048,8 @@ Write your findings to `{findings_file}` as JSON:
 ## Rules
 
 - {'Focus on the screens/flows specified in your task above' if parent_task else f'Explore EVERY screen and flow not already covered in `{e2e_dir}/progress.md`'}
-- **Use Screenshot as primary inspection tool** — only DumpHierarchy when you need exact selectors or accessibility attributes
+- **Inspect with the cheapest structured tool first** — accessibility snapshot / no-vision state-tool; reserve screenshots for visual-only checks or bug evidence
+- **Drive the app via MCP tools only** — never use `curl`, `wget`, `fetch`, or direct HTTP calls as a substitute for a real click/navigate. See the "Do NOT use curl" section above
 - Test error paths: invalid inputs, back navigation, interruptions
 - Test state persistence: navigate away and back
 - Do NOT fix bugs — only document them
