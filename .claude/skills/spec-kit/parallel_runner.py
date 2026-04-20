@@ -3186,6 +3186,368 @@ _MCP_CAPABILITIES = {"mcp-android", "mcp-browser", "mcp-ios"}
 _AUTO_GRANTABLE_CAPS |= _MCP_CAPABILITIES
 
 
+# ── Platform drivers ───────────────────────────────────────────────────
+#
+# A PlatformDriver encapsulates everything the runner needs to know about
+# a given MCP capability that ISN'T lifecycle (boot/teardown lives on
+# PlatformRuntime).  The split: PlatformRuntime runs processes,
+# PlatformDriver answers questions about *evidence* and *prompt content*.
+#
+# This is the registry the validator and prompt builder consult so that
+# adding iOS (or any new platform) is a single class + one registry line,
+# not a scavenger hunt through if/elif chains.
+
+
+class PlatformDriver:
+    """Per-capability knowledge used by the validator and prompt builder.
+
+    Subclasses must set `capability` and `tool_prefix`, and should override
+    `interactive_tools`, `tools_prompt_section`, and `screenshot_prompt_section`.
+    The base class's `has_live_evidence` works for any driver whose
+    `interactive_tools` list is populated — override only for unusual cases.
+    """
+
+    capability: str = ""
+    tool_prefix: str = ""          # e.g. "mcp__mcp-android__"
+    interactive_tools: tuple[str, ...] = ()  # unqualified names that count as live interaction
+
+    def mcp_tool_calls_in_log(self, log_text: str) -> int:
+        """Count interactive MCP tool calls for this platform in an agent log."""
+        if not self.tool_prefix:
+            return 0
+        if not self.interactive_tools:
+            # Fall back to any tool call with the platform prefix.
+            return log_text.count(f'"name":"{self.tool_prefix}')
+        total = 0
+        for name in self.interactive_tools:
+            total += log_text.count(f'"{self.tool_prefix}{name}"')
+        return total
+
+    def has_live_evidence(self, findings: dict, log_path: Optional[Path]) -> int:
+        """Count live-evidence signals across findings + agent log.
+
+        Returns the number of live-evidence signals (0 means blocked).
+        """
+        all_entries = (findings.get("findings") or []) + (findings.get("validations") or [])
+        score = 0
+        for f in all_entries:
+            if f.get("screenshot_path") or f.get("screenshot"):
+                score += 1
+                continue
+            shots = f.get("screenshots")
+            if isinstance(shots, list) and shots:
+                score += 1
+                continue
+            if "live" in (f.get("verification") or "").lower():
+                score += 1
+                continue
+            if "live" in (f.get("result") or "").lower():
+                score += 1
+        if score == 0 and log_path and log_path.exists():
+            try:
+                score = self.mcp_tool_calls_in_log(log_path.read_text())
+            except OSError:
+                pass
+        return score
+
+    def read_mcp_init_status(self, log_path: Path) -> Optional[str]:
+        """Return the MCP server status ('connected', 'failed', ...) for this
+        driver's capability as reported in the agent's init record, or None
+        if the log or record is unavailable.
+        """
+        if not log_path.exists():
+            return None
+        try:
+            with log_path.open() as fh:
+                first_line = fh.readline()
+            init = json.loads(first_line)
+        except (OSError, json.JSONDecodeError):
+            return None
+        for s in init.get("mcp_servers", []) or []:
+            if s.get("name") == self.capability:
+                return s.get("status")
+        return None
+
+    def tools_prompt_section(self, e2e_dir: Path) -> str:
+        """Return the `## Available MCP tools` section for agent prompts."""
+        return ""
+
+    def screenshot_prompt_section(self, e2e_dir: Path) -> str:
+        """Return the `## Saving screenshots` section for agent prompts (may be empty)."""
+        return ""
+
+    # ── Verify-agent prompt parts ────────────────────────────────────
+    # These slot into _build_e2e_verify_prompt so adding iOS doesn't
+    # require editing that builder.
+    def verify_tools_section(self, e2e_dir: Path) -> str:
+        """Terser tool-list for the verify agent (explore prompt has the full version)."""
+        # Default: reuse tools_prompt_section. Subclasses can override
+        # for a shorter restatement if desired.
+        return self.tools_prompt_section(e2e_dir)
+
+    def verify_screenshot_save_hint(self, e2e_dir: Path) -> str:
+        """One-line 'how to save a screenshot on this platform' hint for the verify agent."""
+        return ""
+
+    def verify_evidence_observed_hint(self) -> str:
+        """Platform-specific description for the `## Observed state` section of the evidence file."""
+        return ("[Snapshot / hierarchy / accessibility-tree excerpt showing the relevant UI "
+                "element(s). Paste the exact output — do not summarize or paraphrase it.]")
+
+    # ── Fix-agent prompt parts ───────────────────────────────────────
+    def fix_regression_test_hint(self) -> str:
+        """Platform-specific hint about what makes a regression test 'behavioral'."""
+        return (
+            "**Regression test quality**: If the task says to write regression tests, they MUST "
+            "be behavioral — test state transitions, side effects, and data flows, NOT just that "
+            "text renders on screen. Call real functions with real inputs and assert real state."
+        )
+
+
+class AndroidDriver(PlatformDriver):
+    capability = "mcp-android"
+    tool_prefix = "mcp__mcp-android__"
+    interactive_tools = (
+        "State-Tool", "Click-Tool", "Long-Click-Tool", "Swipe-Tool",
+        "Type-Tool", "Drag-Tool", "Press-Tool", "Notification-Tool",
+    )
+
+    def tools_prompt_section(self, e2e_dir: Path) -> str:
+        return """## Available MCP tools
+
+Tools are namespaced as `mcp__mcp-android__<name>`. Call them directly — do NOT use ToolSearch to discover them.
+
+- **mcp__mcp-android__State-Tool**: Get device state. Pass `{"use_vision": true}` to include a screenshot image (**prefer this — cheaper than hierarchy dumps**). Without `use_vision`, returns the UI element tree as text.
+- **mcp__mcp-android__Click-Tool**: Tap at coordinates `{"x": 540, "y": 1200}`
+- **mcp__mcp-android__Long-Click-Tool**: Long-press at coordinates `{"x": 540, "y": 1200}`
+- **mcp__mcp-android__Swipe-Tool**: Swipe from one point to another `{"x1": 540, "y1": 1600, "x2": 540, "y2": 400}` (for scrolling)
+- **mcp__mcp-android__Type-Tool**: Type text at coordinates `{"text": "hello", "x": 540, "y": 600, "clear": true}` (set `clear: true` to replace existing text)
+- **mcp__mcp-android__Drag-Tool**: Drag and drop `{"x1": 100, "y1": 200, "x2": 300, "y2": 400}`
+- **mcp__mcp-android__Press-Tool**: Press a button `{"button": "back"}` (also: "home", "enter", "recent")
+- **mcp__mcp-android__Notification-Tool**: Open the notification shade (no parameters)
+- **mcp__mcp-android__Wait-Tool**: Pause for N **seconds** `{"duration": 2}` — NEVER pass more than 5
+
+## Do NOT use curl / adb shell am start as a substitute
+
+E2E validation means driving the *UI* — not hitting the app's internal
+APIs or launching intents from shell. `curl`, `adb shell am start`,
+and direct HTTP calls to the app's backend do not prove the user
+experience works. Use the MCP tools above for every interaction.
+
+The only legitimate non-MCP uses are:
+
+- `adb shell screencap` / `adb pull` for saving screenshots (see below).
+- `curl http://127.0.0.1:<port>/health` for verifying a backend service
+  is up before you start driving the UI.
+- Reading logs via `adb logcat` for debugging a finding.
+"""
+
+    def screenshot_prompt_section(self, e2e_dir: Path) -> str:
+        return f"""## CRITICAL: Saving screenshots to disk
+
+The MCP State-Tool returns screenshots as inline images in the conversation — they are NOT saved to disk. You MUST save screenshots to disk yourself using `adb screencap`, because the runner verifies that screenshot files exist on disk as proof of live MCP interaction.
+
+**Every time you take a screenshot with State-Tool, ALSO save it to disk:**
+```bash
+mkdir -p {e2e_dir}/screenshots/ && adb shell screencap -p /sdcard/nk_screen.png && adb pull /sdcard/nk_screen.png {e2e_dir}/screenshots/<name>.png
+```
+
+Use a descriptive `<name>` like `T302-auth-screen`, `T302-error-invalid-key`, `T302-connected`. Then reference that path in findings.json `screenshot_path` field.
+
+Do this at least once per screen you validate and once per bug you find. Without screenshots on disk, the runner will reject your work.
+"""
+
+    def verify_tools_section(self, e2e_dir: Path) -> str:
+        return """## Available MCP tools
+
+Same MCP tools as the explore agent (call directly, no ToolSearch needed):
+`State-Tool`, `Click-Tool`, `Long-Click-Tool`, `Swipe-Tool`, `Type-Tool`, `Drag-Tool`, `Press-Tool`, `Notification-Tool`, `Wait-Tool` (duration in **seconds**, max 5).
+All namespaced as `mcp__mcp-android__<name>`.
+
+**Prefer `State-Tool` (no vision) over State-Tool with `use_vision=true`** to conserve context — only add vision when you genuinely need to *see* the screen.
+"""
+
+    def verify_screenshot_save_hint(self, e2e_dir: Path) -> str:
+        return (f"Save screenshots to disk via `adb shell screencap -p /sdcard/nk_screen.png && "
+                f"adb pull /sdcard/nk_screen.png {e2e_dir}/screenshots/<name>.png` — one per bug "
+                f"max. The State-Tool shows you the screen inline but does NOT save to disk.")
+
+    def verify_evidence_observed_hint(self) -> str:
+        return ("[Raw DumpHierarchy XML snippet showing the relevant UI element(s). "
+                "Copy the EXACT XML — do not summarize or paraphrase it. "
+                "Include attribute values: class, text, content-desc, checkable, clickable, etc.]")
+
+    def fix_regression_test_hint(self) -> str:
+        return (
+            "**Regression test quality**: Regression tests MUST be behavioral — test state "
+            "transitions, side effects, and data flows, NOT just that text renders on screen. "
+            "A test that mocks a ViewModel with a pre-set error string and asserts the string "
+            "is displayed tests nothing useful. Instead: call the real validation function with "
+            "invalid input and assert it returns false/throws. Call a ViewModel method and assert "
+            "the state changes correctly. Use real Android context (InstrumentationRegistry) for "
+            "persistence tests. See the task's \"Done when\" for specific behavioral assertions."
+        )
+
+
+class BrowserDriver(PlatformDriver):
+    capability = "mcp-browser"
+    tool_prefix = "mcp__mcp-browser__"
+    # Interactive tools — snapshot counts because the prompt explicitly
+    # tells agents to prefer it over screenshots for context efficiency.
+    interactive_tools = (
+        "browser_navigate", "browser_navigate_back", "browser_click",
+        "browser_type", "browser_fill_form", "browser_snapshot",
+        "browser_take_screenshot", "browser_press_key", "browser_hover",
+        "browser_select_option", "browser_drag", "browser_evaluate",
+        "browser_wait_for", "browser_file_upload", "browser_handle_dialog",
+    )
+
+    def tools_prompt_section(self, e2e_dir: Path) -> str:
+        return f"""## Available MCP tools
+
+You have `mcp-browser` (Playwright). Tools are namespaced as
+`mcp__mcp-browser__<name>`. Call them directly — do NOT use ToolSearch
+to discover them.
+
+Common tools (the exact menu depends on server version — the runtime
+expose function schemas; read those, don't guess):
+
+- **browser_navigate** — go to a URL. `{{"url": "http://127.0.0.1:4321/kanix/"}}`.
+- **browser_snapshot** — return the accessibility tree of the current
+  page. **Prefer this over screenshots** — it's cheaper, and it gives
+  you the exact `ref` IDs you need for click/type.
+- **browser_click** — click an element by `ref` from the snapshot.
+- **browser_type** — type into an input (also by `ref`).
+- **browser_fill_form** — fill multiple fields at once (cheaper than
+  one `browser_type` per field).
+- **browser_take_screenshot** — PNG snapshot. Use sparingly; screenshots
+  are expensive in context.
+- **browser_wait_for** — wait for text/selector. Prefer this over sleeps.
+- **browser_evaluate** — run JS in the page. Use for reading computed
+  state that isn't in the accessibility tree.
+- **browser_network_requests** / **browser_console_messages** — capture
+  requests or console output when debugging.
+
+**Do NOT call `browser_install`.** The browser is pre-provisioned by
+Nix (`mcp-browser` wrapper points at Nix's chromium via
+`--executable-path`). `browser_install` triggers a Google-Chrome
+download that hangs forever inside the agent sandbox. If a tool error
+claims the browser is missing, that's a configuration bug — file it as
+a finding and stop; do NOT try to "fix" it by downloading.
+
+## Do NOT use curl / wget / fetch as a substitute
+
+The whole point of an E2E run is to exercise the app through a real
+browser: JS executes, cookies persist across requests, Astro's client
+islands hydrate, SuperTokens sets session headers, Stripe loads in an
+iframe, etc.
+
+- `curl`, `wget`, `http`, `fetch`, `node -e "fetch(...)"` and similar
+  **do not count as E2E validation** and must not be used to exercise
+  the app. If you catch yourself reaching for curl, switch to the
+  browser tools.
+- The **only** legitimate curl uses during an E2E run are: checking
+  that a backend service is up (`curl -sf http://127.0.0.1:3000/health`)
+  or reading a raw API response for cross-checking what the UI
+  displayed. Never as a replacement for a navigation flow.
+- If the browser tools aren't working, record that as a finding and
+  stop — do not fall back to curl to claim you validated the flow.
+
+## Saving screenshots to disk
+
+When you need a screenshot (use sparingly), call `browser_take_screenshot`
+with a full path in the `filename` parameter so it lands on disk — the
+runner verifies screenshot files exist as proof of live MCP interaction.
+
+```
+browser_take_screenshot {{
+  "filename": "{e2e_dir}/screenshots/T096-cart.png",
+  "fullPage": true
+}}
+```
+
+Use descriptive names like `T096-home`, `T096-cart`, `T096-checkout-error`.
+Reference the path in `findings.json` as `screenshot_path`.
+"""
+
+    def verify_tools_section(self, e2e_dir: Path) -> str:
+        return """## Available MCP tools
+
+Same `mcp-browser` (Playwright) tools as the explore agent — call directly, no ToolSearch needed. Key ones:
+`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_fill_form`, `browser_take_screenshot`, `browser_wait_for`, `browser_evaluate`, `browser_network_requests`.
+
+**Prefer `browser_snapshot` over `browser_take_screenshot`** — the accessibility tree is cheaper in context and gives you exact `ref` IDs. Reserve screenshots for visual-only evidence.
+"""
+
+    def verify_screenshot_save_hint(self, e2e_dir: Path) -> str:
+        return (f"Save screenshots by passing `filename` to `browser_take_screenshot`, "
+                f"e.g. `{{\"filename\": \"{e2e_dir}/screenshots/<name>.png\", \"fullPage\": true}}`. "
+                f"One per bug max.")
+
+    def verify_evidence_observed_hint(self) -> str:
+        return ("[Accessibility-tree excerpt from `browser_snapshot` showing the relevant "
+                "element(s). Paste the exact ref + role + name lines — do not paraphrase. "
+                "If the bug is a network/data issue, include the relevant "
+                "`browser_network_requests` entry or `browser_console_messages` line instead.]")
+
+    def fix_regression_test_hint(self) -> str:
+        return (
+            "**Regression test quality**: Regression tests MUST be behavioral. Prefer Playwright "
+            "tests that drive the real page (`page.goto`, `page.getByRole`, assert network calls "
+            "or final DOM state). A unit test that asserts a mocked handler was called with "
+            "stubbed inputs proves nothing. If the bug was in server/API logic, add an "
+            "integration test that hits the real endpoint end-to-end."
+        )
+
+
+class IOSDriver(PlatformDriver):
+    """iOS driver — stub until the mcp-ios integration lands.
+
+    This exists so the registry has an entry and adding iOS support is a
+    matter of filling in `interactive_tools` + `tools_prompt_section`
+    rather than wiring new dispatch sites. `has_live_evidence` still
+    returns screenshot-based evidence from findings, which is enough to
+    catch obvious no-ops; a task that lists `[needs: mcp-ios]` today will
+    fail the MCP-server readiness check before evidence evaluation runs.
+    """
+
+    capability = "mcp-ios"
+    tool_prefix = "mcp__mcp-ios__"
+    interactive_tools = ()  # TODO: fill in when mcp-ios tool surface is finalized
+
+    def tools_prompt_section(self, e2e_dir: Path) -> str:
+        return """## Available MCP tools
+
+You have `mcp-ios` (via `xcrun simctl` / XCTest bridge). Tools are
+namespaced as `mcp__mcp-ios__<name>`. Call them directly — do NOT use
+ToolSearch to discover them. Read the function schemas to see the exact
+tool menu your runtime exposes.
+
+## Do NOT use curl or shell commands as a substitute
+
+E2E validation means driving the *UI* through simulator input. `curl`,
+direct HTTP calls, and shell intents do not prove the user experience
+works. Use the MCP tools for every interaction.
+"""
+
+
+_PLATFORM_DRIVERS: dict[str, PlatformDriver] = {
+    d.capability: d for d in (AndroidDriver(), BrowserDriver(), IOSDriver())
+}
+
+
+def _pick_driver(caps: set[str]) -> Optional[PlatformDriver]:
+    """Pick the primary driver for a task's capability set.
+
+    Browser wins over Android wins over iOS when a task declares multiple
+    (rare). Returns None when no MCP capability is declared.
+    """
+    for c in ("mcp-browser", "mcp-android", "mcp-ios"):
+        if c in caps:
+            return _PLATFORM_DRIVERS[c]
+    return None
+
+
 @dataclass
 class PlatformRuntime:
     """Manages lifecycle for a single platform runtime (emulator/browser/sim)."""
@@ -7762,11 +8124,8 @@ Succeed = exit 0 from a cold re-run of setup.sh (or the relevant boot step).
                         if findings_file.exists():
                             try:
                                 sup_findings = json.loads(findings_file.read_text())
-                                sup_live = sum(
-                                    1 for f in sup_findings.get("findings", [])
-                                    if f.get("screenshot_path")
-                                    or "live" in (f.get("verification") or "").lower()
-                                )
+                                sup_driver = _pick_driver(mcp_caps)
+                                sup_live = sup_driver.has_live_evidence(sup_findings, None) if sup_driver else 0
                                 if sup_live > 0:
                                     e2e_log(f"MCP engagement confirmed ({sup_live} live findings) — accepting STOP")
                                     e2e_loop_succeeded = True
@@ -8092,57 +8451,53 @@ The crash log is also saved at `{crash_log_file}`.
             # agent that can't get past the first screen is blocked, not
             # done — no matter what it writes to findings.json.
             #
-            # Check both "findings" and "validations" arrays since agents
-            # may use either schema.
-            all_findings = findings.get("findings", [])
-            all_validations = findings.get("validations", [])
-            all_entries = all_findings + all_validations
-            live_evidence = sum(
-                1 for f in all_entries
-                if f.get("screenshot_path")
-                or f.get("screenshot")  # agents sometimes use this key
-                or "live" in (f.get("verification") or "").lower()
-                or "live" in (f.get("result") or "").lower()
-            )
-            # Also check if the explore agent's log contains MCP tool calls
-            # as a fallback — the agent may have used MCP but not recorded
-            # screenshot paths in findings.
-            if live_evidence == 0:
-                explore_log = self.log_dir / f"agent-{self.agent_counter}-E2E-explore-{iteration}-{self.timestamp}.jsonl"
-                if explore_log.exists():
-                    try:
-                        log_text = explore_log.read_text()
-                        mcp_tool_count = log_text.count('"mcp__mcp-android__')
-                        if mcp_tool_count > 0:
-                            e2e_log(f"  MCP tools used in agent log: {mcp_tool_count} calls")
-                            live_evidence = mcp_tool_count
-                    except OSError:
-                        pass
-            blocked_findings = sum(
-                1 for f in all_entries
-                if f.get("status") == "blocked"
-            )
+            # Dispatched through the PlatformDriver for this task so the
+            # browser path counts `browser_*` calls, Android counts
+            # `mcp__mcp-android__*`, and iOS can be plugged in without
+            # editing this site.
+            driver = _pick_driver(mcp_caps)
+            explore_log = self.log_dir / f"agent-{self.agent_counter}-E2E-explore-{iteration}-{self.timestamp}.jsonl"
+            if driver is not None:
+                live_evidence = driver.has_live_evidence(findings, explore_log)
+            else:
+                live_evidence = 0
+            all_entries = (findings.get("findings") or []) + (findings.get("validations") or [])
+            blocked_findings = sum(1 for f in all_entries if f.get("status") == "blocked")
             total_findings = len(all_entries)
 
             if live_evidence == 0:
+                cap_label = driver.capability if driver else "unknown"
+                mcp_status = driver.read_mcp_init_status(explore_log) if driver else None
+                status_note = (
+                    f" (MCP server `{cap_label}` init status: **{mcp_status}**)"
+                    if mcp_status else ""
+                )
                 e2e_log(
-                    f"MCP engagement check FAILED: {total_findings} findings, "
-                    f"0 with live evidence (screenshots or live-mcp "
-                    f"verification). {blocked_findings} blocked. "
-                    f"The explore agent did not interact with the app via MCP."
+                    f"MCP engagement check FAILED ({cap_label}){status_note}: "
+                    f"{total_findings} findings, 0 with live evidence "
+                    f"(screenshots or live-mcp verification). "
+                    f"{blocked_findings} blocked."
+                )
+                status_line = (
+                    f"MCP server `{cap_label}` init status reported by agent: **{mcp_status}**.\n\n"
+                    if mcp_status else ""
                 )
                 self.blocked_file.write_text(
                     f"# BLOCKED: {task.id} — explore agent produced no live evidence\n\n"
+                    f"Platform: `{cap_label}`. {status_line}"
                     f"The explore agent produced {total_findings} findings with "
-                    f"0 screenshots and 0 live-mcp verifications. "
-                    f"{blocked_findings} findings marked 'blocked'.\n\n"
+                    f"0 screenshots and 0 `{driver.tool_prefix if driver else 'mcp__'}*` "
+                    f"tool calls in its log. {blocked_findings} findings marked "
+                    f"'blocked'.\n\n"
                     f"This means the agent did not interact with the app via MCP "
                     f"(no screenshots taken, no UI elements tapped). "
                     f"Code review alone does not satisfy E2E validation.\n\n"
                     f"## Likely causes\n\n"
-                    f"- MCP server not connected to emulator\n"
-                    f"- App crashed on startup (check logcat)\n"
-                    f"- Emulator not booted or adb disconnected\n"
+                    f"- MCP server for `{cap_label}` failed to connect (check the "
+                    f"  agent log's `mcp_servers` init block for `status: failed`)\n"
+                    f"- App/site crashed on startup (check platform-specific logs)\n"
+                    f"- Runtime not ready (emulator not booted / browser process "
+                    f"  not launched / simulator not booted)\n"
                     f"- Agent ignored MCP tools and only read source code\n\n"
                     f"## To unblock\n\n"
                     f"Check the explore agent's log in `logs/` to see what it "
@@ -8154,7 +8509,7 @@ The crash log is also saved at `{crash_log_file}`.
                         project_dir=Path(spec_dir).parent if spec_dir else None)
                 return
 
-            open_bugs = [f for f in all_findings
+            open_bugs = [f for f in findings.get("findings", [])
                          if f.get("status") in ("new", "verified_broken")]
             e2e_log(f"Open bugs: {len(open_bugs)}")
 
@@ -8358,6 +8713,7 @@ The crash log is also saved at `{crash_log_file}`.
             fix_prompt = self._build_e2e_fix_prompt(
                 spec_dir, findings_file, open_bugs, learnings_file,
                 e2e_dir=e2e_dir,
+                mcp_caps=mcp_caps,
             )
             fix_task = Task(
                 id=f"E2E-fix-{iteration}",
@@ -8550,7 +8906,8 @@ This is build-fix attempt {attempt} of {BUILD_FIX_MAX_ATTEMPTS}.
             # ── Phase 4: VERIFY (with MCP) ──
             e2e_log(f"Phase 4: Verify fixes")
             verify_prompt = self._build_e2e_verify_prompt(
-                spec_dir, findings_file, ui_flow_content, e2e_dir
+                spec_dir, findings_file, ui_flow_content, e2e_dir,
+                mcp_caps=mcp_caps,
             )
             verify_task = Task(
                 id=f"E2E-verify-{iteration}",
@@ -8766,143 +9123,13 @@ Validate every element, flow, and error path described in the task above. When t
             mission = """Explore the running app systematically, comparing actual behavior against the specification. Find bugs in this run. Do not stop after finding one bug — keep exploring every screen, every flow, every edge case."""
 
         # ── Capability-specific tool + screenshot guidance ──
-        # The MCP tools available to this agent depend on which platform
-        # runtime is booted. Historically this prompt hardcoded Android;
-        # browser/iOS tasks got no tool docs at all and fell back to curl.
-        caps = mcp_caps or set()
-        primary_cap = None
-        for c in ("mcp-browser", "mcp-android", "mcp-ios"):
-            if c in caps:
-                primary_cap = c
-                break
-
-        if primary_cap == "mcp-browser":
-            tools_section = f"""## Available MCP tools
-
-You have `mcp-browser` (Playwright). Tools are namespaced as
-`mcp__mcp-browser__<name>`. Call them directly — do NOT use ToolSearch
-to discover them.
-
-Common tools (the exact menu depends on server version — the runtime
-expose function schemas; read those, don't guess):
-
-- **browser_navigate** — go to a URL. `{{"url": "http://127.0.0.1:4321/kanix/"}}`.
-- **browser_snapshot** — return the accessibility tree of the current
-  page. **Prefer this over screenshots** — it's cheaper, and it gives
-  you the exact `ref` IDs you need for click/type.
-- **browser_click** — click an element by `ref` from the snapshot.
-- **browser_type** — type into an input (also by `ref`).
-- **browser_fill_form** — fill multiple fields at once (cheaper than
-  one `browser_type` per field).
-- **browser_take_screenshot** — PNG snapshot. Use sparingly; screenshots
-  are expensive in context.
-- **browser_wait_for** — wait for text/selector. Prefer this over sleeps.
-- **browser_evaluate** — run JS in the page. Use for reading computed
-  state that isn't in the accessibility tree.
-- **browser_network_requests** / **browser_console_messages** — capture
-  requests or console output when debugging.
-
-**Do NOT call `browser_install`.** The browser is pre-provisioned by
-Nix (`mcp-browser` wrapper points at Nix's chromium via
-`--executable-path`). `browser_install` triggers a Google-Chrome
-download that hangs forever inside the agent sandbox. If a tool error
-claims the browser is missing, that's a configuration bug — file it as
-a finding and stop; do NOT try to "fix" it by downloading.
-
-## Do NOT use curl / wget / fetch as a substitute
-
-The whole point of an E2E run is to exercise the app through a real
-browser: JS executes, cookies persist across requests, Astro's client
-islands hydrate, SuperTokens sets session headers, Stripe loads in an
-iframe, etc.
-
-- `curl`, `wget`, `http`, `fetch`, `node -e "fetch(...)"` and similar
-  **do not count as E2E validation** and must not be used to exercise
-  the app. If you catch yourself reaching for curl, switch to the
-  browser tools.
-- The **only** legitimate curl uses during an E2E run are: checking
-  that a backend service is up (`curl -sf http://127.0.0.1:3000/health`)
-  or reading a raw API response for cross-checking what the UI
-  displayed. Never as a replacement for a navigation flow.
-- If the browser tools aren't working, record that as a finding and
-  stop — do not fall back to curl to claim you validated the flow.
-
-## Saving screenshots to disk
-
-When you need a screenshot (use sparingly), call `browser_take_screenshot`
-with a full path in the `filename` parameter so it lands on disk — the
-runner verifies screenshot files exist as proof of live MCP interaction.
-
-```
-browser_take_screenshot {{
-  "filename": "{e2e_dir}/screenshots/T096-cart.png",
-  "fullPage": true
-}}
-```
-
-Use descriptive names like `T096-home`, `T096-cart`, `T096-checkout-error`.
-Reference the path in `findings.json` as `screenshot_path`.
-"""
-            screenshot_section = ""  # folded into tools_section above
-        elif primary_cap == "mcp-android":
-            tools_section = f"""## Available MCP tools
-
-Tools are namespaced as `mcp__mcp-android__<name>`. Call them directly — do NOT use ToolSearch to discover them.
-
-- **mcp__mcp-android__State-Tool**: Get device state. Pass `{{"use_vision": true}}` to include a screenshot image (**prefer this — cheaper than hierarchy dumps**). Without `use_vision`, returns the UI element tree as text.
-- **mcp__mcp-android__Click-Tool**: Tap at coordinates `{{"x": 540, "y": 1200}}`
-- **mcp__mcp-android__Long-Click-Tool**: Long-press at coordinates `{{"x": 540, "y": 1200}}`
-- **mcp__mcp-android__Swipe-Tool**: Swipe from one point to another `{{"x1": 540, "y1": 1600, "x2": 540, "y2": 400}}` (for scrolling)
-- **mcp__mcp-android__Type-Tool**: Type text at coordinates `{{"text": "hello", "x": 540, "y": 600, "clear": true}}` (set `clear: true` to replace existing text)
-- **mcp__mcp-android__Drag-Tool**: Drag and drop `{{"x1": 100, "y1": 200, "x2": 300, "y2": 400}}`
-- **mcp__mcp-android__Press-Tool**: Press a button `{{"button": "back"}}` (also: "home", "enter", "recent")
-- **mcp__mcp-android__Notification-Tool**: Open the notification shade (no parameters)
-- **mcp__mcp-android__Wait-Tool**: Pause for N **seconds** `{{"duration": 2}}` — NEVER pass more than 5
-
-## Do NOT use curl / adb shell am start as a substitute
-
-E2E validation means driving the *UI* — not hitting the app's internal
-APIs or launching intents from shell. `curl`, `adb shell am start`,
-and direct HTTP calls to the app's backend do not prove the user
-experience works. Use the MCP tools above for every interaction.
-
-The only legitimate non-MCP uses are:
-
-- `adb shell screencap` / `adb pull` for saving screenshots (see below).
-- `curl http://127.0.0.1:<port>/health` for verifying a backend service
-  is up before you start driving the UI.
-- Reading logs via `adb logcat` for debugging a finding.
-"""
-            screenshot_section = f"""## CRITICAL: Saving screenshots to disk
-
-The MCP State-Tool returns screenshots as inline images in the conversation — they are NOT saved to disk. You MUST save screenshots to disk yourself using `adb screencap`, because the runner verifies that screenshot files exist on disk as proof of live MCP interaction.
-
-**Every time you take a screenshot with State-Tool, ALSO save it to disk:**
-```bash
-mkdir -p {e2e_dir}/screenshots/ && adb shell screencap -p /sdcard/nk_screen.png && adb pull /sdcard/nk_screen.png {e2e_dir}/screenshots/<name>.png
-```
-
-Use a descriptive `<name>` like `T302-auth-screen`, `T302-error-invalid-key`, `T302-connected`. Then reference that path in findings.json `screenshot_path` field.
-
-Do this at least once per screen you validate and once per bug you find. Without screenshots on disk, the runner will reject your work.
-"""
-        elif primary_cap == "mcp-ios":
-            tools_section = """## Available MCP tools
-
-You have `mcp-ios` (via `xcrun simctl` / XCTest bridge). Tools are
-namespaced as `mcp__mcp-ios__<name>`. Call them directly — do NOT use
-ToolSearch to discover them. Read the function schemas to see the exact
-tool menu your runtime exposes.
-
-## Do NOT use curl or shell commands as a substitute
-
-E2E validation means driving the *UI* through simulator input. `curl`,
-direct HTTP calls, and shell intents do not prove the user experience
-works. Use the MCP tools for every interaction.
-"""
-            screenshot_section = ""
+        # Dispatched through the PlatformDriver registry so adding iOS
+        # (or any new platform) is a one-class change, not an edit here.
+        driver = _pick_driver(mcp_caps or set())
+        if driver is not None:
+            tools_section = driver.tools_prompt_section(e2e_dir)
+            screenshot_section = driver.screenshot_prompt_section(e2e_dir)
         else:
-            # Unknown / no capability — keep prompt usable but weak.
             tools_section = """## Available MCP tools
 
 No platform-specific MCP capability was declared for this task. Read
@@ -9061,13 +9288,18 @@ Write your findings to `{findings_file}` as JSON:
 
     def _build_e2e_fix_prompt(self, spec_dir: str, findings_file: Path,
                                open_bugs: list[dict], learnings_file: str,
-                               e2e_dir: Path = None) -> str:
+                               e2e_dir: Path = None,
+                               mcp_caps: set[str] | None = None) -> str:
         """Build the prompt for the E2E fix agent.
 
         When e2e_dir is provided, includes per-bug research reports and
         supervisor guidance in the prompt.
         """
         bugs_summary = json.dumps(open_bugs, indent=2)
+        driver = _pick_driver(mcp_caps or set())
+        regression_hint = (driver.fix_regression_test_hint() if driver
+                           else "**Regression test quality**: Regression tests MUST be behavioral "
+                                "— test real state transitions and side effects, not mocked outputs.")
 
         # Build per-bug research and guidance sections
         research_sections = ""
@@ -9167,16 +9399,30 @@ already failed and what the research agent recommends.
 - Prefer fixing the app code over fixing tests (tests are the spec)
 - **Do NOT skip tests** — if you can't find a test command, look harder (CLAUDE.md, Makefile, package.json, build.gradle)
 - Record any non-obvious learnings to `{learnings_file}`
-- **Regression test quality**: If the task says to write regression tests, they MUST be behavioral — test state transitions, side effects, and data flows, NOT just that text renders on screen. A test that mocks a ViewModel with a pre-set error string and asserts the string is displayed tests nothing useful. Instead: call the real validation function with invalid input and assert it returns false/throws. Call a ViewModel method and assert the state changes correctly. Use real Android context (InstrumentationRegistry) for persistence tests. See the task's "Done when" for specific behavioral assertions required.
+- {regression_hint}
 """
 
     def _build_e2e_verify_prompt(self, spec_dir: str, findings_file: Path,
-                                  ui_flow: str, e2e_dir: Path) -> str:
+                                  ui_flow: str, e2e_dir: Path,
+                                  mcp_caps: set[str] | None = None) -> str:
         """Build the prompt for the E2E verify agent."""
         # Verify agent needs bug details but not pass entries.
         # Higher inline limit since it needs steps-to-reproduce etc.
         findings_inline, findings_overflow = _prepare_findings_context(
             findings_file, e2e_dir, max_inline_bytes=40_000)
+
+        driver = _pick_driver(mcp_caps or set())
+        if driver is not None:
+            tools_section = driver.verify_tools_section(e2e_dir)
+            screenshot_hint = driver.verify_screenshot_save_hint(e2e_dir)
+            observed_hint = driver.verify_evidence_observed_hint()
+        else:
+            tools_section = ("## Available MCP tools\n\n"
+                             "No platform capability declared — read the function schemas to "
+                             "see what tools are exposed.\n")
+            screenshot_hint = "Save screenshots alongside findings when your platform supports it."
+            observed_hint = ("[Snapshot / hierarchy / tree excerpt showing the relevant UI "
+                             "element(s). Paste the exact output.]")
 
         return f"""You are an E2E verify agent with access to MCP tools. Your job is to verify bug fixes, produce structured evidence, and find new bugs.
 
@@ -9184,18 +9430,12 @@ already failed and what the research agent recommends.
 
 Follow these rules to avoid crashing from context overflow:
 
-1. **Prefer Screenshot over DumpHierarchy** — screenshots use far less context than XML dumps. Only use DumpHierarchy when you need exact resource IDs, content descriptions, or accessibility attributes.
-2. **Maximum 15 screenshots per session** — one per bug being verified is enough. After each State-Tool screenshot, save it to disk via `adb shell screencap -p /sdcard/nk_screen.png && adb pull /sdcard/nk_screen.png {e2e_dir}/screenshots/<name>.png` and reference that path in findings.
+1. **Prefer structured state (snapshot / hierarchy tree) over screenshots** — structured output is far cheaper in context. Reserve screenshots for visual-only checks.
+2. **Maximum 15 screenshots per session** — one per bug being verified is enough.
 3. **Avoid re-reading screenshots** you've already analyzed.
 4. **Update findings incrementally** — write to `{findings_file}` after verifying each bug, not all at once at the end.
 
-## Available MCP tools
-
-Same MCP tools as the explore agent (call directly, no ToolSearch needed):
-`State-Tool`, `Click-Tool`, `Long-Click-Tool`, `Swipe-Tool`, `Type-Tool`, `Drag-Tool`, `Press-Tool`, `Notification-Tool`, `Wait-Tool` (duration in **seconds**, max 5).
-All namespaced as `mcp__mcp-android__<name>`.
-
-**Prefer Screenshot over DumpHierarchy** to conserve context window space. Only dump hierarchy when you need exact selectors or accessibility attributes.
+{tools_section}
 
 ## Previous findings to verify
 
@@ -9208,11 +9448,10 @@ All namespaced as `mcp__mcp-android__<name>`.
 
 1. For each bug with status "new" or "verified_broken" in the findings:
    a. Follow the steps to reproduce exactly
-   b. **Take a screenshot** to capture the visual state
-   c. Run DumpHierarchy only if you need exact selectors or accessibility attributes for evidence
-   d. If the bug is fixed: update status to "fixed"
-   e. If the bug still exists: update status to "verified_broken"
-   f. **Write structured evidence** to the bug's directory (see below)
+   b. **Capture structured state first** (snapshot / hierarchy), screenshot only if visual evidence is needed
+   c. If the bug is fixed: update status to "fixed"
+   d. If the bug still exists: update status to "verified_broken"
+   e. **Write structured evidence** to the bug's directory (see below)
 2. **Update `{findings_file}` after EACH bug** — don't wait until the end
 3. While re-testing, if you discover NEW bugs, add them with status "new"
 
@@ -9235,24 +9474,22 @@ The evidence file MUST contain:
 2. [next action...]
 
 ## Observed state
-[Raw DumpHierarchy XML snippet showing the relevant UI element(s).
-Copy the EXACT XML — do not summarize or paraphrase it.]
+{observed_hint}
 
 ## Expected state
-[What the XML/hierarchy SHOULD look like per the spec, with specific
-attribute values: class, text, checkable, clickable, etc.]
+[What the state SHOULD look like per the spec, with specific attribute values.]
 
 ## Delta
-[Concrete difference: "Node has checkable=false, expected checkable=true"
-or "Node missing entirely from hierarchy" — NOT "accessibility is broken"]
+[Concrete difference: "Element has aria-disabled=true, expected aria-disabled=false"
+or "Node missing entirely from tree" — NOT "the UI is broken"]
 
 ## Screenshot
-[Path to screenshot file, or "not needed — hierarchy sufficient"]
+[Path to screenshot file, or "not needed — structured state sufficient"]
 ```
 
 **Why this matters**: The fix agent and supervisor use this evidence to understand
-exactly what failed. "Bug still broken" is useless. "Switch node has checkable=false
-in AccessibilityNodeInfo" tells the fix agent exactly what to fix.
+exactly what failed. "Bug still broken" is useless. Concrete deltas tell the fix agent
+exactly what to fix.
 
 Also update the finding in `{findings_file}` to include a `bug_dir` field pointing
 to the bug's evidence directory: `"bug_dir": "{e2e_dir}/bugs/<BUG-ID>"`
@@ -9266,7 +9503,7 @@ to the bug's evidence directory: `"bug_dir": "{e2e_dir}/bugs/<BUG-ID>"`
 ## Rules
 
 - Test EVERY bug in the findings — do not skip any
-- Save screenshots to disk via `adb shell screencap -p /sdcard/nk_screen.png && adb pull /sdcard/nk_screen.png {e2e_dir}/screenshots/<name>.png` — one per bug max. The State-Tool shows you the screen inline but does NOT save to disk.
+- {screenshot_hint}
 - Add any newly discovered bugs (with `bug_dir` field)
 - **Always write structured evidence** — no exceptions
 - Do NOT modify source code — only update `{findings_file}` and write evidence files

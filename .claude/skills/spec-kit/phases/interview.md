@@ -10,6 +10,11 @@ Check `interview-notes.md` (if it exists) for a `preset:` line, or ask the user 
 
 1. **Understand the idea** — Ask the user to describe their project/feature. Listen carefully.
 
+   **After hearing the description, scan for first-class scaffolding decisions that short-circuit later topics.** These are decisions that materially change what gets scaffolded into the project and must be caught early:
+
+   - **Payment integration (Stripe)** — scan for keywords: `ecommerce`, `marketplace`, `subscription`, `SaaS`, `payments`, `revenue`, `checkout`, `billing`, `storefront`, `shop`, `paid tier`, `pro plan`, `charge customers`, `sell`, `for profit`, `donations`, `tips`, `one-time purchase`. If ANY appears, load `reference/stripe.md` and explicitly ask: *"This project mentions revenue/payments — do you want Stripe integration scaffolded? [y/N]"* Default: No. Record the answer in `interview-notes.md` as `Payment integration: stripe | none`. If yes, follow the §6 "What to probe during the Stripe interview" flow in `reference/stripe.md` as a dedicated interview topic.
+   - **Platform runtimes** (Android, iOS, web, desktop) — already covered in the Platform runtime and E2E testing topics section below.
+
 2. **Research similar projects** — Use WebSearch to find existing projects that solve similar problems. Bring back:
    - Feature ideas the user hasn't mentioned
    - Common patterns and pitfalls in the domain
@@ -98,6 +103,7 @@ For each of these topics, present the enterprise-grade default, explain why it m
 | Idempotency & readiness | `reference/idempotency.md` | Idempotency patterns for setup flows, readiness check scripts for external dependencies |
 | Traceability | `reference/traceability.md` | FR-xxx/SC-xxx numbering, learnings format, interview handoff document requirements |
 | UI_FLOW.md (if project has UI) | `reference/ui-flow.md` | Required sections, Mermaid diagram conventions, field validation table format |
+| Stripe / payment integration (if project involves revenue/payments) | `reference/stripe.md` | Auto-detection keywords, generated scripts bundle, webhook handler contract, publishable-key delivery contract, RUNBOOK sections, live-key guardrails |
 
 **Skip loading reference files for topics the preset says to skip entirely.** But for any topic you're going to discuss with the user, load its reference first — even if you only need one detail from it.
 
@@ -106,6 +112,7 @@ For each of these topics, present the enterprise-grade default, explain why it m
 - **If the project has a UI**: load `reference/ui-flow.md` and probe for screens, navigation, state machines, field validations, real-time connections.
 - **If the project has a database or persistent state**: load `reference/migration.md` and probe for migration strategy, seed data, schema versioning, admin process parity.
 - **If the project has an API**: load `reference/api-contracts.md` for contract depth requirements. Also probe for API versioning — default is URL path versioning (`/v1/`, `/v2/`) with latest-version alias (unversioned path → latest). Ask: "Who consumes your API? Internal only, or external clients too?"
+- **If the project description mentions revenue, payments, or commerce** (see keyword list below): load `reference/stripe.md`. This is a first-class scaffolding decision — equivalent to choosing a platform target. Follow the auto-detection + explicit confirmation flow documented in that file before proceeding with other interview topics.
 
 #### Nix availability — check FIRST
 
@@ -128,6 +135,7 @@ For each topic below, present the enterprise-grade default, let the user accept 
 - **CORS policy** (web-facing APIs) — default: restrictive (specific allowed origins). If user wants `*`: warn about CSRF and data exfiltration. If deferred: document with WARNING for pre-production review.
 - **Rate limiting & backpressure** — per-client rate limits, bounded queues, connection limits, timeout budgets on all external calls. Ask: "Do you need rate limiting now, or is this an internal-only service where it can wait?" If deferred: document the recommendation.
 - **Observability** — metrics (Prometheus/StatsD/OpenTelemetry), tracing (correlation IDs + distributed trace context), error reporting (Sentry/log-based). Ask: "Which metrics and tracing tools do you want?"
+- **Payment integration** — if the project involves revenue, payments, subscriptions, donations, or any form of commerce (see keyword scan in Step 1), offer Stripe scaffolding. Load `reference/stripe.md` and follow its §6 probe list: what are you selling (one-time, subscription, marketplace, donations), multi-currency, Stripe Tax, Stripe Connect (marketplace), refund policy, dispute handling, subscription dunning (if applicable). If the user says yes, the generated bundle is comprehensive (scripts, env, webhook contract docs, RUNBOOK, task-deps, live-key guardrails) — all documented in `reference/stripe.md`. Record all answers in `interview-notes.md` under `## Stripe integration`.
 - **Migration & data seeding** — strongly recommend idempotent up/down structured migrations with a library (Knex/Prisma for Node.js, Alembic for Python, golang-migrate for Go, Diesel for Rust). Seed script doubles as dev bootstrapping AND test fixture setup. Ask: "Do you need a database? If so, let's set up migrations and seeding from day one."
 - **API versioning** — URL path versioning (`/v1/`, `/v2/`) with latest-version alias. Ask: "Who consumes your API? Internal only, or external clients too?" Determine backward compatibility promise.
 - **Branching strategy** — present both options: **feature branches with PRs** (review checkpoints, easy rollback, spec-kit default — each feature gets its own branch `specs/<feature-name>`) vs **direct-to-main** (faster for solo developers, POCs). Ask: "Do you want feature branches with PRs, or just work directly on main?" If main-branch: spec-kit's branch creation during `specify` is skipped; commits go directly to main. If feature-branch: determine naming convention, squash-merge vs merge-commit. **Document the decision — it affects how the task runner commits code.**

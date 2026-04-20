@@ -97,6 +97,7 @@ Use Mermaid `stateDiagram-v2` format (renders natively in GitHub Markdown). Link
 Skip this section for stateless request/response services, pure-function libraries, and run-and-exit CLIs.
 
 ### Infrastructure decisions
+- **Payment integration** — If `interview-notes.md` shows `Payment integration: stripe`, load `reference/stripe.md` and walk through the generated bundle at plan time so the user can see the full scaffolding footprint before tasks are written: scripts directory, flake entry, env scaffolding, webhook handler contract, publishable-key dual delivery (runtime fetch + build-time fallback), CLAUDE.md / test/e2e / RUNBOOK stanzas, task-deps entry, three live-key guardrails. Confirm the webhook forwarding URL (default `localhost:<api-port>/webhooks/stripe`) and the frontend env sync target (e.g., `site/.env` for Astro, `web/.env.local` for Next.js). Confirm any Stripe-specific scope answers from the interview (multi-currency, Stripe Tax, Connect, refund/dispute policy, subscription dunning).
 - **Logging** — Confirm library from interview, present any adjustments
 - **Error handling** — Present the error hierarchy customized for this project
 - **Config management** — Config file format, secret management approach

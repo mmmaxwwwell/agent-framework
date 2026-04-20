@@ -148,6 +148,15 @@ Include at the top of tasks.md: `Approach: Fix-validate loop. Each phase: build 
 - **If the project spawns external processes**: include stub process creation tasks in the test infrastructure phase, and integration tests that exercise the full spawn → stdin → stdout → exit lifecycle. Load `reference/testing.md` for the stub process pattern.
 - **If the project has external service dependencies** (databases, emulators, queues): include readiness-check script tasks. Load `reference/idempotency.md` for the pattern.
 - **If the project has edge cases enumerated in the spec**: each edge case test should appear alongside its feature's test tasks, not in a separate "edge case phase." Load `reference/edge-cases.md` if you need to verify coverage of all 11 categories.
+- **If `interview-notes.md` has `Payment integration: stripe`**: load `reference/stripe.md`. The foundational phase MUST include tasks for: generating the listener scripts (`scripts/stripe-listen-*.sh`, `scripts/stripe-webhook-secret.sh`, `scripts/sync-env.sh`, all chmod +x'd), adding `stripe-cli` to `flake.nix`, scaffolding `.env.example` with the Stripe stanza + banner, writing `docs/stripe-integration.md` (webhook handler contract + publishable key delivery contract), appending the Stripe stanza to `CLAUDE.md` and `test/e2e/README.md`, creating/extending `RUNBOOK.md` with the 8-section Stripe operations guide, adding the `stripe-listen` entry to `.claude/task-deps.json`, and installing the three live-key guardrails (pre-commit hook, gitleaks rule, `.env.example` warning). Every Stripe-driving E2E task (checkout, refund, subscription lifecycle, tax, webhook integration tests that hit real Stripe events) MUST carry the `[needs: stripe-listen]` tag and a `Prereq:` line referencing the start/stop scripts and `test/e2e/README.md`. Example:
+
+  ```markdown
+  - [ ] T042 E2E: guest checkout end-to-end [SC-001] [needs: mcp-browser, stripe-listen]
+    Prereq: `scripts/stripe-listen-start.sh` before running (see test/e2e/README.md); tear down with `stripe-listen-stop.sh` after.
+    Done when: guest completes checkout with test card 4242424242424242; `payment_intent.succeeded` webhook received; order transitions to `paid`; confirmation page renders with order id.
+  ```
+
+  The run-tasks runner reads `[needs: stripe-listen]`, resolves it via `.claude/task-deps.json`, and executes the start script before the task and the stop script after — no extra per-task boilerplate needed.
 
 ### User-flow integration tests (every feature phase)
 Load `reference/testing.md` § "User-flow integration tests" before writing these tasks. For each user story or functional requirement implemented in a phase:

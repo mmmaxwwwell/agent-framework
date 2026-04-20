@@ -46,6 +46,7 @@ reference/           # Enterprise knowledge base — loaded on demand by phase f
   readme.md          # Human-facing README.md structure, sections, quality checklist
   pre-pr.md          # Pre-PR gate: single-command validation, multi-build discovery, non-vacuous checks
   e2e-runtime.md     # Real-runtime E2E: emulator, browser, simulator patterns, side-by-side architecture
+  stripe.md          # Stripe / payment integration: listener scripts, env pattern, webhook contract, RUNBOOK, live-key guardrails
 presets/             # Quality presets — loaded once per project
   poc.md             # Proof of concept
   local.md           # Single-user local tool
@@ -99,6 +100,48 @@ Skip presets that clearly don't apply (don't show enterprise for a throwaway scr
 - New tools go in `flake.nix`, not global installs
 
 If Nix is NOT available, fall back to Docker/devcontainers. Do not block on Nix.
+
+## Payment integration (Stripe)
+
+Stripe is a **first-class project dependency** in spec-kit — treated with the same weight as choosing a platform target (Android/iOS/web). When the project involves revenue, payments, subscriptions, donations, or any form of commerce, the skill must detect this during the interview, explicitly confirm with the user, and scaffold the full integration pattern.
+
+### Auto-detection during the interview
+
+When the user describes their project, scan the description for commerce/revenue keywords:
+`ecommerce`, `marketplace`, `subscription`, `SaaS`, `payments`, `revenue`, `checkout`, `billing`, `storefront`, `shop`, `paid tier`, `pro plan`, `charge customers`, `sell`, `for profit`, `donations`, `tips`, `one-time purchase`.
+
+If any keyword appears, the interview MUST explicitly ask:
+
+> "This project mentions revenue/payments — do you want Stripe integration scaffolded? [y/N]"
+
+Default: **No**. Never scaffold Stripe by inference — always require explicit confirmation. Record the answer in `interview-notes.md` under `Payment integration: stripe | none`.
+
+### When the user opts in
+
+Load `reference/stripe.md` — it is the full knowledge base. The generated bundle includes:
+
+- **Scripts** (`scripts/stripe-listen-start.sh`, `stripe-listen-stop.sh`, `stripe-webhook-secret.sh`, `sync-env.sh`) — stack-agnostic bash, all chmod +x'd.
+- **Flake** — `stripe-cli` added to the devShell.
+- **Env scaffolding** — `.env.example` with `STRIPE_SECRET_KEY`, `PUBLIC_STRIPE_PUBLISHABLE_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_TAX_ENABLED`, plus a banner warning about test-only keys.
+- **Webhook handler contract** — documented in `docs/stripe-integration.md` (stack-agnostic — the agent researches raw-body handling for their specific framework: Fastify, Express, Next.js, FastAPI, etc.).
+- **Publishable key delivery contract** — `GET /api/<client>/stripe/config` + `PUBLIC_*` env fallback for web + `--dart-define` / build-config fallback for mobile. Dual-path so mobile keys can rotate without app store releases.
+- **CLAUDE.md stanza** — keys, dev workflow, test vs live.
+- **test/e2e/README.md stanza** — first-time setup, agent usage pattern, scripts reference table.
+- **RUNBOOK.md stanza** — all 8 areas (dev webhook lifecycle, test/live guardrails, prod endpoint setup, delivery failure recovery, secret rotation, fraud/dispute response, monitoring, common errors).
+- **`.claude/task-deps.json` entry** — `stripe-listen` with start/stop scripts, JSON output schema, prereq list.
+- **Task-list tagging** — Stripe-related E2E tasks get `[needs: stripe-listen]` + `Prereq:` line.
+- **Live-key guardrails (all three)** — pre-commit hook blocking `sk_live_` / `pk_live_`, gitleaks rule, `.env.example` warning comment.
+
+### Core design patterns (documented in depth in `reference/stripe.md`)
+
+- **Single-source-of-truth `.env` + `sync-env.sh`** — root `.env` is canonical; `PUBLIC_*`-prefixed variables are copied into the web frontend's `.env` via a predev/prebuild hook. Secrets physically cannot leak to the frontend because the sync script filters them out.
+- **Runtime fetch + build-time fallback for publishable keys** — clients hit `/api/<client>/stripe/config` at runtime, with the build-time env as a fallback. Enables key rotation without app store re-releases.
+- **Listener lifecycle scripts** — the webhook signing secret rotates every `stripe listen` session as a security feature. Rather than fighting it, the start script is idempotent (detects/reuses a live listener, cleans stale PIDs, writes the session secret to `.env`) and emits JSON (`{pid, secret, forward_to, log, reused}`) for agents to parse. API must restart after start to pick up the new secret.
+- **Three-layered live-key guardrails** — pre-commit hook + CI gitleaks + `.env.example` warning. Bypassing one still trips the others.
+
+### Future-proofing
+
+The initial implementation is Stripe-specific. If a future project uses a different payment processor (Braintree, Adyen, Paddle), the **shape** transfers directly — webhook-listener lifecycle scripts, publishable-key dual delivery, env sync, live-key guardrails. Only the SDK names change. `reference/stripe.md` explicitly documents this so a future `reference/braintree.md` (or whatever) can follow the same pattern.
 
 ## Agent sandboxing
 
