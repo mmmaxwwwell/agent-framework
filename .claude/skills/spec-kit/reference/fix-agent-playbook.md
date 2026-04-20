@@ -9,7 +9,7 @@ which burns tokens and often fixes the wrong thing.
 
 When the runner spawns you for a `platform_init_fail`, the diagnostic block starts with a section labeled `## MCP launch probe:` with one of four outcomes:
 
-- **✅ launched and responded to initialize** — the MCP server itself is fine. The failure is elsewhere: a backend service didn't come up, the emulator/browser isn't healthy, or there's a race between them. Skip the rest of the probe discussion and work the service logs / pid cross-check below.
+- **✅ launched and responded to initialize** — the MCP server itself is fine, and the runner confirms this by omitting the setup.sh / service-log / port / pid-file sections from the diagnostic entirely. Do **not** go looking for service-health issues: services are up. The failure is at the runtime layer — the emulator/browser/simulator binary is reachable but misbehaving. Work the "Runtime-layer checks when the probe is green" section below *before* anything else.
 - **⚠ launched but never responded** — the binary starts but doesn't complete the JSON-RPC handshake within 5s. Usually a placeholder binary, a protocol-version mismatch (server speaks an older MCP version), or a bug where the server wedges during `initialize`. Check the stderr block; if it's empty, run the binary yourself under the same shell and feed it an `initialize` request manually.
 - **❌ crashed on launch** — this is the root cause. The stderr excerpt in the probe section *is* the error. Fix that; do not chase setup.sh, service logs, or pid files. Common culprits: `nix run` blocked by bwrap's read-only `/nix/store`, missing shared libraries, or a missing env var that the Claude CLI scrubs but the runner's parent shell had.
 - **⚠ no-config** — the runner never reached `start_mcp_server`, meaning the failure was earlier in the boot path (setup.sh or emulator boot). Treat like a non-MCP failure and work the service logs.
@@ -17,6 +17,20 @@ When the runner spawns you for a `platform_init_fail`, the diagnostic block star
 The probe is a *lazy re-launch*: the runner re-runs the MCP binary under the same sandbox constraints as the Claude CLI at diagnostic-build time. That makes its stderr authoritative in a way that setup.sh logs are not — setup.sh reports "MCP did not boot" but has no visibility into *why*.
 
 If the probe section contradicts any other section of the diagnostic (a matched pattern, a prior-attempt claim, etc.), **trust the probe**. The other sections are heuristics built from setup.sh's external view; the probe has the actual process stderr.
+
+## Runtime-layer checks when the probe is green
+
+When the probe is ✅ but `platform_init_fail` still fires, the failure is at the runtime layer — the emulator/browser/simulator CLI is reachable but misbehaving. The service stack is known-good; skip it. Work these checks in order:
+
+1. **Read the PATH diagnostics at the top of the diagnostic.** The runner prints the resolved path for `start-emulator`, `emulator`, and `adb`, and flags any binary that has multiple matches in PATH. If a wrapper (e.g. `emulator-wrapper` from a devshell) is supposed to win but a raw SDK binary is first, that is almost certainly the bug — PATH shadowing makes `-list-avds` return empty and makes the runner conclude "not booted." Fix PATH ordering (`flake.nix` shellHook, direnv, `.envrc`, etc.) before anything else.
+
+2. **Run the runtime CLI yourself and compare.** For Android: `emulator -list-avds`, `adb devices`, `adb -s emulator-5554 shell getprop sys.boot_completed`. For browser: `playwright --version`, `node -e 'require("playwright").chromium.launch().then(b=>b.close())'`. If the CLI hangs, errors, or returns empty where populated output is expected, that is the failure — not setup.sh.
+
+3. **Compare with the wrapper, if there is one.** If the project ships a wrapper script (`emulator-wrapper`, `start-emulator`, etc.), run both the wrapper and the raw binary. Divergent output between them *is* the bug.
+
+4. **Only after 1–3 come up empty**, consider races between "MCP responded" and "runner marks booted." These are rare; do not reach for them first.
+
+The one mistake to avoid in this mode: treating the absence of service-log / pid-file sections as a gap to fill by hand. The runner omitted them on purpose because they are noise for this failure class. Don't shell out to read them yourself.
 
 ## Core principle: reproduce before hypothesizing
 

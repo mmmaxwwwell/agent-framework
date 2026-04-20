@@ -32,7 +32,7 @@ import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -104,6 +104,10 @@ class SubAgentRecord:
     output_tokens: int
     elapsed_s: int
     status: str         # "done" or "failed"
+    input_tokens_fresh: int = 0
+    input_tokens_cache_read: int = 0
+    input_tokens_cache_create: int = 0
+    model: str = "opus"
 
 
 @dataclass
@@ -121,6 +125,9 @@ class AgentSlot:
     attempt: int = 1  # which attempt this is for the task (1 = first try)
     input_tokens: int = 0     # cumulative input tokens (including cache)
     output_tokens: int = 0    # cumulative output tokens
+    input_tokens_fresh: int = 0         # non-cached input tokens
+    input_tokens_cache_read: int = 0    # cache hits (cheap)
+    input_tokens_cache_create: int = 0  # cache writes (1.25x input cost)
     model: str = "opus"       # model requested at spawn time (for cost accounting)
     is_ci_loop: bool = False  # True for the virtual CI loop orchestrator slot
     sub_agent_history: list[SubAgentRecord] = field(default_factory=list)
@@ -675,25 +682,6 @@ def render_dependency_graph(phases: list[Phase], phase_deps: dict[str, list[str]
         legend_parts.append(f"{STATUS_COLORS[s]}{STATUS_SYMBOLS[s]} {s.value}{RESET}")
     header.append(" " + " ".join(legend_parts))
 
-    # Running agents
-    if agents:
-        agent_strs = []
-        for a in agents:
-            elapsed = int(time.time() - a.start_time) if a.start_time else 0
-            att = f" att#{a.attempt}" if a.attempt > 1 else ""
-            tok = ""
-            total_tok = a.input_tokens + a.output_tokens
-            if total_tok > 0:
-                tok = f" {total_tok // 1000}k tok"
-            prefix = "CI Loop" if a.is_ci_loop else f"Agent {a.agent_id}"
-            sub_info = ""
-            if a.is_ci_loop and a.active_sub_agent_id is not None:
-                sub_info = f" → Agent {a.active_sub_agent_id}"
-            agent_strs.append(
-                f"{STATUS_COLORS[TaskStatus.RUNNING]}{prefix}: {a.task.id}{att}{sub_info} ({elapsed}s{tok}){RESET}"
-            )
-        header.append(f" Running: {' │ '.join(agent_strs)}")
-
     header.append(f"{BOLD}{'─' * width}{RESET}")
 
     # ── Build full task list ─────────────────────────────────────────────
@@ -926,8 +914,7 @@ class TUI:
         pane_lines = []
         elapsed = int(time.time() - agent.start_time) if agent.start_time else 0
         att = f" att#{agent.attempt}" if agent.attempt > 1 else ""
-        total_tok = agent.input_tokens + agent.output_tokens
-        tok = f", {total_tok // 1000}k tok" if total_tok > 0 else ""
+        tok = format_usage_compact(agent)
         prefix = "CI Loop" if agent.is_ci_loop else f"Agent {agent.agent_id}"
         sub_info = ""
         if agent.is_ci_loop and agent.active_sub_agent_id is not None:
@@ -940,8 +927,11 @@ class TUI:
             parts = []
             for rec in agent.sub_agent_history[-6:]:  # last 6 sub-agents
                 rtok = (rec.input_tokens + rec.output_tokens) // 1000
+                rcost = estimate_cost_usd(
+                    rec.input_tokens_fresh, rec.input_tokens_cache_read,
+                    rec.input_tokens_cache_create, rec.output_tokens, rec.model)
                 mark = "✓" if rec.status == "done" else "✗"
-                parts.append(f"{mark} {rec.label} {rtok}k")
+                parts.append(f"{mark} {rec.label} {rtok}k {format_cost_usd(rcost)}")
             hist_line = " │ ".join(parts)
             pane_lines.append(f"{hist_line[:pane_width]}")
         else:
@@ -1005,15 +995,17 @@ class HeadlessLogger:
         for a in agents:
             elapsed = int(time.time() - a.start_time) if a.start_time else 0
             att = f" att#{a.attempt}" if a.attempt > 1 else ""
-            total_tok = a.input_tokens + a.output_tokens
-            tok = f", {total_tok // 1000}k tok" if total_tok > 0 else ""
+            tok = format_usage_compact(a)
             prefix = "CI Loop" if a.is_ci_loop else f"Agent {a.agent_id}"
             lines.append(f"  {prefix}: {a.task.id}{att} ({a.status}, {elapsed}s{tok})")
             if a.is_ci_loop and a.sub_agent_history:
                 for rec in a.sub_agent_history:
                     rtok = (rec.input_tokens + rec.output_tokens) // 1000
+                    rcost = estimate_cost_usd(
+                        rec.input_tokens_fresh, rec.input_tokens_cache_read,
+                        rec.input_tokens_cache_create, rec.output_tokens, rec.model)
                     mark = "✓" if rec.status == "done" else "✗"
-                    lines.append(f"    {mark} Agent {rec.agent_id}: {rec.label} ({rec.elapsed_s}s, {rtok}k tok)")
+                    lines.append(f"    {mark} Agent {rec.agent_id}: {rec.label} ({rec.elapsed_s}s, {rtok}k tok, {format_cost_usd(rcost)})")
 
         with open(status_file, "w") as f:
             f.write("\n".join(lines) + "\n")
@@ -2340,7 +2332,7 @@ def spawn_agent(task: Task, prompt: str, log_path: Path,
     # placed next to the agent log so it's inside the project directory
     # (visible inside the bwrap sandbox, unlike host /tmp).
     prompt_file = log_path.with_suffix(".prompt.md")
-    prompt_file.write_text(prompt)
+    prompt_file.write_text(prompt + REASONING_APPENDIX)
     claude_cmd += ["-p", f"Follow the instructions in {prompt_file} exactly. Read that file now with the Read tool and do what it says."]
 
     cmd = claude_cmd
@@ -2478,13 +2470,88 @@ def extract_usage_breakdown(log_path: Path) -> dict:
     return out
 
 
-def read_stream_output(log_path: Path, last_pos: int) -> tuple[list[str], int, Optional[int], tuple[int, int]]:
+# Per-million-token USD prices. Keys match substrings of model IDs (e.g.
+# "claude-opus-4-7") and also the short aliases passed at spawn time.
+# Source: Anthropic public pricing for Claude 4 models.
+_MODEL_PRICING = {
+    "opus":   {"input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_create": 18.75},
+    "sonnet": {"input":  3.00, "output": 15.00, "cache_read": 0.30, "cache_create":  3.75},
+    "haiku":  {"input":  0.80, "output":  4.00, "cache_read": 0.08, "cache_create":  1.00},
+}
+
+
+def _pricing_for(model: str) -> dict:
+    """Look up per-MTok prices for a model id/alias. Defaults to opus."""
+    m = (model or "").lower()
+    if "haiku" in m:
+        return _MODEL_PRICING["haiku"]
+    if "sonnet" in m:
+        return _MODEL_PRICING["sonnet"]
+    return _MODEL_PRICING["opus"]
+
+
+def estimate_cost_usd(fresh: int, cache_read: int, cache_create: int,
+                      output: int, model: str) -> float:
+    """Estimate USD cost for a usage breakdown at the given model's pricing."""
+    p = _pricing_for(model)
+    return (
+        fresh        * p["input"]        / 1_000_000
+        + cache_read   * p["cache_read"]   / 1_000_000
+        + cache_create * p["cache_create"] / 1_000_000
+        + output       * p["output"]       / 1_000_000
+    )
+
+
+def format_cost_usd(cost: float) -> str:
+    """Compact USD formatter: <$0.01 as <$0.01, <$1 as ¢, ≥$1 as $X.XX."""
+    if cost <= 0:
+        return "$0"
+    if cost < 0.01:
+        return "<$0.01"
+    if cost < 1.0:
+        return f"${cost:.2f}"
+    return f"${cost:.2f}"
+
+
+def format_usage_compact(a) -> str:
+    """Build a compact usage string for live display.
+
+    Returns e.g. " in 120k/out 4k, cache 87%, $0.42" or "" if no tokens yet.
+    Accepts an AgentSlot or any object with the breakdown fields.
+    """
+    fresh = getattr(a, "input_tokens_fresh", 0) or 0
+    cr = getattr(a, "input_tokens_cache_read", 0) or 0
+    cc = getattr(a, "input_tokens_cache_create", 0) or 0
+    in_tot = a.input_tokens if (fresh + cr + cc) == 0 else (fresh + cr + cc)
+    out_tot = a.output_tokens
+    if in_tot == 0 and out_tot == 0:
+        return ""
+    # cache hit % = cache_read / (total input)
+    cache_pct = (cr * 100 // in_tot) if in_tot > 0 else 0
+    cost = estimate_cost_usd(fresh, cr, cc, out_tot, getattr(a, "model", "opus"))
+    return (
+        f" in {in_tot // 1000}k/out {out_tot // 1000}k"
+        f", cache {cache_pct}%, {format_cost_usd(cost)}"
+    )
+
+
+def read_stream_output(log_path: Path, last_pos: int) -> tuple[list[str], int, Optional[int], tuple[int, int], dict]:
     """Read new JSON lines from a stream-json log file.
-    Returns (display_lines, new_position, exit_code_if_result, (input_tokens, output_tokens))."""
+    Returns (display_lines, new_position, exit_code_if_result, (input_tokens, output_tokens), breakdown).
+
+    breakdown keys: input_tokens_fresh, input_tokens_cache_read,
+    input_tokens_cache_create, output_tokens, model."""
     lines = []
     exit_code = None
     input_tokens = 0
     output_tokens = 0
+    breakdown = {
+        "input_tokens_fresh": 0,
+        "input_tokens_cache_read": 0,
+        "input_tokens_cache_create": 0,
+        "output_tokens": 0,
+        "model": "",
+    }
     try:
         with open(log_path, "r") as f:
             f.seek(last_pos)
@@ -2504,16 +2571,19 @@ def read_stream_output(log_path: Path, last_pos: int) -> tuple[list[str], int, O
                 # The result entry has authoritative cumulative usage — prefer it
                 usage = msg.get("usage", {})
                 if usage:
-                    result_in = (
-                        usage.get("input_tokens", 0)
-                        + usage.get("cache_creation_input_tokens", 0)
-                        + usage.get("cache_read_input_tokens", 0)
-                    )
+                    result_fresh = usage.get("input_tokens", 0)
+                    result_cc = usage.get("cache_creation_input_tokens", 0)
+                    result_cr = usage.get("cache_read_input_tokens", 0)
+                    result_in = result_fresh + result_cc + result_cr
                     result_out = usage.get("output_tokens", 0)
                     # Only use if non-zero (avoid synthetic error zeroing)
                     if result_in > 0 or result_out > 0:
                         input_tokens = result_in
                         output_tokens = result_out
+                        breakdown["input_tokens_fresh"] = result_fresh
+                        breakdown["input_tokens_cache_create"] = result_cc
+                        breakdown["input_tokens_cache_read"] = result_cr
+                        breakdown["output_tokens"] = result_out
                 # Also extract display text and exit code from result
                 if msg.get("result"):
                     lines.append(msg["result"])
@@ -2526,17 +2596,26 @@ def read_stream_output(log_path: Path, last_pos: int) -> tuple[list[str], int, O
                 if model == "<synthetic>":
                     pass  # Don't let synthetic error messages zero out real counts
                 else:
+                    if model:
+                        breakdown["model"] = model
                     usage = msg.get("message", {}).get("usage", {})
                     if usage:
-                        msg_in = (
-                            usage.get("input_tokens", 0)
-                            + usage.get("cache_creation_input_tokens", 0)
-                            + usage.get("cache_read_input_tokens", 0)
-                        )
+                        msg_fresh = usage.get("input_tokens", 0)
+                        msg_cc = usage.get("cache_creation_input_tokens", 0)
+                        msg_cr = usage.get("cache_read_input_tokens", 0)
+                        msg_in = msg_fresh + msg_cc + msg_cr
                         msg_out = usage.get("output_tokens", 0)
                         if msg_in > 0 or msg_out > 0:
                             input_tokens = msg_in
                             output_tokens = msg_out
+                            # Only overwrite breakdown if result entry hasn't set it
+                            # (result is authoritative). Since result is processed
+                            # if present in same read, and messages are chronological,
+                            # always overwrite — result line comes last.
+                            breakdown["input_tokens_fresh"] = msg_fresh
+                            breakdown["input_tokens_cache_create"] = msg_cc
+                            breakdown["input_tokens_cache_read"] = msg_cr
+                            breakdown["output_tokens"] = msg_out
 
                 if msg.get("message", {}).get("content"):
                     for block in msg["message"]["content"]:
@@ -2563,9 +2642,15 @@ def read_stream_output(log_path: Path, last_pos: int) -> tuple[list[str], int, O
                 lines.append(f"ERROR: {err_msg}")
                 exit_code = 2
 
-        return lines, new_pos, exit_code, (input_tokens, output_tokens)
+        return lines, new_pos, exit_code, (input_tokens, output_tokens), breakdown
     except FileNotFoundError:
-        return [], last_pos, None, (0, 0)
+        return [], last_pos, None, (0, 0), {
+            "input_tokens_fresh": 0,
+            "input_tokens_cache_read": 0,
+            "input_tokens_cache_create": 0,
+            "output_tokens": 0,
+            "model": "",
+        }
 
 
 def check_rate_limited(stderr_path: Path, log_path: Optional[Path] = None) -> Optional[float]:
@@ -3041,6 +3126,138 @@ def write_attempt_record(spec_dir: str, task_id: str, agent_id: int,
         f.write(json.dumps(record) + "\n")
 
 
+# ── Reasoning writeup ─────────────────────────────────────────────────
+#
+# Every agent is asked to end its final message with a `## Reasoning`
+# section. After the agent exits, we pull that section out of the JSONL
+# transcript and write it to {spec_dir}/reasoning/ as a standalone file.
+#
+# Filename: NNNNNN-{iso_ts}-{kind}-{task_id}-agent{id}.md
+# The zero-padded counter gives sequential ordering; the kind lets you
+# grep by agent type (task, vr, fix, ci-diagnose, e2e-executor, ...).
+
+REASONING_APPENDIX = """
+
+---
+
+## Required: reasoning writeup
+
+Before you stop, end your final message with a section titled exactly
+`## Reasoning` covering:
+
+- **What I did**: the 1-3 concrete changes, findings, or actions taken
+- **Why**: the reasoning behind the approach — constraints weighed,
+  alternatives rejected, assumptions made
+- **Confidence & risks**: what might be wrong, what you did not verify
+- **Next step if this fails**: what you would try next
+- **Prompt feedback — unnecessary**: what input in this prompt did you
+  ignore or find irrelevant? Be specific (name files, sections, fields).
+  If everything was used, say "none".
+- **Prompt feedback — missing (mechanical)**: what concrete info, if the
+  prompt generator had fed it in automatically, would have let you
+  finish faster or avoid a wrong turn? Think: file contents you had to
+  Read, commands you had to run to discover state, earlier attempt
+  outputs, schema definitions, exact error messages, paths, env vars.
+  Only name things a script could have injected — not judgment calls.
+  If nothing, say "none".
+
+This is mandatory. The runner parses it to diagnose agent behavior and
+to tune prompts across runs. Keep it terse but specific.
+"""
+
+
+def extract_reasoning(log_path: Path) -> str:
+    """Pull the `## Reasoning` section from the final assistant text block.
+
+    Returns the reasoning section text (without the heading) if found,
+    otherwise the full final assistant message, otherwise empty string.
+    """
+    last_text = ""
+    try:
+        for raw_line in log_path.read_text().splitlines():
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                msg = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("type") != "assistant":
+                continue
+            content = msg.get("message", {}).get("content", [])
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    t = block.get("text", "")
+                    if t.strip():
+                        last_text = t
+    except OSError:
+        return ""
+
+    if not last_text:
+        return ""
+
+    m = re.search(r'(?im)^#{1,6}\s*Reasoning\s*$(.*)', last_text, re.DOTALL)
+    if m:
+        section = m.group(1).strip()
+        next_h = re.search(r'^#{1,6}\s+\S', section, re.MULTILINE)
+        if next_h:
+            section = section[:next_h.start()].rstrip()
+        return section
+
+    return last_text.strip()
+
+
+def write_reasoning_record(spec_dir: str, task_id: str, agent_id: int,
+                           agent_kind: str, log_path: Path,
+                           status: str = "", duration_s: int = 0,
+                           session_id: str | None = None) -> Optional[Path]:
+    """Write a reasoning markdown file to {spec_dir}/reasoning/.
+
+    Returns the path written, or None on failure / empty reasoning.
+    Sequential ordering comes from a zero-padded monotonic counter
+    derived from the existing file count.
+    """
+    if not spec_dir:
+        return None
+    try:
+        reasoning = extract_reasoning(log_path)
+        reasoning_dir = Path(spec_dir) / "reasoning"
+        reasoning_dir.mkdir(parents=True, exist_ok=True)
+        seq = sum(1 for _ in reasoning_dir.glob("*.md")) + 1
+        ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+        safe_kind = re.sub(r'[^a-zA-Z0-9_-]', '-', agent_kind or "agent")
+        safe_task = re.sub(r'[^a-zA-Z0-9_.-]', '-', task_id or "unknown")
+        fname = f"{seq:06d}-{ts}-{safe_kind}-{safe_task}-agent{agent_id}.md"
+        out_path = reasoning_dir / fname
+
+        lines = [
+            f"# {agent_kind} — {task_id} (agent {agent_id})",
+            "",
+            f"- timestamp: {datetime.now().isoformat()}",
+            f"- log: {log_path}",
+        ]
+        if status:
+            lines.append(f"- status: {status}")
+        if duration_s:
+            lines.append(f"- duration_s: {duration_s}")
+        if session_id:
+            lines.append(f"- session: {session_id}")
+        lines.append("")
+        if reasoning:
+            lines.append("## Reasoning")
+            lines.append("")
+            lines.append(reasoning)
+        else:
+            lines.append("_Agent did not produce a reasoning section._")
+        lines.append("")
+        out_path.write_text("\n".join(lines))
+        return out_path
+    except Exception:
+        return None
+
+
 def read_attempt_history(spec_dir: str, task_id: str,
                          session_id: str | None = None) -> list[dict]:
     """Read attempt records for a task.
@@ -3246,6 +3463,258 @@ _MCP_CAPABILITIES = {"mcp-android", "mcp-browser", "mcp-ios"}
 
 # These are auto-grantable (no user intervention needed).
 _AUTO_GRANTABLE_CAPS |= _MCP_CAPABILITIES
+
+# Cross-session loop-detector threshold. If the same (task_id, capability)
+# has triggered this many *unproductive* `platform_init_fail` events within
+# the lookback window across ALL sessions, the runner stops respawning the
+# regular fix-agent and instead promotes the next attempt to a **meta-fix
+# agent** — a differently-prompted agent whose charter is not to fix the
+# immediate error but to name and attack the structural issue behind the
+# repeating failures. Per-session retry cap is separate
+# (PLATFORM_INIT_MAX_ATTEMPTS, defined inline near the retry loop).
+PLATFORM_LOOP_FAIL_THRESHOLD = 3
+PLATFORM_LOOP_LOOKBACK_HOURS = 24
+
+# How many consecutive meta-fix attempts the runner will spawn before
+# giving up and writing BLOCKED.md. Two chances is enough: if the first
+# meta-agent restructured things into a new failure mode, the second gets
+# to continue from there; if it couldn't, a human needs to look.
+PLATFORM_META_FIX_MAX = 2
+
+
+def _count_recent_platform_failures(
+    run_log_path: Path, task_id: str, capability: str, lookback_hours: int
+) -> tuple[int, Optional[str]]:
+    """Count the trailing streak of *unproductive* platform_init_fail events
+    for (task_id, capability) within the lookback window.
+
+    A fail is "productive" (= real progress) if the fix-agent attempt that
+    followed it reported a new `root_cause` (via `platform_fix_claim`) or
+    marked itself `verified`. Productive fails reset the streak; unproductive
+    fails accumulate toward PLATFORM_LOOP_FAIL_THRESHOLD. This keeps the
+    breaker from tripping while the agents are genuinely diagnosing new
+    causes each round, but still stops the loop once they start repeating
+    themselves.
+
+    Returns (streak, last_root_cause). `last_root_cause` is the most recent
+    root_cause seen on a fix-claim within the window (for triage / BLOCKED.md),
+    or None if no claim was emitted. Returns (0, None) if the log is missing
+    or unreadable — we'd rather under-count than crash the runner."""
+    if not run_log_path.exists():
+        return 0, None
+    cutoff = datetime.now() - timedelta(hours=lookback_hours)
+    # Replay fail + claim events in order so we can pair each fail with the
+    # fix-claim that followed it (same task+cap, next in log).
+    events: list[tuple[str, dict]] = []
+    try:
+        with open(run_log_path, "r") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                ev = rec.get("event")
+                if ev not in ("platform_init_fail", "platform_fix_claim"):
+                    continue
+                if rec.get("task_id") != task_id or rec.get("capability") != capability:
+                    continue
+                ts = rec.get("timestamp", "")
+                try:
+                    when = datetime.fromisoformat(ts)
+                except ValueError:
+                    continue
+                if when >= cutoff:
+                    events.append((ev, rec))
+    except OSError:
+        return 0, None
+
+    streak = 0
+    prev_root_cause: Optional[str] = None
+    pending_fail = False
+    for ev, rec in events:
+        if ev == "platform_init_fail":
+            # Assume unproductive until a following claim proves otherwise.
+            streak += 1
+            pending_fail = True
+        elif ev == "platform_fix_claim" and pending_fail:
+            root_cause = rec.get("root_cause")
+            verified = bool(rec.get("verified"))
+            # Real progress: verified fix OR a new root_cause we haven't
+            # seen on the current streak. Either resets the streak.
+            if verified or (root_cause and root_cause != prev_root_cause):
+                streak = 0
+                prev_root_cause = root_cause
+            else:
+                # Same (or missing) root_cause → still unproductive; keep
+                # the streak incremented from the fail event above.
+                if root_cause:
+                    prev_root_cause = root_cause
+            pending_fail = False
+    return streak, prev_root_cause
+
+
+def _count_recent_meta_fix_attempts(
+    run_log_path: Path, task_id: str, capability: str, lookback_hours: int
+) -> int:
+    """Count how many meta-fix agents have been spawned (and not yet
+    followed by a verified success) for (task_id, capability) within the
+    window. Used to cap meta-fix attempts at PLATFORM_META_FIX_MAX so the
+    runner doesn't loop on meta-fixes forever either.
+
+    A meta-fix attempt is marked by a `platform_meta_fix_spawn` event.
+    A verified fix clears the counter (same logic as the regular streak)."""
+    if not run_log_path.exists():
+        return 0
+    cutoff = datetime.now() - timedelta(hours=lookback_hours)
+    count = 0
+    try:
+        with open(run_log_path, "r") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                ev = rec.get("event")
+                if ev not in (
+                    "platform_meta_fix_spawn", "platform_fix_claim",
+                ):
+                    continue
+                if rec.get("task_id") != task_id or rec.get("capability") != capability:
+                    continue
+                try:
+                    when = datetime.fromisoformat(rec.get("timestamp", ""))
+                except ValueError:
+                    continue
+                if when < cutoff:
+                    continue
+                if ev == "platform_meta_fix_spawn":
+                    count += 1
+                elif ev == "platform_fix_claim" and rec.get("verified"):
+                    # A verified claim wipes the meta-fix streak, same way
+                    # it wipes the regular streak.
+                    count = 0
+    except OSError:
+        return 0
+    return count
+
+
+def _attempts_state_key(task_id: str, capability: str) -> str:
+    """Stable key for the persisted attempt-count state file."""
+    return f"{task_id}|{capability}"
+
+
+def _load_persisted_attempt(state_path: Path, task_id: str, capability: str,
+                             max_age_hours: int) -> int:
+    """Return the last persisted attempt count for (task_id, capability),
+    or 0 if missing / stale / unreadable. Stale entries (older than
+    max_age_hours) are treated as 0 so a day-old failure doesn't force an
+    immediate BLOCKED on the next run."""
+    if not state_path.exists():
+        return 0
+    try:
+        data = json.loads(state_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return 0
+    entry = (data or {}).get(_attempts_state_key(task_id, capability))
+    if not isinstance(entry, dict):
+        return 0
+    ts = entry.get("timestamp", "")
+    try:
+        when = datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return 0
+    if datetime.now() - when > timedelta(hours=max_age_hours):
+        return 0
+    val = entry.get("attempt", 0)
+    return val if isinstance(val, int) and val > 0 else 0
+
+
+def _save_persisted_attempt(state_path: Path, task_id: str, capability: str,
+                             attempt: int) -> None:
+    """Write the current attempt count so a re-exec can resume at attempt+1.
+    Best-effort: disk errors are logged upstream via the caller, not here."""
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        data: dict = {}
+        if state_path.exists():
+            try:
+                data = json.loads(state_path.read_text()) or {}
+            except json.JSONDecodeError:
+                data = {}
+        data[_attempts_state_key(task_id, capability)] = {
+            "attempt": attempt,
+            "timestamp": datetime.now().isoformat(),
+        }
+        state_path.write_text(json.dumps(data, indent=2))
+    except OSError:
+        pass  # best-effort; counter will just restart next time
+
+
+def _clear_persisted_attempt(state_path: Path, task_id: str,
+                              capability: str) -> None:
+    """Drop the persisted attempt for (task_id, capability). Called on
+    success and when the attempt budget is exhausted — in both cases the
+    next run should start a fresh budget rather than resume mid-flight."""
+    if not state_path.exists():
+        return
+    try:
+        data = json.loads(state_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    key = _attempts_state_key(task_id, capability)
+    if not isinstance(data, dict) or key not in data:
+        return
+    data.pop(key, None)
+    try:
+        if data:
+            state_path.write_text(json.dumps(data, indent=2))
+        else:
+            state_path.unlink()
+    except OSError:
+        pass
+
+
+def _extract_fix_agent_claim(log_path: Path) -> Optional[dict]:
+    """Pull the structured `<claim>{...}</claim>` JSON trailer from a
+    fix-agent's stream-json log. Returns the parsed dict, or None if the
+    agent didn't emit one. The fix prompt instructs the agent to end its
+    final message with this trailer; #2 of the observability work."""
+    if not log_path.exists():
+        return None
+    final_text = ""
+    try:
+        with open(log_path, "r") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if msg.get("type") == "result" and msg.get("result"):
+                    final_text = msg["result"]
+                elif msg.get("type") == "assistant":
+                    for block in msg.get("message", {}).get("content", []):
+                        if block.get("type") == "text" and block.get("text"):
+                            final_text = block["text"]
+    except OSError:
+        return None
+    if not final_text:
+        return None
+    m = re.search(r"<claim>\s*(\{.*?\})\s*</claim>", final_text, re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
 
 
 # ── Platform drivers ───────────────────────────────────────────────────
@@ -3621,21 +4090,40 @@ class PlatformRuntime:
     _mcp_config_path: Optional[Path] = None
     _mcp_probe_stderr_path: Optional[Path] = None
 
-    def boot(self, project_dir: Path, log_fn=None) -> bool:
-        """Boot the platform runtime. Returns True on success."""
+    def boot(self, project_dir: Path, log_fn=None, event_fn=None) -> bool:
+        """Boot the platform runtime. Returns True on success.
+
+        event_fn(event_type, **fields) is called at key lifecycle points so
+        the runner can persist structured observability events to
+        run-log.jsonl. See #1/#4 of platform-init observability. Callers
+        that don't care about events can omit it — we default to a no-op.
+        """
         _log = log_fn or (lambda msg: print(f"[platform:{self.name}] {msg}", file=sys.stderr))
+        _emit = event_fn or (lambda _type, **_k: None)
 
         if self._booted:
             _log(f"{self.name} already booted")
             return True
 
-        if self.name == "android":
-            return self._boot_android(project_dir, _log)
-        elif self.name == "browser":
-            return self._boot_browser(project_dir, _log)
-        elif self.name == "ios":
-            return self._boot_ios(project_dir, _log)
-        return False
+        _emit("mcp_boot_start", platform=self.name, capability=self.capability)
+        t0 = time.time()
+        try:
+            if self.name == "android":
+                ok = self._boot_android(project_dir, _log, _emit)
+            elif self.name == "browser":
+                ok = self._boot_browser(project_dir, _log)
+            elif self.name == "ios":
+                ok = self._boot_ios(project_dir, _log)
+            else:
+                ok = False
+        finally:
+            elapsed = int(time.time() - t0)
+        _emit(
+            "mcp_boot_ok" if ok else "mcp_boot_fail",
+            platform=self.name, capability=self.capability,
+            duration_s=elapsed,
+        )
+        return ok
 
     def readiness_check(self, log_fn=None) -> bool:
         """Check if the runtime is ready to accept commands."""
@@ -3908,8 +4396,15 @@ class PlatformRuntime:
 
     # ── Android internals ──
 
-    def _boot_android(self, project_dir: Path, log) -> bool:
-        """Boot Android emulator. Looks for project-provided start-emulator or uses adb."""
+    def _boot_android(self, project_dir: Path, log, emit=None) -> bool:
+        """Boot Android emulator. Looks for project-provided start-emulator or uses adb.
+
+        emit(event_type, **fields) is called for AVD/emulator health probes
+        (#4 observability). The events distinguish *which* phase failed —
+        script launch, sys.boot_completed wait, or package-manager wait —
+        so the next session knows whether to fix the AVD config, the
+        emulator binary, or the install path."""
+        emit = emit or (lambda _t, **_k: None)
         log("Booting Android emulator...")
 
         # Check for project-provided emulator script (e.g. nix-key's start-emulator)
@@ -3928,14 +4423,21 @@ class PlatformRuntime:
 
         if start_script:
             log(f"Using emulator script: {start_script}")
+            emit("avd_script_start", script=str(start_script))
             result = subprocess.run(
                 [str(start_script)],
                 capture_output=True, timeout=300,
                 cwd=str(project_dir),
             )
             if result.returncode != 0:
-                log(f"Emulator script failed: {result.stderr.decode()[:300]}")
+                stderr_tail = result.stderr.decode(errors="replace")[-500:]
+                log(f"Emulator script failed: {stderr_tail[:300]}")
+                emit("avd_script_fail",
+                     script=str(start_script),
+                     exit_code=result.returncode,
+                     stderr_tail=stderr_tail)
                 return False
+            emit("avd_script_ok", script=str(start_script))
         else:
             # Fallback: try nix develop --command start-emulator if a flake exists
             flake_nix = project_dir / "flake.nix"
@@ -3972,22 +4474,40 @@ class PlatformRuntime:
         if not self._wait_for("boot_completed",
                               ["adb", "shell", "getprop", "sys.boot_completed"],
                               expected="1", timeout=180, log=log):
+            devices = ""
+            try:
+                d = subprocess.run(
+                    ["adb", "devices"], capture_output=True, timeout=5,
+                )
+                devices = d.stdout.decode(errors="replace")
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                pass
+            emit("avd_boot_completed_timeout",
+                 timeout_s=180, adb_devices=devices)
             return False
+        emit("avd_boot_completed_ok")
 
         # Wait for package manager (important for install)
         log("Waiting for package manager...")
         deadline = time.time() + 120
+        pm_ready = False
+        last_pkg_count = 0
         while time.time() < deadline:
             pm = subprocess.run(
                 ["adb", "shell", "pm", "list", "packages"],
                 capture_output=True, timeout=10,
             )
-            if pm.returncode == 0 and len(pm.stdout.decode().splitlines()) > 30:
-                break
+            if pm.returncode == 0:
+                last_pkg_count = len(pm.stdout.decode().splitlines())
+                if last_pkg_count > 30:
+                    pm_ready = True
+                    break
             time.sleep(3)
-        else:
+        if not pm_ready:
             log("Package manager not ready after 120s")
+            emit("avd_pm_timeout", timeout_s=120, last_pkg_count=last_pkg_count)
             return False
+        emit("avd_pm_ok", pkg_count=last_pkg_count)
 
         self._booted = True
         log("Android emulator ready")
@@ -4003,6 +4523,61 @@ class PlatformRuntime:
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return False
 
+    def _record_build_failure(self, reason: str, error_line: str,
+                              phase: str, extra: Optional[dict] = None) -> None:
+        """Record a structured Android build failure on the runtime so that
+        platform_init_fail carries diagnostic fields instead of nulls.
+        PlatformManager reads _last_build_failure off the runtime (or its own
+        cache) when constructing the run-log event.
+        """
+        self._last_build_failure = {
+            "failed_service": "android_build",
+            "phase": phase,
+            "reason": reason,
+            "error_line": error_line,
+            **(extra or {}),
+        }
+
+    @staticmethod
+    def _find_android_build_roots(project_dir: Path) -> list[Path]:
+        """Discover Android build roots under project_dir.
+
+        Returns a list of directories where an Android build can be kicked
+        off. Each entry is one of:
+          - a Flutter project root (contains pubspec.yaml AND android/)
+          - a plain Gradle project root (contains android/gradlew)
+          - project_dir itself if it contains gradlew directly
+
+        Handles multi-app repos (e.g. kanix with customer/ and admin/) where
+        the top-level has no build files but subdirectories do.
+        """
+        roots: list[Path] = []
+        # Fast path: project_dir itself is a build root.
+        if (project_dir / "gradlew").exists():
+            roots.append(project_dir)
+        if (project_dir / "android" / "gradlew").exists():
+            roots.append(project_dir)
+        if roots:
+            return roots
+
+        # Multi-app repo: scan up to 3 levels deep for pubspec.yaml + android/
+        # or android/gradlew. Skip vendored dirs to keep this fast.
+        SKIP_DIRS = {
+            "node_modules", ".git", "build", ".dart_tool", ".gradle",
+            "ios", "macos", "windows", "linux", "web",
+            "dist", "target", ".venv", "venv", ".tox",
+        }
+        for entry in sorted(project_dir.iterdir()):
+            if not entry.is_dir() or entry.name in SKIP_DIRS or entry.name.startswith("."):
+                continue
+            if (entry / "pubspec.yaml").exists() and (entry / "android").exists():
+                roots.append(entry)
+            elif (entry / "android" / "gradlew").exists():
+                roots.append(entry)
+            elif (entry / "gradlew").exists():
+                roots.append(entry)
+        return roots
+
     def _build_install_android(self, project_dir: Path, log,
                                build_log_path: Optional[Path] = None) -> BuildResult:
         """Build debug APK and install on emulator.
@@ -4016,6 +4591,7 @@ class PlatformRuntime:
         entire output into context.
         """
         log("Building Android APK...")
+        self._last_build_failure = None
 
         def _write_build_log(result: subprocess.CompletedProcess, phase: str):
             if not build_log_path:
@@ -4033,42 +4609,148 @@ class PlatformRuntime:
                     f.write(result.stderr.decode(errors="replace"))
                 f.write("\n")
 
-        # Detect build system
-        gradle_dir = None
-        for candidate in [project_dir / "android", project_dir]:
-            if (candidate / "gradlew").exists():
-                gradle_dir = candidate
-                break
+        def _tail(data: bytes, n: int = 400) -> str:
+            text = data.decode(errors="replace") if data else ""
+            return text[-n:].strip()
 
-        if not gradle_dir:
-            # Try make target
-            if (project_dir / "Makefile").exists():
-                result = subprocess.run(
-                    ["make", "android-apk"], capture_output=True, timeout=600,
-                    cwd=str(project_dir),
-                )
-                _write_build_log(result, "make android-apk")
-                if result.returncode != 0:
-                    log(f"make android-apk failed (full log: {build_log_path})")
-                    return BuildResult.BUILD_FAILED
-            else:
-                log("No Gradle or Makefile found for Android build")
-                return BuildResult.BUILD_FAILED
+        # Detect build system. Check fast paths first, then multi-app repos.
+        build_root: Optional[Path] = None
+        build_kind: Optional[str] = None  # "flutter" | "gradle" | "make"
+
+        # 1. Flutter at project_dir
+        if (project_dir / "pubspec.yaml").exists() and (project_dir / "android").exists():
+            build_root, build_kind = project_dir, "flutter"
+        # 2. Gradle at project_dir/android
+        elif (project_dir / "android" / "gradlew").exists():
+            build_root, build_kind = project_dir / "android", "gradle"
+        # 3. Gradle at project_dir
+        elif (project_dir / "gradlew").exists():
+            build_root, build_kind = project_dir, "gradle"
+        # 4. Makefile
+        elif (project_dir / "Makefile").exists():
+            build_root, build_kind = project_dir, "make"
         else:
+            # 5. Multi-app repo — search subdirectories
+            candidates = self._find_android_build_roots(project_dir)
+            if len(candidates) == 1:
+                cand = candidates[0]
+                if (cand / "pubspec.yaml").exists():
+                    build_root, build_kind = cand, "flutter"
+                elif (cand / "android" / "gradlew").exists():
+                    build_root, build_kind = cand / "android", "gradle"
+                elif (cand / "gradlew").exists():
+                    build_root, build_kind = cand, "gradle"
+            elif len(candidates) > 1:
+                names = ", ".join(c.name for c in candidates)
+                msg = (
+                    f"Multi-app repo: found {len(candidates)} Android build roots "
+                    f"({names}); set ANDROID_BUILD_ROOT env var to disambiguate"
+                )
+                log(msg)
+                override = os.environ.get("ANDROID_BUILD_ROOT")
+                if override:
+                    picked = project_dir / override
+                    if (picked / "pubspec.yaml").exists() and (picked / "android").exists():
+                        build_root, build_kind = picked, "flutter"
+                    elif (picked / "android" / "gradlew").exists():
+                        build_root, build_kind = picked / "android", "gradle"
+                    elif (picked / "gradlew").exists():
+                        build_root, build_kind = picked, "gradle"
+                if not build_root:
+                    self._record_build_failure(
+                        reason="ambiguous_build_root",
+                        error_line=msg,
+                        phase="detect",
+                        extra={"candidates": [str(c) for c in candidates]},
+                    )
+                    return BuildResult.BUILD_FAILED
+
+        if not build_root or not build_kind:
+            msg = (
+                f"No Android build system found under {project_dir} "
+                f"(searched for pubspec.yaml+android/, android/gradlew, gradlew, Makefile; "
+                f"also scanned first-level subdirs for multi-app layout)"
+            )
+            log(msg)
+            self._record_build_failure(
+                reason="no_build_system",
+                error_line=msg,
+                phase="detect",
+            )
+            return BuildResult.BUILD_FAILED
+
+        log(f"Android build: kind={build_kind} root={build_root}")
+
+        if build_kind == "flutter":
             result = subprocess.run(
-                [str(gradle_dir / "gradlew"), "assembleDebug"],
+                ["flutter", "build", "apk", "--debug"],
+                capture_output=True, timeout=900,
+                cwd=str(build_root),
+            )
+            _write_build_log(result, "flutter build apk --debug")
+            if result.returncode != 0:
+                log(f"flutter build apk failed (full log: {build_log_path})")
+                self._record_build_failure(
+                    reason="flutter_build_failed",
+                    error_line=_tail(result.stderr) or _tail(result.stdout),
+                    phase="flutter build apk --debug",
+                    extra={"cwd": str(build_root), "exit_code": result.returncode},
+                )
+                return BuildResult.BUILD_FAILED
+        elif build_kind == "make":
+            result = subprocess.run(
+                ["make", "android-apk"], capture_output=True, timeout=600,
+                cwd=str(build_root),
+            )
+            _write_build_log(result, "make android-apk")
+            if result.returncode != 0:
+                log(f"make android-apk failed (full log: {build_log_path})")
+                self._record_build_failure(
+                    reason="make_failed",
+                    error_line=_tail(result.stderr) or _tail(result.stdout),
+                    phase="make android-apk",
+                    extra={"cwd": str(build_root), "exit_code": result.returncode},
+                )
+                return BuildResult.BUILD_FAILED
+        else:  # gradle
+            result = subprocess.run(
+                [str(build_root / "gradlew"), "assembleDebug"],
                 capture_output=True, timeout=600,
-                cwd=str(gradle_dir),
+                cwd=str(build_root),
             )
             _write_build_log(result, "gradlew assembleDebug")
             if result.returncode != 0:
                 log(f"Gradle assembleDebug failed (full log: {build_log_path})")
+                self._record_build_failure(
+                    reason="gradle_failed",
+                    error_line=_tail(result.stderr) or _tail(result.stdout),
+                    phase="gradlew assembleDebug",
+                    extra={"cwd": str(build_root), "exit_code": result.returncode},
+                )
                 return BuildResult.BUILD_FAILED
 
-        # Find and install APK
-        apk_candidates = list(project_dir.rglob("*-debug.apk")) + list(project_dir.rglob("app-debug.apk"))
+        # Find and install APK. Search under build_root first (multi-app
+        # repos) and fall back to project_dir so we still pick up unusual
+        # output layouts. Deduplicate paths.
+        apk_search_roots = [build_root]
+        if build_root != project_dir:
+            apk_search_roots.append(project_dir)
+        apk_candidates: list[Path] = []
+        for root in apk_search_roots:
+            apk_candidates.extend(root.rglob("*-debug.apk"))
+            apk_candidates.extend(root.rglob("app-debug.apk"))
+        # Deduplicate while preserving order.
+        seen: set[Path] = set()
+        apk_candidates = [p for p in apk_candidates if not (p in seen or seen.add(p))]
         if not apk_candidates:
-            log("No debug APK found after build")
+            msg = f"No debug APK found after build (searched under {build_root})"
+            log(msg)
+            self._record_build_failure(
+                reason="apk_not_found",
+                error_line=msg,
+                phase="apk_discovery",
+                extra={"build_root": str(build_root)},
+            )
             return BuildResult.BUILD_FAILED
 
         apk = sorted(apk_candidates, key=lambda p: p.stat().st_mtime, reverse=True)[0]
@@ -4108,6 +4790,12 @@ class PlatformRuntime:
                 _write_build_log(install, "adb install (retry after uninstall)")
             if install.returncode != 0:
                 log(f"APK install failed (full log: {build_log_path})")
+                self._record_build_failure(
+                    reason="adb_install_failed",
+                    error_line=_tail(install.stderr) or _tail(install.stdout),
+                    phase="adb install",
+                    extra={"apk": str(apk), "exit_code": install.returncode},
+                )
                 return BuildResult.INSTALL_FAILED
 
         log("APK installed successfully")
@@ -4234,9 +4922,14 @@ class PlatformManager:
     in its setup script. The runner doesn't need to know what the services are.
     """
 
-    def __init__(self, log_fn=None):
+    def __init__(self, log_fn=None, event_fn=None):
         self._runtimes: dict[str, PlatformRuntime] = {}
         self._log = log_fn or (lambda msg: print(f"[platforms] {msg}", file=sys.stderr))
+        # event_fn(event_type, **fields) drains lifecycle events from
+        # PlatformRuntime.boot up to run-log.jsonl. The runner attaches the
+        # real writer; default no-op keeps unit tests / tools using the
+        # manager standalone working unchanged.
+        self._event = event_fn or (lambda _t, **_k: None)
         self._e2e_services_started = False
 
     def _start_e2e_services(self, project_dir: Path) -> bool:
@@ -4441,13 +5134,17 @@ class PlatformManager:
         runtime = PlatformRuntime(name=name, capability=capability)
         self._log(f"Initializing {name} platform runtime...")
 
-        if not runtime.boot(project_dir, self._log):
+        if not runtime.boot(project_dir, self._log, self._event):
             self._log(f"Failed to boot {name} runtime")
             return None
 
         if not runtime.readiness_check(self._log):
             self._log(f"{name} runtime failed readiness check")
+            self._event("mcp_readiness_fail",
+                        platform=name, capability=capability)
             return None
+        self._event("mcp_readiness_ok",
+                    platform=name, capability=capability)
 
         # Register early so build_and_install can find the runtime
         self._runtimes[name] = runtime
@@ -4455,13 +5152,56 @@ class PlatformManager:
         build_result = self.build_and_install(capability, project_dir)
         if build_result != BuildResult.OK:
             self._log(f"Failed to build/install for {name} ({build_result.value})")
+            # Surface the structured build failure (if any) onto the manager
+            # so the runner's platform_init_fail emitter can include
+            # failed_service/phase/error_line instead of nulls. Without this,
+            # fix-agents see `failed_service: null, patterns: []` and have to
+            # guess at the cause (emulator? AVD? PATH?) when the real issue
+            # is an Android build detection or compile error.
+            bf = getattr(runtime, "_last_build_failure", None)
+            if bf:
+                self._last_build_failure = {
+                    **bf,
+                    "build_result": build_result.value,
+                    "capability": capability,
+                }
+            self._event(
+                "mcp_build_fail",
+                platform=name, capability=capability,
+                build_result=build_result.value,
+                reason=(bf or {}).get("reason"),
+                phase=(bf or {}).get("phase"),
+                error_line=(bf or {}).get("error_line"),
+            )
             del self._runtimes[name]
             return None
 
+        self._event("mcp_init_start",
+                    platform=name, capability=capability)
         if not runtime.start_mcp_server(project_dir, self._log):
             self._log(f"Failed to start MCP server for {name}")
+            self._event("mcp_init_fail",
+                        platform=name, capability=capability,
+                        reason="start_mcp_server returned False")
             del self._runtimes[name]
             return None
+        # Probe the configured binary so we capture stderr if it crashes
+        # at handshake. Healthy servers block — that's the "launched"
+        # outcome and we record it as ok. See probe_mcp_launch().
+        probe = runtime.probe_mcp_launch(project_dir, self._log)
+        if probe.get("status") in ("launched",) or probe.get("stdout_got_response"):
+            self._event("mcp_init_ok",
+                        platform=name, capability=capability,
+                        probe_status=probe.get("status"))
+        else:
+            stderr_tail = (probe.get("stderr") or "")[-1000:]
+            self._event("mcp_init_fail",
+                        platform=name, capability=capability,
+                        probe_status=probe.get("status"),
+                        stderr_tail=stderr_tail,
+                        message=probe.get("message", ""))
+            # Don't abort — start_mcp_server already succeeded; the probe
+            # is diagnostic. The Claude CLI may still connect successfully.
 
         self._log(f"{name} platform runtime fully initialized")
         return runtime
@@ -7073,7 +7813,7 @@ class Runner:
             for agent in agents_snapshot:
                 if agent.log_file:
                     pos = self._read_positions.get(agent.agent_id, 0)
-                    new_lines, new_pos, exit_code, (in_tok, out_tok) = read_stream_output(agent.log_file, pos)
+                    new_lines, new_pos, exit_code, (in_tok, out_tok), brk = read_stream_output(agent.log_file, pos)
                     self._read_positions[agent.agent_id] = new_pos
 
                     if new_lines:
@@ -7085,8 +7825,13 @@ class Runner:
                     # Update token counts (latest usage from stream replaces prior)
                     if in_tok > 0:
                         agent.input_tokens = in_tok
+                        agent.input_tokens_fresh = brk.get("input_tokens_fresh", agent.input_tokens_fresh)
+                        agent.input_tokens_cache_read = brk.get("input_tokens_cache_read", agent.input_tokens_cache_read)
+                        agent.input_tokens_cache_create = brk.get("input_tokens_cache_create", agent.input_tokens_cache_create)
                     if out_tok > 0:
                         agent.output_tokens = out_tok
+                    if brk.get("model"):
+                        agent.model = brk["model"]
 
                     if exit_code is not None:
                         agent.exit_code = exit_code
@@ -7147,11 +7892,27 @@ class Runner:
 
                     # Write attempt record for non-VR tasks
                     spec_dir = getattr(self, '_current_spec_dir', '')
+                    duration_s = int(time.time() - agent.start_time)
                     if spec_dir and not agent.task.id.startswith("VR-"):
-                        duration_s = int(time.time() - agent.start_time)
                         summary = extract_attempt_summary(agent.log_file) if agent.log_file else {}
                         write_attempt_record(spec_dir, agent.task.id, agent.agent_id, duration_s, summary,
                                              session_id=self.session_id)
+                    # Reasoning writeup for EVERY agent (task, VR, verify, etc.)
+                    if spec_dir and agent.log_file:
+                        if agent.task.id.startswith("VR-"):
+                            _kind = "vr"
+                        elif agent.task.id.startswith("verify-"):
+                            _kind = "verify"
+                        elif agent.task.id.startswith("fix-"):
+                            _kind = "fix"
+                        else:
+                            _kind = "task"
+                        write_reasoning_record(
+                            spec_dir, agent.task.id, agent.agent_id,
+                            _kind, agent.log_file,
+                            status=agent.status, duration_s=duration_s,
+                            session_id=self.session_id,
+                        )
 
                     # Structured event log
                     _sd = getattr(self, '_current_spec_dir', '')
@@ -7317,14 +8078,19 @@ class Runner:
 
             # Read final token counts from sub-agent log
             sub_in_tok, sub_out_tok = 0, 0
+            sub_brk = {}
             if log_p and log_p.exists():
-                _, _, _, (sub_in_tok, sub_out_tok) = read_stream_output(log_p, 0)
+                _, _, _, (sub_in_tok, sub_out_tok), sub_brk = read_stream_output(log_p, 0)
 
             # Record sub-agent in parent's history and update aggregate totals
             record = SubAgentRecord(
                 agent_id=aid, label=sub_task.id,
                 input_tokens=sub_in_tok, output_tokens=sub_out_tok,
                 elapsed_s=sub_elapsed, status=sub_status,
+                input_tokens_fresh=sub_brk.get("input_tokens_fresh", 0),
+                input_tokens_cache_read=sub_brk.get("input_tokens_cache_read", 0),
+                input_tokens_cache_create=sub_brk.get("input_tokens_cache_create", 0),
+                model=sub_brk.get("model") or "opus",
             )
             with self._lock:
                 for a in self.agents:
@@ -7332,11 +8098,24 @@ class Runner:
                         a.sub_agent_history.append(record)
                         a.input_tokens += sub_in_tok
                         a.output_tokens += sub_out_tok
+                        a.input_tokens_fresh += sub_brk.get("input_tokens_fresh", 0)
+                        a.input_tokens_cache_read += sub_brk.get("input_tokens_cache_read", 0)
+                        a.input_tokens_cache_create += sub_brk.get("input_tokens_cache_create", 0)
                         a.active_sub_agent_id = None
                         break
                 self.agents = [a for a in self.agents if a.agent_id != aid]
 
             ci_log(f"{label} completed (exit {proc.returncode}, {(sub_in_tok + sub_out_tok) // 1000}k tok)")
+
+            # Reasoning writeup for this CI sub-agent
+            _sd = getattr(self, '_current_spec_dir', '')
+            if _sd and log_p:
+                _kind = re.sub(r'\s+', '-', (label or 'ci-sub').strip().lower())[:40] or 'ci-sub'
+                write_reasoning_record(
+                    _sd, sub_task.id, aid, f"ci-{_kind}", log_p,
+                    status=sub_status, duration_s=sub_elapsed,
+                    session_id=self.session_id,
+                )
 
             # Detect auth failures — abort early instead of looping uselessly
             if proc.returncode != 0:
@@ -7899,13 +8678,18 @@ class Runner:
             slot.status = sub_status
 
             sub_in_tok, sub_out_tok = 0, 0
+            sub_brk = {}
             if log_p and log_p.exists():
-                _, _, _, (sub_in_tok, sub_out_tok) = read_stream_output(log_p, 0)
+                _, _, _, (sub_in_tok, sub_out_tok), sub_brk = read_stream_output(log_p, 0)
 
             record = SubAgentRecord(
                 agent_id=aid, label=sub_task.id,
                 input_tokens=sub_in_tok, output_tokens=sub_out_tok,
                 elapsed_s=int(time.time() - slot.start_time), status=sub_status,
+                input_tokens_fresh=sub_brk.get("input_tokens_fresh", 0),
+                input_tokens_cache_read=sub_brk.get("input_tokens_cache_read", 0),
+                input_tokens_cache_create=sub_brk.get("input_tokens_cache_create", 0),
+                model=sub_brk.get("model") or "opus",
             )
             with self._lock:
                 for a in self.agents:
@@ -7913,11 +8697,25 @@ class Runner:
                         a.sub_agent_history.append(record)
                         a.input_tokens += sub_in_tok
                         a.output_tokens += sub_out_tok
+                        a.input_tokens_fresh += sub_brk.get("input_tokens_fresh", 0)
+                        a.input_tokens_cache_read += sub_brk.get("input_tokens_cache_read", 0)
+                        a.input_tokens_cache_create += sub_brk.get("input_tokens_cache_create", 0)
                         a.active_sub_agent_id = None
                         break
                 self.agents = [a for a in self.agents if a.agent_id != aid]
 
             e2e_log(f"{label} completed (exit {proc.returncode}, {(sub_in_tok + sub_out_tok) // 1000}k tok)")
+
+            # Reasoning writeup for this E2E sub-agent
+            _sd = getattr(self, '_current_spec_dir', '')
+            if _sd and log_p:
+                _kind = re.sub(r'\s+', '-', (label or 'e2e-sub').strip().lower())[:40] or 'e2e-sub'
+                write_reasoning_record(
+                    _sd, sub_task.id, aid, f"e2e-{_kind}", log_p,
+                    status=sub_status,
+                    duration_s=int(time.time() - slot.start_time),
+                    session_id=self.session_id,
+                )
 
             if proc.returncode != 0:
                 auth_err = check_auth_error(log_p)
@@ -8024,12 +8822,17 @@ class Runner:
             )
             r.slot.status = sub_status
             sub_in_tok, sub_out_tok = 0, 0
+            sub_brk = {}
             if r.log_p and r.log_p.exists():
-                _, _, _, (sub_in_tok, sub_out_tok) = read_stream_output(r.log_p, 0)
+                _, _, _, (sub_in_tok, sub_out_tok), sub_brk = read_stream_output(r.log_p, 0)
             record = SubAgentRecord(
                 agent_id=r.aid, label=r.sub_task.id,
                 input_tokens=sub_in_tok, output_tokens=sub_out_tok,
                 elapsed_s=int(time.time() - r.slot.start_time), status=sub_status,
+                input_tokens_fresh=sub_brk.get("input_tokens_fresh", 0),
+                input_tokens_cache_read=sub_brk.get("input_tokens_cache_read", 0),
+                input_tokens_cache_create=sub_brk.get("input_tokens_cache_create", 0),
+                model=sub_brk.get("model") or "opus",
             )
             with self._lock:
                 for a in self.agents:
@@ -8037,9 +8840,24 @@ class Runner:
                         a.sub_agent_history.append(record)
                         a.input_tokens += sub_in_tok
                         a.output_tokens += sub_out_tok
+                        a.input_tokens_fresh += sub_brk.get("input_tokens_fresh", 0)
+                        a.input_tokens_cache_read += sub_brk.get("input_tokens_cache_read", 0)
+                        a.input_tokens_cache_create += sub_brk.get("input_tokens_cache_create", 0)
                         break
                 self.agents = [a for a in self.agents if a.agent_id != r.aid]
             e2e_log(f"{r.label} completed (exit {r.proc.returncode}, {(sub_in_tok + sub_out_tok) // 1000}k tok)")
+
+            # Reasoning writeup for this parallel E2E sub-agent
+            _sd = getattr(self, '_current_spec_dir', '')
+            if _sd and r.log_p:
+                _kind = re.sub(r'\s+', '-', (r.label or 'e2e-sub').strip().lower())[:40] or 'e2e-sub'
+                write_reasoning_record(
+                    _sd, r.sub_task.id, r.aid, f"e2e-{_kind}", r.log_p,
+                    status=sub_status,
+                    duration_s=int(time.time() - r.slot.start_time),
+                    session_id=self.session_id,
+                )
+
             if r.proc.returncode != 0:
                 auth_err = check_auth_error(r.log_p)
                 if auth_err:
@@ -8058,11 +8876,19 @@ class Runner:
             self.log(msg)
             e2e_log(f"[platform] {msg}")
 
+        # Drain platform lifecycle events to run-log.jsonl so observers can
+        # tell *which* boot/init phase failed across sessions, not just
+        # that "platform_init_fail" fired again.
+        def platform_event(event_type, **fields):
+            self._write_event(event_type, spec_dir, task_id=task.id, **fields)
+
         if not hasattr(self, '_platform_manager'):
-            self._platform_manager = PlatformManager(log_fn=platform_log)
+            self._platform_manager = PlatformManager(
+                log_fn=platform_log, event_fn=platform_event)
         else:
-            # Update log function so it writes to this task's e2e-loop.log
+            # Update log + event hooks for this task's e2e-loop.log
             self._platform_manager._log = platform_log
+            self._platform_manager._event = platform_event
 
         PLATFORM_INIT_MAX_ATTEMPTS = 10
         fix_history_path = project_dir / "test" / "e2e" / ".state" / "fix-history.md"
@@ -8284,6 +9110,148 @@ class Runner:
                 pass
             return ""
 
+        def _build_cross_attempt_summary(cap: str) -> str:
+            """Aggregate prior platform-fix claims + run-log events into a
+            table the fix-agent can use to spot *patterns across attempts*.
+
+            Per-attempt diagnostics answer "what's failing now?"; this
+            answers "what has been tried, and what held?" — the distinction
+            that matters when 10+ attempts each chased a different immediate
+            error without ever stepping back to the category.
+
+            Reads `{spec_dir}/claims/platform-fix-*.json` (structured claims)
+            and `{spec_dir}/run-log.jsonl` (event timeline) — both written
+            by the runner, so format drift stays localized here."""
+            claims_glob = sorted(
+                (Path(spec_dir) / "claims").glob(f"platform-fix-*.json"),
+                key=lambda p: p.stat().st_mtime,
+            )
+            rows: list[dict] = []
+            for cp in claims_glob:
+                try:
+                    rec = json.loads(cp.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if rec.get("task_id") != task.id or rec.get("capability") != cap:
+                    continue
+                claim = rec.get("claim") or {}
+                rows.append({
+                    "attempt": rec.get("attempt"),
+                    "root_cause": (claim.get("root_cause") or "").strip(),
+                    "action_taken": (claim.get("action_taken") or "").strip(),
+                    "verified": bool(claim.get("verified")),
+                    "residual_risk": (claim.get("residual_risk") or "").strip(),
+                    "mtime": cp.stat().st_mtime,
+                })
+            rows.sort(key=lambda r: (r.get("attempt") or 0, r["mtime"]))
+
+            # Also pull the timeline of platform_init_fail events so the
+            # agent can see whether the failure shape itself is changing
+            # (different failed_service / patterns → real progression) or
+            # stuck (all identical → symptom-chasing).
+            fails: list[dict] = []
+            try:
+                with open(Path(spec_dir) / "run-log.jsonl") as f:
+                    for raw in f:
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            rec = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        if rec.get("event") != "platform_init_fail":
+                            continue
+                        if rec.get("task_id") != task.id or rec.get("capability") != cap:
+                            continue
+                        fails.append({
+                            "timestamp": rec.get("timestamp", "")[:19],
+                            "failed_service": rec.get("failed_service"),
+                            "failed_port": rec.get("failed_port"),
+                            "patterns": rec.get("patterns") or [],
+                        })
+            except OSError:
+                pass
+
+            if not rows and not fails:
+                return ""
+
+            out: list[str] = ["\n## Cross-attempt summary (look for patterns, not just the current error)\n"]
+
+            if fails:
+                out.append(
+                    f"Observed **{len(fails)}** `platform_init_fail` event(s) "
+                    f"for `{cap}` on `{task.id}`. Whether they are all the same "
+                    f"shape matters — identical shapes mean each fix-agent was "
+                    f"chasing a symptom, not the root cause.\n"
+                )
+                shape_counts: dict[tuple, int] = {}
+                for ev in fails:
+                    key = (
+                        ev["failed_service"] or "None",
+                        ev["failed_port"] or "None",
+                        ",".join(sorted(ev["patterns"])) or "none",
+                    )
+                    shape_counts[key] = shape_counts.get(key, 0) + 1
+                out.append("\n**Failure shape distribution** (service / port / patterns → count):\n")
+                for (svc, port, pats), n in sorted(
+                    shape_counts.items(), key=lambda kv: -kv[1]
+                ):
+                    out.append(f"- `{svc}` / `{port}` / `{pats}` → **{n}**")
+                if len(shape_counts) == 1 and len(fails) >= 2:
+                    out.append(
+                        "\n*All events share the same shape.* That means the "
+                        "runner's symptom has **not changed across attempts**. "
+                        "If prior fixes each blamed something different, they "
+                        "were very likely addressing symptoms of a deeper cause, "
+                        "not the cause itself."
+                    )
+                elif len(shape_counts) > 1:
+                    out.append(
+                        "\n*Failure shape has changed across attempts.* Some fix "
+                        "attempts did move the system state, even if the overall "
+                        "symptom (boot fail) persisted. Identify which prior fix "
+                        "changed the shape and treat its claim as load-bearing."
+                    )
+
+            if rows:
+                out.append("\n**Prior fix-agent claims** (oldest → newest):\n")
+                for r in rows:
+                    verified_mark = "✅ verified" if r["verified"] else "⚠ unverified"
+                    out.append(
+                        f"\n### Attempt {r['attempt']} — {verified_mark}"
+                    )
+                    if r["root_cause"]:
+                        out.append(f"- **Blamed**: {r['root_cause']}")
+                    if r["action_taken"]:
+                        out.append(f"- **Changed**: {r['action_taken']}")
+                    if r["residual_risk"]:
+                        out.append(f"- **Known residual risk**: {r['residual_risk']}")
+                # De-duplication check — repeated root_causes are the clearest
+                # signal that the loop has stopped making progress.
+                root_causes = [r["root_cause"] for r in rows if r["root_cause"]]
+                distinct = {rc for rc in root_causes}
+                if len(root_causes) >= 2 and len(distinct) < len(root_causes):
+                    out.append(
+                        "\n*⚠ Repeated `root_cause` strings across attempts.* "
+                        "At least one pair of fix-agents independently reached the "
+                        "same conclusion and it still didn't hold. Re-applying "
+                        "the same fix is the #1 way this loop wastes attempts — "
+                        "pick a materially different approach or zoom out to a "
+                        "structural fix."
+                    )
+                if len(root_causes) >= 3:
+                    out.append(
+                        "\n*If each attempt blamed a different thing and none held*, "
+                        "the actual bug is likely **one layer up** from all of them "
+                        "— e.g. an environment drift, a sandbox/host mismatch, or a "
+                        "missing-state issue that surfaces differently each run. "
+                        "Name that higher-level hypothesis explicitly in your "
+                        "hypothesis brief below."
+                    )
+
+            return "\n".join(out)
+
         def _record_attempt(attempt: int, failure: dict, matched: list[str]):
             """Append a terse line to fix-history.md so the next fix-agent
             sees prior attempts at a glance."""
@@ -8305,12 +9273,84 @@ class Runner:
             identifies the failing service and attaches only its tail + port
             binding + matched failure patterns."""
             import shutil as _sh
+            import os as _os
             lines: list[str] = [f"Could not boot `{cap}` runtime.\n", "## Platform diagnostics\n"]
-            lines.append(f"- start-emulator in PATH: {bool(_sh.which('start-emulator'))}")
-            lines.append(f"- emulator in PATH: {bool(_sh.which('emulator'))}")
-            lines.append(f"- adb in PATH: {bool(_sh.which('adb'))}")
+
+            # Resolve runtime CLIs to full paths so PATH-shadowing is visible.
+            # A wrapper (e.g. nix devshell's `emulator-wrapper`) and the raw
+            # SDK binary can both be named `emulator`; printing only a bool
+            # hides which one is winning. Follow up with `which -a` to show
+            # every match in PATH order.
+            def _resolve_all(name: str) -> list[str]:
+                """Return every executable named `name` found on PATH, in order."""
+                seen: list[str] = []
+                for d in _os.environ.get("PATH", "").split(_os.pathsep):
+                    if not d:
+                        continue
+                    cand = _os.path.join(d, name)
+                    if _os.path.isfile(cand) and _os.access(cand, _os.X_OK):
+                        # Resolve symlinks so two names pointing at the same
+                        # binary collapse (common in nix profiles).
+                        real = _os.path.realpath(cand)
+                        if real not in seen:
+                            seen.append(cand)
+                return seen
+
+            for bin_name in ("start-emulator", "emulator", "adb"):
+                resolved = _sh.which(bin_name)
+                if resolved:
+                    all_matches = _resolve_all(bin_name)
+                    lines.append(f"- `{bin_name}` → `{resolved}`")
+                    if len(all_matches) > 1:
+                        shadowed = "\n".join(f"    {i+1}. `{p}`" for i, p in enumerate(all_matches))
+                        lines.append(
+                            f"  - **⚠ {len(all_matches)} matches in PATH — first one wins:**\n{shadowed}\n"
+                            f"  - If the wrong binary is first (e.g. raw SDK ahead of a wrapper), "
+                            f"fix PATH ordering before anything else."
+                        )
+                else:
+                    lines.append(f"- `{bin_name}`: **not found in PATH**")
+
             lines.append(f"- flake.nix exists: {(project_dir / 'flake.nix').exists()}")
             lines.append(f"- project_dir: {project_dir}")
+
+            # Show PATH head so ordering issues are inspectable without
+            # shelling out. Most shadowing bugs are visible in the first ~10.
+            path_head = _os.environ.get("PATH", "").split(_os.pathsep)[:10]
+            lines.append("- `$PATH` (first 10 entries):")
+            for i, p in enumerate(path_head, 1):
+                lines.append(f"    {i}. `{p}`")
+
+            # `emulator -list-avds` is the canonical smoke test for the
+            # Android runtime: empty output means the binary can't find its
+            # SDK (wrong binary on PATH, missing ANDROID_HOME, broken
+            # wrapper). A `which emulator` bool hides this; the actual
+            # output makes it obvious.
+            if _sh.which("emulator"):
+                try:
+                    avd_result = subprocess.run(
+                        ["emulator", "-list-avds"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    avd_stdout = avd_result.stdout.strip()
+                    avd_stderr = avd_result.stderr.strip()
+                    lines.append(
+                        f"- `emulator -list-avds` (exit {avd_result.returncode}):"
+                    )
+                    if avd_stdout:
+                        for avd in avd_stdout.splitlines():
+                            lines.append(f"    - `{avd}`")
+                    else:
+                        lines.append(
+                            "    - **(empty)** — no AVDs visible to this binary. "
+                            "Usually means the wrong `emulator` is first on PATH "
+                            "(e.g. raw SDK shadowing a devshell wrapper)."
+                        )
+                    if avd_stderr:
+                        lines.append(f"    - stderr: `{avd_stderr[:200]}`")
+                except Exception as e:
+                    lines.append(f"- `emulator -list-avds`: error ({e})")
+
             try:
                 adb_result = subprocess.run(
                     ["adb", "devices"], capture_output=True, text=True, timeout=5)
@@ -8326,6 +9366,7 @@ class Runner:
             # the root cause is almost always in that invisible stderr.
             # Re-running the launch here captures it under the same sandbox
             # constraints the CLI faces.
+            probe_green = False  # True only when MCP responded to initialize
             rt = self._platform_manager._runtimes.get(cap)
             if rt is not None and hasattr(rt, "probe_mcp_launch"):
                 probe = rt.probe_mcp_launch(project_dir, log_fn=self._log)
@@ -8352,11 +9393,20 @@ class Runner:
                         lines.append(f"*({note_if_empty})*")
 
                 if probe["status"] == "launched" and probe["stdout_got_response"]:
+                    probe_green = True
                     lines.append(
                         f"\n## MCP launch probe: ✅ `{cap}` responded to initialize\n\n"
                         f"*The binary launched and completed the JSON-RPC handshake. "
-                        f"MCP launch is working; the failure is elsewhere (service "
-                        f"boot, emulator/browser state, or a race between them).*"
+                        f"MCP launch is working; the failure is elsewhere. When the probe "
+                        f"is green but `platform_init_fail` still fires, the cause is "
+                        f"almost always one of:*\n"
+                        f"*  1. A runtime CLI on PATH that looks fine but misbehaves "
+                        f"(wrong `emulator` shadowing a wrapper, broken `adb`, etc.) — "
+                        f"**check the PATH diagnostics above first**.*\n"
+                        f"*  2. A race between the runtime handshake and the check that "
+                        f"decides it's \"booted\".*\n"
+                        f"*Do not chase setup.sh, service logs, port bindings, or pid "
+                        f"files for this failure mode — services are up and MCP works.*"
                     )
                 elif probe["status"] == "launched":
                     lines.append(
@@ -8390,79 +9440,228 @@ class Runner:
             setup_log = project_dir / "test" / "e2e" / ".state" / "setup-failure.log"
             failure = _parse_setup_failure(setup_log)
 
-            if failure.get("error_line"):
-                lines.append(f"\n## Failing step\n\n`{failure['error_line']}`")
-            if failure.get("timed_out"):
-                lines.append("\n*setup.sh was killed by the runner after 300s (timeout).*")
+            # Ambiguous-failure snapshot. When the runner reports a
+            # platform_init_fail but has no failed_service, no error_line,
+            # and no matched patterns — i.e. it knows something went wrong
+            # but can't name it — the fix-agent previously had to re-derive
+            # environment context from scratch every time. Dump it once,
+            # here, so the same facts don't get re-discovered across N
+            # attempts. This is the case T097 kept hitting: probe green,
+            # avd_boot_completed_ok, then silent platform_init_fail with
+            # `failed_service: null, patterns: []`.
+            probe_green_and_opaque = (
+                probe_green
+                and not failure.get("failed_service")
+                and not failure.get("error_line")
+                and not failure.get("timed_out")
+            )
+            if probe_green_and_opaque:
+                lines.append(
+                    "\n## Opaque-failure snapshot (probe ✅, no failing service, no matched pattern)\n\n"
+                    "*The runner marked this boot as failed but has no structured "
+                    "reason — the service stack is up, MCP responded, yet the "
+                    "runtime wasn't registered as booted. This usually means a "
+                    "runtime-layer check silently returned empty/false. The "
+                    "context below is the set of facts future hypotheses will "
+                    "hinge on; read them before forming one.*\n"
+                )
 
-            service_log_tail = ""
-            if failure.get("failed_service"):
-                svc_log = _service_log_for(failure["failed_service"])
-                if svc_log and svc_log.exists():
-                    try:
-                        raw = svc_log.read_text().splitlines()
-                        service_log_tail = "\n".join(raw[-80:])
-                        lines.append(
-                            f"\n## Tail of `{svc_log.relative_to(project_dir)}` "
-                            f"(last 80 lines — this is the service that failed)\n"
-                        )
-                        lines.append("```")
-                        lines.append(service_log_tail)
-                        lines.append("```")
+                # HOME / ANDROID_* env — the single biggest source of
+                # bwrap-sandbox vs host-shell divergence for the Android path.
+                # Nix-wrapper scripts often set ANDROID_USER_HOME to a
+                # non-default location; if the wrapper isn't what runs inside
+                # the sandbox, AVDs vanish from the subprocess's view.
+                env_keys = (
+                    "HOME", "USER", "PWD",
+                    "ANDROID_HOME", "ANDROID_SDK_ROOT",
+                    "ANDROID_USER_HOME", "ANDROID_AVD_HOME",
+                    "ANDROID_EMULATOR_HOME", "ANDROID_PREFS_ROOT",
+                    "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+                )
+                lines.append("**Environment variables the runtime depends on:**")
+                lines.append("```")
+                for k in env_keys:
+                    v = _os.environ.get(k)
+                    lines.append(f"{k}={v if v is not None else '(unset)'}")
+                lines.append("```")
+
+                # Compare what `$HOME` actually contains against what the
+                # emulator needs. If `~/.android/avd` is missing while the
+                # SDK thinks that's where AVDs live, `-list-avds` returns
+                # empty and the runner concludes "no runtime." This fact
+                # took 13 fix-attempts to surface manually on T097.
+                home = Path(_os.environ.get("HOME", ""))
+                if home and home.exists():
+                    android_dirs: list[str] = []
+                    for sub in (".android", ".android/avd", ".config/.android"):
+                        p = home / sub
+                        if p.exists():
+                            try:
+                                entries = sorted(p.iterdir())
+                                count = len(entries)
+                                sample = ", ".join(e.name for e in entries[:5])
+                                if count > 5:
+                                    sample += f", … ({count} total)"
+                                android_dirs.append(f"- `{p}` → {sample or '(empty)'}")
+                            except OSError as e:
+                                android_dirs.append(f"- `{p}` → error ({e})")
+                        else:
+                            android_dirs.append(f"- `{p}` → **missing**")
+                    lines.append("\n**Android state under `$HOME`:**")
+                    for line in android_dirs:
+                        lines.append(line)
+                    lines.append(
+                        "\n*If `~/.android/avd` is missing or empty but "
+                        "`emulator -list-avds` is expected to return AVDs, "
+                        "the AVDs live under a different root (check "
+                        "`ANDROID_AVD_HOME` / `ANDROID_USER_HOME`) — or the "
+                        "sandbox `$HOME` is a fresh tmpfs that the host's "
+                        "AVD dir was never bind-mounted into. The latter is a "
+                        "**structural** bug — don't patch the wrapper, fix "
+                        "the mount.*"
+                    )
+
+                # Capture whatever the runtime-specific probe wants to say
+                # about its own state. For Android we already ran
+                # `emulator -list-avds` above; here we cross-check against
+                # `adb -s emulator-5554 shell getprop sys.boot_completed`
+                # and the package manager, since the runner's own
+                # `avd_boot_completed_ok` / `avd_pm_ok` events fired — if
+                # they disagree with a live probe right now, that disagreement
+                # is the bug.
+                if cap == "mcp-android":
+                    probe_cmds: list[tuple[str, list[str]]] = [
+                        ("adb devices", ["adb", "devices"]),
+                        ("boot_completed",
+                         ["adb", "-s", "emulator-5554", "shell",
+                          "getprop", "sys.boot_completed"]),
+                        ("pm list (count)",
+                         ["adb", "-s", "emulator-5554", "shell",
+                          "pm", "list", "packages"]),
+                    ]
+                    lines.append("\n**Live runtime probes (compare against the runner's boot events):**")
+                    lines.append("```")
+                    for label, cmd in probe_cmds:
                         try:
-                            mtime = datetime.fromtimestamp(svc_log.stat().st_mtime)
-                            lines.append(f"\n*log mtime: {mtime.isoformat(timespec='seconds')}"
-                                         f" — if this is stale vs. now, a prior broken process "
-                                         f"may still be running (see stale-process pattern).*")
+                            r = subprocess.run(
+                                cmd, capture_output=True, text=True, timeout=8,
+                            )
+                            out_s = (r.stdout or "").strip()
+                            err_s = (r.stderr or "").strip()
+                            if label == "pm list (count)":
+                                n = len([ln for ln in out_s.splitlines() if ln.strip()])
+                                lines.append(f"{label}: exit={r.returncode} count={n}")
+                            else:
+                                first = out_s.splitlines()[:3]
+                                lines.append(f"{label}: exit={r.returncode}")
+                                for fln in first:
+                                    lines.append(f"  {fln}")
+                            if err_s and r.returncode != 0:
+                                lines.append(f"  stderr: {err_s[:160]}")
+                        except Exception as e:
+                            lines.append(f"{label}: error ({e})")
+                    lines.append("```")
+
+                lines.append(
+                    "\n*If the live probes above contradict the runner's own "
+                    "`mcp_boot_ok` / `avd_boot_completed_ok` events in "
+                    "`run-log.jsonl`, the disagreement is the bug. The "
+                    "events are snapshots from when the check ran — if the "
+                    "state has since decayed, something is killing or "
+                    "unmounting runtime state between the check and the "
+                    "register-as-booted step. That is a structural race, not "
+                    "a typo in a config file.*"
+                )
+
+            # The setup.sh / service-log / port / pid sections only help when
+            # a backend service failed. When the MCP probe is green, services
+            # are by definition up and MCP is reachable — those sections are
+            # pure noise that pushes the agent toward the wrong hypothesis
+            # (as in the T097 flake.nix PATH-shadowing case, where the agent
+            # spent tokens cross-checking service pids before finding the
+            # real issue in PATH ordering).
+            service_log_tail = ""
+            if not probe_green:
+                if failure.get("error_line"):
+                    lines.append(f"\n## Failing step\n\n`{failure['error_line']}`")
+                if failure.get("timed_out"):
+                    lines.append("\n*setup.sh was killed by the runner after 300s (timeout).*")
+
+                if failure.get("failed_service"):
+                    svc_log = _service_log_for(failure["failed_service"])
+                    if svc_log and svc_log.exists():
+                        try:
+                            raw = svc_log.read_text().splitlines()
+                            service_log_tail = "\n".join(raw[-80:])
+                            lines.append(
+                                f"\n## Tail of `{svc_log.relative_to(project_dir)}` "
+                                f"(last 80 lines — this is the service that failed)\n"
+                            )
+                            lines.append("```")
+                            lines.append(service_log_tail)
+                            lines.append("```")
+                            try:
+                                mtime = datetime.fromtimestamp(svc_log.stat().st_mtime)
+                                lines.append(f"\n*log mtime: {mtime.isoformat(timespec='seconds')}"
+                                             f" — if this is stale vs. now, a prior broken process "
+                                             f"may still be running (see stale-process pattern).*")
+                            except OSError:
+                                pass
                         except OSError:
                             pass
-                    except OSError:
-                        pass
 
-            if failure.get("failed_port"):
-                binding = _port_binding(failure["failed_port"])
+                if failure.get("failed_port"):
+                    binding = _port_binding(failure["failed_port"])
+                    lines.append(
+                        f"\n## Port binding for {failure['failed_port']}\n\n"
+                        f"```\n{binding}\n```"
+                    )
+
+                # Explicit EADDRINUSE callout — the most common root cause when a
+                # prior attempt left a node server behind, and the signal is buried
+                # in the service log tail above. Surface it at the top level.
+                if service_log_tail and re.search(r"EADDRINUSE|address already in use",
+                                                  service_log_tail, re.IGNORECASE):
+                    lines.append(
+                        "\n## ⚠ EADDRINUSE detected in service log\n\n"
+                        "The service **did** start, tried to bind its port, and crashed "
+                        "because another process was already listening. This is almost "
+                        "always a stale process from a previous setup.sh run (or a prior "
+                        "platform-fix attempt). See the process tree and pid-file sections "
+                        "below, then kill the stale pid before re-running setup.sh.\n"
+                    )
+
+                # Process tree + pid-file cross-check. Cheap, small, and catches
+                # the single most common missed hypothesis: 'a prior attempt's
+                # server is still alive and holding the port.' Only useful when
+                # services might actually be the problem (probe not green).
+                lines.append("\n## E2E-related processes on this host\n")
                 lines.append(
-                    f"\n## Port binding for {failure['failed_port']}\n\n"
-                    f"```\n{binding}\n```"
+                    "*If you see more than one `setup.sh` or more than one `node dist/index.js`, "
+                    "a prior attempt did not clean up. Kill it before retrying.*\n"
                 )
+                lines.append("```")
+                lines.append(_e2e_process_tree())
+                lines.append("```")
 
-            # Explicit EADDRINUSE callout — the most common root cause when a
-            # prior attempt left a node server behind, and the signal is buried
-            # in the service log tail above. Surface it at the top level.
-            if service_log_tail and re.search(r"EADDRINUSE|address already in use",
-                                              service_log_tail, re.IGNORECASE):
+                lines.append("\n## `.dev/e2e-state/*.pid` cross-check\n")
                 lines.append(
-                    "\n## ⚠ EADDRINUSE detected in service log\n\n"
-                    "The service **did** start, tried to bind its port, and crashed "
-                    "because another process was already listening. This is almost "
-                    "always a stale process from a previous setup.sh run (or a prior "
-                    "platform-fix attempt). See the process tree and pid-file sections "
-                    "below, then kill the stale pid before re-running setup.sh.\n"
+                    "*`setup.sh` uses `kill -0 $pid` to decide if a service is 'already "
+                    "running' — but that check passes for **any** live pid, including "
+                    "reused pids owned by unrelated processes. If a pid file says DEAD "
+                    "or points at something that isn't our API/Astro/SuperTokens, delete "
+                    "the pid file before retrying.*\n"
                 )
-
-            # Always attach the process tree + pid-file cross-check. These are
-            # cheap, small, and catch the single most common missed hypothesis:
-            # 'a prior attempt's server is still alive and holding the port.'
-            lines.append("\n## E2E-related processes on this host\n")
-            lines.append(
-                "*If you see more than one `setup.sh` or more than one `node dist/index.js`, "
-                "a prior attempt did not clean up. Kill it before retrying.*\n"
-            )
-            lines.append("```")
-            lines.append(_e2e_process_tree())
-            lines.append("```")
-
-            lines.append("\n## `.dev/e2e-state/*.pid` cross-check\n")
-            lines.append(
-                "*`setup.sh` uses `kill -0 $pid` to decide if a service is 'already "
-                "running' — but that check passes for **any** live pid, including "
-                "reused pids owned by unrelated processes. If a pid file says DEAD "
-                "or points at something that isn't our API/Astro/SuperTokens, delete "
-                "the pid file before retrying.*\n"
-            )
-            lines.append("```")
-            lines.append(_pid_files_status())
-            lines.append("```")
+                lines.append("```")
+                lines.append(_pid_files_status())
+                lines.append("```")
+            else:
+                lines.append(
+                    "\n*(setup.sh / service-log / process-tree / pid-file sections "
+                    "omitted — MCP probe is green, so services are up and this is not "
+                    "a service-health failure. Focus on the PATH diagnostics above and "
+                    "the runtime-level checks below.)*"
+                )
 
             matched = _match_patterns(failure, service_log_tail)
             pattern_section = _extract_pattern_sections(matched)
@@ -8573,7 +9772,22 @@ class Runner:
                 "not proof of a fix.\n"
             )
 
-        def _build_platform_fix_prompt(cap: str, attempt: int, diag: str) -> str:
+        def _build_platform_fix_prompt(
+            cap: str,
+            attempt: int,
+            diag: str,
+            *,
+            meta: bool = False,
+            meta_attempt: int = 0,
+            streak: int = 0,
+        ) -> str:
+            """Build the fix-agent prompt. Parameterized by `meta` to switch
+            between "attempt N/{MAX}" (normal) and "structural redesign after
+            {streak} unproductive attempts" (meta). Both modes share the same
+            diagnostic, playbook, cross-attempt summary, hypothesis brief,
+            and structural-categories list — only the framing and the
+            urgency language differ. A single prompt avoids the drift that
+            comes from maintaining two."""
             playbook_section = ""
             if _PLATFORM_FIX_PLAYBOOK:
                 playbook_section = (
@@ -8582,13 +9796,302 @@ class Runner:
                     + _PLATFORM_FIX_PLAYBOOK
                 )
             repeat_section = _repeat_failure_section(attempt)
-            return rf"""You are fixing a platform runtime initialization failure for task {task.id}.
+            cross_attempt = _build_cross_attempt_summary(cap)
 
-The runner tried to boot the `{cap}` platform runtime so it could run an E2E
-test loop, but the boot failed. This is attempt **{attempt}/{PLATFORM_INIT_MAX_ATTEMPTS}**.
-If you don't fix it, the runner will spawn another fix-agent with updated
-diagnostics. After {PLATFORM_INIT_MAX_ATTEMPTS} failed attempts, the runner
-writes BLOCKED.md and stops.
+            # Enumerate raw claim files. Useful from attempt 1 (empty list
+            # → "nothing to compare against, you're the first") through the
+            # meta path (long list → "five prior theories, none held").
+            # spec_dir may be relative (e.g. "specs/admin") or absolute —
+            # resolve against project_dir to make both cases work and to
+            # keep relative_to() from raising when inputs disagree.
+            def _rel_to_project(p: Path) -> str:
+                """Best-effort project-relative display path. Falls back to
+                str(p) when the path can't be expressed relative to the
+                project (different filesystem, absolute vs relative mix)."""
+                try:
+                    return str(p.resolve().relative_to(project_dir.resolve()))
+                except (ValueError, OSError):
+                    return str(p)
+
+            claims_root = Path(spec_dir)
+            if not claims_root.is_absolute():
+                claims_root = project_dir / claims_root
+            claim_files: list[Path] = sorted(
+                (claims_root / "claims").glob("platform-fix-*.json"),
+                key=lambda p: p.stat().st_mtime,
+            )
+            meta_claim_files: list[Path] = sorted(
+                (claims_root / "claims").glob("platform-meta-fix-*.json"),
+                key=lambda p: p.stat().st_mtime,
+            )
+            all_claim_files = claim_files + meta_claim_files
+            if all_claim_files:
+                claim_list = "\n".join(
+                    f"- `{_rel_to_project(p)}`"
+                    for p in all_claim_files
+                    if p.exists()
+                )
+            else:
+                claim_list = "*(none yet — this is the first attempt)*"
+            run_log_rel = _rel_to_project(claims_root / "run-log.jsonl")
+
+            # The structural-categories list is always shown. On attempt 1
+            # it's a prompt to classify the failure; on attempt N it's a
+            # prompt to notice whether N-1 prior theories all fall into the
+            # same category (meaning the category is the actual bug).
+            structural_categories = (
+                "**Common structural categories** — if prior attempts each "
+                "blamed something different and none held, the real bug is "
+                "usually one of these (not a typo in any individual attempt's "
+                "target file):\n"
+                "- **Environment drift** — fixes work in the shell that made "
+                "them, but env resets between runs (devshell cache, bwrap "
+                "sandbox starts fresh, `direnv` not re-entered).\n"
+                "- **Sandbox/host mismatch** — fix works on the host, but the "
+                "runner spawns the runtime inside a sandbox (bwrap, Docker) "
+                "where the same state is missing or redirected (tmpfs `$HOME`, "
+                "missing bind mount, different `$PATH`).\n"
+                "- **Missing durable state** — a file, mount, or resource the "
+                "runtime needs is created lazily, and each attempt creates it "
+                "for *its* run but not for the next.\n"
+                "- **Wrong abstraction boundary** — responsibility is split "
+                "between the runner, a wrapper, and the raw CLI, and the "
+                "fix-agent keeps patching the wrong layer.\n"
+                "- **Race between 'ready' and 'registered'** — the runtime is "
+                "up at check time, but the runner's registration step runs "
+                "before or after a state decay and concludes otherwise.\n\n"
+                "If your hypothesis lands in one of these categories, prefer "
+                "a **structural** fix (move the abstraction boundary, bake "
+                "the state, add the bind-mount, remove the drift source) over "
+                "patching the surface symptom. Structural fixes make the "
+                "whole category impossible; symptom fixes just pick a "
+                "different place for the same bug to resurface."
+            )
+
+            hypothesis_brief_section = (
+                "\n## Mandatory: write a hypothesis brief BEFORE editing anything\n\n"
+                "Before you open an editor, touch a config file, or run a fix "
+                "command, emit a short (5–8 line) **hypothesis brief** as a "
+                "plain-text message. It is cheap to write, and the runner and "
+                "the next fix-agent will read it. Structure:\n\n"
+                "1. **Event sequence** — what the run-log shows happened "
+                "(one line per boot-phase event).\n"
+                "2. **Invariant across attempts** — what has been the same "
+                "every time (symptom, failed step, error line). On attempt 1 "
+                "this is 'n/a, first attempt'.\n"
+                "3. **What has varied** — what changed between attempts "
+                "(different root_causes, different patches, environment diffs). "
+                "On attempt 1 this is 'n/a, first attempt'.\n"
+                "4. **Is this one bug or a class?** — pick a category from "
+                "the list below. On attempt 1 this is your best guess from "
+                "the diagnostic. On attempt N it should account for why "
+                "prior attempts in this same category (or different "
+                "categories) did not hold.\n"
+                "5. **Hypothesis this attempt will test** — one sentence, "
+                "falsifiable. If the test fails, what does that tell you?\n\n"
+                + structural_categories + "\n\n"
+                "Skipping this brief and jumping straight to an edit is the "
+                "behavior the runner is trying to break. Do not skip it.\n"
+            )
+            if meta:
+                preamble = (
+                    f"You are fixing a platform runtime initialization failure "
+                    f"for task {task.id} / capability `{cap}`.\n\n"
+                    f"**This is a structural-redesign attempt.** The regular "
+                    f"fix-agent loop has tried **{streak}** unproductive "
+                    f"attempts in a row (threshold: "
+                    f"{PLATFORM_LOOP_FAIL_THRESHOLD}). Each one either "
+                    f"repeated a prior root_cause or produced a new one that "
+                    f"didn't hold. This is meta-attempt "
+                    f"**{meta_attempt}/{PLATFORM_META_FIX_MAX}**; after that, "
+                    f"the runner writes BLOCKED.md.\n\n"
+                    f"Because symptom-chasing has demonstrably failed, your "
+                    f"charter is different from a typical attempt: read the "
+                    f"diagnostic and the prior claims, but weight them toward "
+                    f"identifying the **structural** cause — the one-layer-up "
+                    f"issue that keeps producing different-looking symptoms. "
+                    f"Then attack that, not the immediate error."
+                )
+            else:
+                preamble = (
+                    f"You are fixing a platform runtime initialization failure "
+                    f"for task {task.id}.\n\n"
+                    f"The runner tried to boot the `{cap}` platform runtime so "
+                    f"it could run an E2E test loop, but the boot failed. "
+                    f"This is attempt **{attempt}/{PLATFORM_INIT_MAX_ATTEMPTS}**. "
+                    f"If you don't fix it, the runner will spawn another "
+                    f"fix-agent with updated diagnostics. After "
+                    f"{PLATFORM_INIT_MAX_ATTEMPTS} failed attempts (or "
+                    f"{PLATFORM_LOOP_FAIL_THRESHOLD} unproductive attempts "
+                    f"across sessions), the runner promotes to a meta-fix "
+                    f"attempt with a redesign charter."
+                )
+
+            if meta:
+                first_actions = (
+                    "## Your job\n\n"
+                    "**Mandatory first actions — read the prior claims and the "
+                    "diagnostic together before forming a hypothesis.** The "
+                    "diagnostic tells you what's failing *now*; the claims tell "
+                    "you what's already been tried. The answer is almost "
+                    "always in the gap between them.\n\n"
+                    f"1. **Read each file in the claims list below in full.** "
+                    f"For every claim, note: what was blamed, what was "
+                    f"changed, whether it was `verified`. Build a mental "
+                    f"timeline. Look for claims that blamed different things "
+                    f"but fall into the same structural category — that "
+                    f"category is almost certainly the actual bug.\n"
+                    f"2. **Grep the run log** (`{run_log_rel}`) for "
+                    f"`platform_init_fail`, `platform_fix_claim`, and "
+                    f"runtime-specific events (`avd_*`, `mcp_*`) for "
+                    f"`task_id={task.id}`, `capability={cap}`. Notice whether "
+                    f"the failure *shape* has been identical across attempts "
+                    f"(→ symptom-chase) or has shifted (→ each fix moved "
+                    f"something real but missed the core).\n"
+                    f"3. **Use the current diagnostic as corroboration, not "
+                    f"as the primary source.** If the opaque-failure snapshot "
+                    f"shows an env var or filesystem state that contradicts "
+                    f"what a prior claim assumed, that contradiction is the "
+                    f"lever.\n"
+                    f"4. **Propose a structural fix** — the smallest "
+                    f"*architectural* change that makes the whole category of "
+                    f"failure impossible. Examples: bake a known-good AVD "
+                    f"path into the nix derivation; add an explicit "
+                    f"bind-mount in the runner's bwrap invocation for the "
+                    f"state dir; collapse a wrapper + raw CLI into a single "
+                    f"blessed entry point; move the runtime-boot check to "
+                    f"after the state the runtime needs.\n"
+                    f"5. **Verify by cold re-run across the sandbox "
+                    f"boundary.** A meta-fix that holds in your shell but not "
+                    f"under the runner's bwrap spawn is no fix at all. Prove "
+                    f"the change sticks across (a) a fresh devshell "
+                    f"re-entry, and (b) the runner's actual spawn path.\n"
+                    f"6. On your final message, follow the 'Finishing' "
+                    f"section of the playbook and emit the `<claim>` trailer "
+                    f"(required format below)."
+                )
+                constraints = (
+                    "## Constraints\n\n"
+                    "- Do NOT default to the regular fix-agent loop ('read "
+                    "current logs, patch the immediate error, exit'). That "
+                    f"has already failed {streak} times. If your hypothesis "
+                    f"after reading the claims is a small-diff surface fix, "
+                    "re-read the claims — you probably missed the category.\n"
+                    "- Do NOT re-apply a change a prior fix-agent already "
+                    "tried (check the claims list and `git log --oneline "
+                    f"-{max(20, streak * 3)}` on E2E-relevant paths). "
+                    "Re-applying a known-failed fix is the thing that got "
+                    "us here.\n"
+                    "- Do NOT write `BLOCKED.md`, `DEFER-*.md`, mark the task "
+                    "complete, or delete tests.\n"
+                    "- Do NOT expand scope outside the {cap} boot path. This "
+                    "is a focused surgical task.\n"
+                    "- If a fix requires a real user secret, prefer a "
+                    "test-mode default or E2E-optional config path. Only if "
+                    "that's impossible, document it clearly."
+                ).format(cap=cap)
+            else:
+                first_actions = (
+                    "## Your job\n\n"
+                    "**Mandatory first actions — before forming any "
+                    "hypothesis, gather ground truth.** The diagnostics above "
+                    "are a summary. Summaries can mask the actual error. Run "
+                    "these commands and paste the output into your reasoning "
+                    "*before* editing anything. If any result contradicts the "
+                    "matched pattern, abandon the pattern and chase the "
+                    "contradiction.\n\n"
+                    "1. **Read the failing service's raw log, not just the "
+                    "tail we quoted.** Open `.dev/e2e-state/api.log` / "
+                    "`astro.log` / `supertokens.log` (whichever matches the "
+                    "failing service) and search for `EADDRINUSE`, `address "
+                    "already in use`, `Error:`, `FATAL`, `crashed`, and the "
+                    "service's own startup-success line. 'wait_for_port timed "
+                    "out' almost never means the service silently hung — it "
+                    "usually means the service logged an error and died, or "
+                    "a prior run's ghost process is still bound to the port.\n"
+                    "2. **Snapshot live processes.** Run:\n"
+                    "   ```\n"
+                    "   ps -eo pid,ppid,etimes,cmd --no-headers \\\n"
+                    "     | grep -E 'setup\\.sh|node .*dist/index|tsx .*src/index|astro .*dev|io\\.supertokens\\.Main'\n"
+                    "   ```\n"
+                    "   If you see more than one `setup.sh`, more than one "
+                    "API node process, or processes with `etimes` far larger "
+                    "than this retry's age, a prior attempt is still alive. "
+                    "Kill them before anything else.\n"
+                    "3. **Check port ownership directly.** For the failing "
+                    "port P, run `ss -tlnpH \"sport = :P\"` and note the pid. "
+                    "Cross-check against `cat .dev/e2e-state/*.pid` — if the "
+                    "pid file names a different pid than `ss` shows, or names "
+                    "a pid whose `ps -p $PID -o args=` is unrelated (e.g. "
+                    "`sshd`, `bash`), the pid file is stale and setup.sh's "
+                    "'already running' guard will mis-fire. Delete the stale "
+                    "pid file.\n"
+                    "4. **Only now** consult the matched pattern's 'Fix "
+                    "options'. Apply the smallest fix that addresses what "
+                    "the evidence actually shows — which may not be what "
+                    "the pattern predicted. If your hypothesis from the "
+                    "hypothesis brief lands in a structural category, "
+                    "prefer the structural fix over the smallest code diff.\n"
+                    "5. **Verify by reproducing from a clean state**: kill "
+                    "all stale processes, remove `.dev/e2e-state/*.pid`, "
+                    "re-run `bash test/e2e/setup.sh`, confirm exit 0 AND "
+                    "that it logs the failing service as ready. 'exit 0 "
+                    "from the guarded happy path' is not the same as a real "
+                    "fix — if your fix only skipped the failing step, it "
+                    "hasn't worked.\n"
+                    "6. On your final message, follow the 'Finishing' "
+                    "section of the playbook (root cause / fix / "
+                    "verification / residual risk)."
+                )
+                constraints = (
+                    "## Constraints\n\n"
+                    "- Do NOT write `BLOCKED.md`, `DEFER-*.md`, or any 'skip "
+                    "this' file. The runner decides when to give up.\n"
+                    "- Do NOT disable tests, mark them `.skip`, or add long "
+                    "sleeps to mask races.\n"
+                    "- Do NOT modify `specs/` or mark tasks complete.\n"
+                    "- Do NOT expand scope — if the bug is in setup.sh, fix "
+                    "setup.sh and stop.\n"
+                    "- If a fix requires a real user secret (e.g. a real "
+                    "Stripe live key), prefer a test-mode default or an "
+                    "E2E-optional config path. Only if that's impossible, "
+                    "document it clearly in your final message."
+                )
+
+            claim_example_root_cause = (
+                "structural: <category> — <one-line description>"
+                if meta else
+                "stale supertokens.pid pointed at recycled sshd pid"
+            )
+            claim_example_action = (
+                "what you restructured (files + the architectural shift)"
+                if meta else
+                "deleted .dev/e2e-state/supertokens.pid; reran setup.sh"
+            )
+            claim_example_evidence = (
+                "cold-start command + exit 0 output + proof the change holds "
+                "across the sandbox boundary"
+                if meta else
+                "setup.sh exit 0; supertokens responded on :3567"
+            )
+            claim_example_residual = (
+                "what could still break, or what you couldn't verify"
+                if meta else
+                "if sshd recycles to that pid again next reboot, same race"
+            )
+            verified_note = (
+                "`verified: true` for a structural fix means you ran the boot "
+                "path from a cold shell AND confirmed the change isn't "
+                "silently reverted by a cache / sandbox / re-entry. If you "
+                "can't prove both, say so and mark `verified: false`."
+                if meta else
+                "`verified: true` means you actually re-ran the failing step "
+                "and saw it succeed. `verified: false` means you made a "
+                "change you believe is correct but couldn't (or didn't) "
+                "prove it from a cold start."
+            )
+
+            return rf"""{preamble}
 
 ## What "boot the runtime" means
 
@@ -8600,94 +10103,312 @@ writes BLOCKED.md and stops.
   via `start-emulator` / `emulator -list-avds`.
 - `mcp-ios`: uses `xcrun simctl`.
 
+## Prior fix-agent claims (read these before editing)
+
+{claim_list}
+
+The run log is `{run_log_rel}` — grep for events tagged with
+`task_id={task.id}` and `capability={cap}` when you want the full timeline.
+
 {diag}
+{cross_attempt}
 {repeat_section}
 {playbook_section}
+{hypothesis_brief_section}
+{first_actions}
 
-## Your job
-
-**Mandatory first actions — before forming any hypothesis, gather ground truth.**
-The diagnostics above are a summary. Summaries can mask the actual error.
-Run these commands and paste the output into your reasoning *before* editing
-anything. If any result contradicts the matched pattern, abandon the pattern
-and chase the contradiction.
-
-1. **Read the failing service's raw log, not just the tail we quoted.**
-   Open `.dev/e2e-state/api.log` / `astro.log` / `supertokens.log` (whichever
-   matches the failing service) and search for `EADDRINUSE`, `address already
-   in use`, `Error:`, `FATAL`, `crashed`, and the service's own startup-
-   success line. "wait_for_port timed out" almost never means the service
-   silently hung — it usually means the service logged an error and died,
-   or a prior run's ghost process is still bound to the port.
-2. **Snapshot live processes.** Run:
-   ```
-   ps -eo pid,ppid,etimes,cmd --no-headers \
-     | grep -E 'setup\.sh|node .*dist/index|tsx .*src/index|astro .*dev|io\.supertokens\.Main'
-   ```
-   If you see more than one `setup.sh`, more than one API node process, or
-   processes with `etimes` far larger than this retry's age, a prior attempt
-   is still alive. Kill them before anything else.
-3. **Check port ownership directly.** For the failing port P, run
-   `ss -tlnpH "sport = :P"` and note the pid. Cross-check against
-   `cat .dev/e2e-state/*.pid` — if the pid file names a different pid than
-   `ss` shows, or names a pid whose `ps -p $PID -o args=` is unrelated
-   (e.g. `sshd`, `bash`), the pid file is stale and setup.sh's
-   "already running" guard will mis-fire. Delete the stale pid file.
-4. **Only now** consult the matched pattern's "Fix options". Apply the
-   smallest fix that addresses what the evidence actually shows — which may
-   not be what the pattern predicted.
-5. **Verify by reproducing from a clean state**: kill all stale processes,
-   remove `.dev/e2e-state/*.pid`, re-run `bash test/e2e/setup.sh`, confirm
-   exit 0 AND that it logs the failing service as ready. "exit 0 from the
-   guarded happy path" is not the same as a real fix — if your fix only
-   skipped the failing step, it hasn't worked.
-6. On your final message, follow the "Finishing" section of the playbook
-   (root cause / fix / verification / residual risk).
-
-## Constraints
-
-- Do NOT write `BLOCKED.md`, `DEFER-*.md`, or any "skip this" file. The
-  runner decides when to give up.
-- Do NOT disable tests, mark them `.skip`, or add long sleeps to mask races.
-- Do NOT modify `specs/` or mark tasks complete.
-- Do NOT expand scope — if the bug is in setup.sh, fix setup.sh and stop.
-- If a fix requires a real user secret (e.g. a real Stripe live key),
-  prefer a test-mode default or an E2E-optional config path. Only if
-  that's impossible, document it clearly in your final message.
+{constraints}
 
 Succeed = exit 0 from a cold re-run of setup.sh (or the relevant boot step).
+
+## Required final-message trailer
+
+End your last message with a single `<claim>...</claim>` block containing
+JSON. The runner parses this to write a per-attempt claim file so future
+sessions can see what each fix-agent concluded — without it, `exit_code=0`
+is the only signal and it's misleading. Example:
+
+<claim>
+{{"root_cause": "{claim_example_root_cause}",
+"action_taken": "{claim_example_action}",
+"verified": true,
+"evidence": "{claim_example_evidence}",
+"residual_risk": "{claim_example_residual}"}}
+</claim>
+
+{verified_note}
 """
 
         mcp_config_paths = []
         platform_init_failed = False
+        run_log_path = Path(spec_dir) / "run-log.jsonl"
+        claims_dir = Path(spec_dir) / "claims"
         for cap in mcp_caps:
-            attempt = 0
+            # Persist per-session attempt count across method re-entries so
+            # "attempt N/10" doesn't reset to 1/10 every process restart.
+            # Defined up here because the meta-fix branch below also needs
+            # to clear it when the meta-fix runs (reset the regular budget).
+            attempts_state_path = (
+                project_dir / "test" / "e2e" / ".state" / "platform-attempts.json"
+            )
+
+            # Cross-session loop detector. Per-session retries are capped
+            # at PLATFORM_INIT_MAX_ATTEMPTS but the runner gets restarted
+            # each session, so the same (task, capability) can keep failing
+            # forever without anyone noticing. If we've already accumulated
+            # enough failures across recent sessions, promote the next
+            # attempt to a meta-fix agent (and if that too is exhausted,
+            # surface a BLOCKED.md so a human steps in).
+            unproductive_streak, last_root_cause = _count_recent_platform_failures(
+                run_log_path, task.id, cap, PLATFORM_LOOP_LOOKBACK_HOURS,
+            )
+            if unproductive_streak >= PLATFORM_LOOP_FAIL_THRESHOLD:
+                self._write_event(
+                    "platform_loop_detected", spec_dir,
+                    task_id=task.id, capability=cap,
+                    unproductive_streak=unproductive_streak,
+                    last_root_cause=last_root_cause,
+                    threshold=PLATFORM_LOOP_FAIL_THRESHOLD,
+                    lookback_hours=PLATFORM_LOOP_LOOKBACK_HOURS,
+                )
+
+                # Before halting, give the meta-fix agent a chance. The
+                # regular fix-agent has been chasing symptoms; the meta-agent
+                # reads the full claim history and is prompted to attack the
+                # structural cause instead. Cap meta-fix attempts at
+                # PLATFORM_META_FIX_MAX so we don't loop forever here either.
+                prior_meta = _count_recent_meta_fix_attempts(
+                    run_log_path, task.id, cap, PLATFORM_LOOP_LOOKBACK_HOURS,
+                )
+                if prior_meta >= PLATFORM_META_FIX_MAX:
+                    # Meta-fix has already been tried the maximum number of
+                    # times without a verified resolution — now we halt.
+                    rc_note = (
+                        f" Last root_cause: {last_root_cause!r}."
+                        if last_root_cause else " No fix-claim root_cause recorded."
+                    )
+                    e2e_log(
+                        f"Platform loop detected for {cap} on {task.id}: "
+                        f"{unproductive_streak} unproductive fails, plus "
+                        f"{prior_meta} meta-fix attempt(s) already exhausted "
+                        f"— writing BLOCKED.md.{rc_note}"
+                    )
+                    blocked_rc_line = (
+                        f"\nLast fix-claim `root_cause`: `{last_root_cause}`.\n"
+                        if last_root_cause else
+                        "\nNo `root_cause` was recorded on recent fix-claims.\n"
+                    )
+                    self.blocked_file.write_text(
+                        f"# BLOCKED: {task.id} — Platform-init loop detected\n\n"
+                        f"`{cap}` failed {unproductive_streak} times with the "
+                        f"regular fix-agent, and the meta-fix agent was then "
+                        f"spawned {prior_meta} time(s) (cap: "
+                        f"{PLATFORM_META_FIX_MAX}) without producing a verified "
+                        f"resolution. Neither symptom-chasing nor structural "
+                        f"redesign has worked unattended — a human needs to "
+                        f"inspect this manually.\n"
+                        f"{blocked_rc_line}\n"
+                        f"See `run-log.jsonl` for `platform_init_fail`, "
+                        f"`platform_fix_claim`, and `platform_meta_fix_*` "
+                        f"events, and `claims/platform-fix-*.json` for the "
+                        f"structured claims of every attempt.\n"
+                    )
+                    platform_init_failed = True
+                    break
+
+                # Spawn a meta-fix agent. It gets a different prompt — no
+                # per-boot diagnostic, full claim history, charter is to
+                # attack the structural cause behind the repetition.
+                meta_attempt = prior_meta + 1
+                e2e_log(
+                    f"Platform loop tripped for {cap} on {task.id} "
+                    f"({unproductive_streak} unproductive fails, threshold "
+                    f"{PLATFORM_LOOP_FAIL_THRESHOLD}) — spawning meta-fix "
+                    f"agent {meta_attempt}/{PLATFORM_META_FIX_MAX}"
+                )
+                meta_fix_task = Task(
+                    id=f"{task.id}-platform-meta-fix-{meta_attempt}",
+                    description=(
+                        f"Meta-fix platform runtime for {cap} "
+                        f"(attempt {meta_attempt}/{PLATFORM_META_FIX_MAX})"
+                    ),
+                    phase=task.phase, parallel=False,
+                    status=TaskStatus.RUNNING, line_num=0,
+                    capabilities=task.capabilities,
+                )
+                # Build a diagnostic to include with the meta prompt. The
+                # runtime isn't booted so `_build_platform_diag` pulls from
+                # whatever state the last failed attempt left — useful for
+                # corroboration even when the agent's primary job is to read
+                # the claim history, not the current logs.
+                meta_diag = _build_platform_diag(cap, meta_attempt)
+                meta_prompt = _build_platform_fix_prompt(
+                    cap, meta_attempt, meta_diag,
+                    meta=True, meta_attempt=meta_attempt,
+                    streak=unproductive_streak,
+                )
+                self._write_event(
+                    "platform_meta_fix_spawn", spec_dir,
+                    task_id=task.id, capability=cap,
+                    meta_attempt=meta_attempt,
+                    unproductive_streak=unproductive_streak,
+                )
+                try:
+                    _wait_for_subagent(
+                        meta_fix_task, meta_prompt,
+                        f"Platform meta-fix agent ({cap}, "
+                        f"attempt {meta_attempt}/{PLATFORM_META_FIX_MAX})",
+                        caps=task.capabilities,
+                    )
+                except AgentAuthError:
+                    raise
+                except Exception as exc:
+                    e2e_log(
+                        f"Platform meta-fix agent raised {exc!r} — "
+                        f"continuing to regular retry loop"
+                    )
+
+                # Capture the meta-fix claim the same way regular fix claims
+                # are captured so the streak/meta-counter accounting stays
+                # consistent.
+                try:
+                    meta_logs = sorted(
+                        self.log_dir.glob(f"agent-*-{meta_fix_task.id}-*.jsonl"),
+                        key=lambda p: p.stat().st_mtime,
+                    )
+                    meta_log = meta_logs[-1] if meta_logs else None
+                    meta_claim = _extract_fix_agent_claim(meta_log) if meta_log else None
+                    claims_dir.mkdir(parents=True, exist_ok=True)
+                    meta_claim_path = claims_dir / f"platform-meta-fix-{meta_fix_task.id}.json"
+                    meta_claim_path.write_text(json.dumps({
+                        "task_id": task.id,
+                        "capability": cap,
+                        "meta_attempt": meta_attempt,
+                        "streak_at_spawn": unproductive_streak,
+                        "fix_task_id": meta_fix_task.id,
+                        "log_file": str(meta_log) if meta_log else None,
+                        "claim": meta_claim,
+                    }, indent=2))
+                    # Emit as platform_fix_claim so the streak-reset logic in
+                    # _count_recent_platform_failures sees it too — a verified
+                    # meta-fix claim resets the unproductive streak just like
+                    # a verified regular-fix claim does.
+                    self._write_event(
+                        "platform_fix_claim", spec_dir,
+                        task_id=task.id, capability=cap,
+                        attempt=meta_attempt, meta=True,
+                        has_claim=meta_claim is not None,
+                        root_cause=(meta_claim or {}).get("root_cause"),
+                        verified=(meta_claim or {}).get("verified"),
+                        claim_path=str(meta_claim_path),
+                    )
+                except Exception as exc:
+                    e2e_log(f"Failed to capture meta-fix claim: {exc!r}")
+
+                # Clear the per-session attempt counter so the regular retry
+                # loop below starts from a fresh budget — the meta-fix may
+                # have fundamentally changed the failure surface and we
+                # don't want old attempts counting against the new budget.
+                _clear_persisted_attempt(attempts_state_path, task.id, cap)
+                try:
+                    # Reset services so the next ensure_runtime() runs against
+                    # clean state (the meta-fix may have edited flake/config
+                    # that needs a fresh spawn to take effect).
+                    self._platform_manager.reset_e2e_services(project_dir)
+                except Exception as exc:
+                    e2e_log(
+                        f"reset_e2e_services after meta-fix raised {exc!r} "
+                        f"— continuing to regular retry loop"
+                    )
+
+                # Fall through to the regular retry loop below. If the
+                # meta-fix worked, ensure_runtime() will succeed on the next
+                # call and the streak resets naturally. If it didn't, the
+                # regular fix-agent takes over with the meta-fix's claim
+                # included in the cross-attempt summary.
+
+            # Per-session attempt budget (attempts_state_path was defined at
+            # the top of the loop so the meta-fix branch could reset it).
+            # The state file is keyed by (task_id, capability) and expires
+            # after PLATFORM_LOOP_LOOKBACK_HOURS so old runs don't carry
+            # over forever.
+            attempt = _load_persisted_attempt(
+                attempts_state_path, task.id, cap,
+                max_age_hours=PLATFORM_LOOP_LOOKBACK_HOURS,
+            )
+            if attempt > 0:
+                e2e_log(
+                    f"Resuming platform init for {cap}: {attempt} prior attempt(s) "
+                    f"in this window — continuing from attempt {attempt + 1}/{PLATFORM_INIT_MAX_ATTEMPTS}"
+                )
             runtime = None
             last_diag = ""
+            aborted_reason: Optional[str] = None
             while attempt < PLATFORM_INIT_MAX_ATTEMPTS:
                 if self._shutdown.is_set() or self._draining.is_set():
-                    e2e_log("Shutdown/drain requested during platform init — aborting retry loop")
+                    aborted_reason = "shutdown" if self._shutdown.is_set() else "drain"
+                    e2e_log(
+                        f"{aborted_reason.capitalize()} requested during platform init "
+                        f"after attempt {attempt}/{PLATFORM_INIT_MAX_ATTEMPTS} — aborting retry loop"
+                    )
                     platform_init_failed = True
                     break
                 attempt += 1
-                e2e_log(f"Platform runtime init for {cap}: attempt {attempt}/{PLATFORM_INIT_MAX_ATTEMPTS}")
+                _save_persisted_attempt(attempts_state_path, task.id, cap, attempt)
+                # Streak only counts *unproductive* fails (no new root_cause);
+                # the breaker trips on the streak, not the raw total. The
+                # current attempt hasn't failed yet so it's added optimistically
+                # — if it succeeds, the streak resets naturally on the next
+                # read of run-log.jsonl.
+                projected_streak = unproductive_streak + attempt
+                e2e_log(
+                    f"Platform runtime init for {cap}: attempt {attempt}/{PLATFORM_INIT_MAX_ATTEMPTS} "
+                    f"(unproductive streak up to {projected_streak} across last "
+                    f"{PLATFORM_LOOP_LOOKBACK_HOURS}h; loop threshold "
+                    f"{PLATFORM_LOOP_FAIL_THRESHOLD})"
+                )
                 runtime = self._platform_manager.ensure_runtime(cap, project_dir)
                 if runtime:
                     e2e_log(f"Platform runtime {cap} initialized on attempt {attempt}")
+                    _clear_persisted_attempt(attempts_state_path, task.id, cap)
                     break
 
                 last_diag = _build_platform_diag(cap, attempt)
-                e2e_log(f"Failed to initialize platform runtime for {cap} (attempt {attempt}/{PLATFORM_INIT_MAX_ATTEMPTS})")
+                e2e_log(
+                    f"Failed to initialize platform runtime for {cap} "
+                    f"(attempt {attempt}/{PLATFORM_INIT_MAX_ATTEMPTS}, "
+                    f"unproductive streak up to {projected_streak} across last {PLATFORM_LOOP_LOOKBACK_HOURS}h)"
+                )
                 e2e_log(last_diag)
                 # Persist a terse line to fix-history.md for the next fix-agent.
                 parsed = getattr(self, "_last_platform_failure", {}) or {}
                 _record_attempt(attempt, parsed.get("failure", {}), parsed.get("matched", []))
+                # A build/install failure surfaces through the PlatformManager
+                # as _last_build_failure — prefer that over the setup.sh
+                # parse when present, since it names the exact phase (detect,
+                # gradlew, flutter, adb install) and includes an error_line.
+                build_fail = getattr(
+                    getattr(self, "_platform_manager", None),
+                    "_last_build_failure", None,
+                ) or {}
+                failed_service = (
+                    build_fail.get("failed_service")
+                    or (parsed.get("failure") or {}).get("failed_service")
+                )
                 self._write_event(
                     "platform_init_fail", spec_dir,
                     task_id=task.id, capability=cap, attempt=attempt,
-                    failed_service=(parsed.get("failure") or {}).get("failed_service"),
+                    failed_service=failed_service,
                     failed_port=(parsed.get("failure") or {}).get("failed_port"),
                     patterns=parsed.get("matched") or [],
+                    build_phase=build_fail.get("phase"),
+                    build_reason=build_fail.get("reason"),
+                    build_error_line=build_fail.get("error_line"),
+                    build_extra=build_fail.get("extra") or {
+                        k: v for k, v in build_fail.items()
+                        if k not in {"failed_service", "phase", "reason", "error_line",
+                                     "build_result", "capability"}
+                    },
                 )
 
                 if attempt >= PLATFORM_INIT_MAX_ATTEMPTS:
@@ -8718,6 +10439,42 @@ Succeed = exit 0 from a cold re-run of setup.sh (or the relevant boot step).
                 except Exception as exc:
                     e2e_log(f"Platform fix agent raised {exc!r} — continuing retry loop")
 
+                # Capture the fix-agent's structured claim. The prompt
+                # tells it to end its final message with a `<claim>{...}</claim>`
+                # JSON trailer; we glob for its log by sub_task.id and
+                # persist the parsed claim alongside other completion
+                # artifacts so future sessions (and humans) know what each
+                # attempt actually concluded — without that, exit_code=0
+                # is the only signal and it's misleading.
+                try:
+                    fix_logs = sorted(
+                        self.log_dir.glob(f"agent-*-{fix_task.id}-*.jsonl"),
+                        key=lambda p: p.stat().st_mtime,
+                    )
+                    fix_log = fix_logs[-1] if fix_logs else None
+                    claim = _extract_fix_agent_claim(fix_log) if fix_log else None
+                    claims_dir.mkdir(parents=True, exist_ok=True)
+                    claim_path = claims_dir / f"platform-fix-{fix_task.id}.json"
+                    claim_record = {
+                        "task_id": task.id,
+                        "capability": cap,
+                        "attempt": attempt,
+                        "fix_task_id": fix_task.id,
+                        "log_file": str(fix_log) if fix_log else None,
+                        "claim": claim,
+                    }
+                    claim_path.write_text(json.dumps(claim_record, indent=2))
+                    self._write_event(
+                        "platform_fix_claim", spec_dir,
+                        task_id=task.id, capability=cap, attempt=attempt,
+                        has_claim=claim is not None,
+                        root_cause=(claim or {}).get("root_cause"),
+                        verified=(claim or {}).get("verified"),
+                        claim_path=str(claim_path),
+                    )
+                except Exception as exc:
+                    e2e_log(f"Failed to capture fix-agent claim: {exc!r}")
+
                 # Reset backend services before the next retry so the upcoming
                 # ensure_runtime() call re-runs setup.sh from a clean slate.
                 # Without this, each failed attempt leaves another setup.sh +
@@ -8731,12 +10488,45 @@ Succeed = exit 0 from a cold re-run of setup.sh (or the relevant boot step).
 
             if not runtime:
                 platform_init_failed = True
+                # Distinguish the three possible exit reasons so the BLOCKED.md
+                # body and the log line tell the truth: (a) exhausted the
+                # attempt budget, (b) shutdown/drain cut us off early, or
+                # (c) the while-loop fell through for some other reason.
+                if aborted_reason:
+                    summary = (
+                        f"Aborted after {attempt}/{PLATFORM_INIT_MAX_ATTEMPTS} "
+                        f"fix attempts: runner {aborted_reason} was requested."
+                    )
+                    log_summary = (
+                        f"Platform runtime {cap} aborted at attempt "
+                        f"{attempt}/{PLATFORM_INIT_MAX_ATTEMPTS} ({aborted_reason}) — writing BLOCKED.md"
+                    )
+                    # Keep persisted attempt so the next session resumes where
+                    # we left off instead of restarting the counter at 1.
+                elif attempt >= PLATFORM_INIT_MAX_ATTEMPTS:
+                    summary = f"Gave up after {PLATFORM_INIT_MAX_ATTEMPTS} fix attempts."
+                    log_summary = (
+                        f"Platform runtime {cap} still failing after "
+                        f"{PLATFORM_INIT_MAX_ATTEMPTS} attempts — writing BLOCKED.md"
+                    )
+                    # Attempt budget exhausted — clear state so a human-triggered
+                    # retry starts a fresh budget instead of refusing immediately.
+                    _clear_persisted_attempt(attempts_state_path, task.id, cap)
+                else:
+                    summary = (
+                        f"Retry loop exited unexpectedly at attempt "
+                        f"{attempt}/{PLATFORM_INIT_MAX_ATTEMPTS}."
+                    )
+                    log_summary = (
+                        f"Platform runtime {cap} exited retry loop unexpectedly "
+                        f"at attempt {attempt}/{PLATFORM_INIT_MAX_ATTEMPTS} — writing BLOCKED.md"
+                    )
                 diag_msg = (
                     f"# BLOCKED: {task.id} — Platform runtime initialization failed\n\n"
-                    f"Gave up after {PLATFORM_INIT_MAX_ATTEMPTS} fix attempts.\n\n"
+                    f"{summary}\n\n"
                     + last_diag
                 )
-                e2e_log(f"Platform runtime {cap} still failing after {PLATFORM_INIT_MAX_ATTEMPTS} attempts — writing BLOCKED.md")
+                e2e_log(log_summary)
                 self.blocked_file.write_text(diag_msg + "\n")
                 break
 
@@ -9459,41 +11249,29 @@ The crash log is also saved at `{crash_log_file}`.
 
             state["total_bugs_found"] = len(findings.get("findings", []))
 
-            # ── Phase 1.5: RESEARCH new bugs ──
-            # For any bug that doesn't have a research file yet, spawn a research
-            # agent to investigate before the fix agent runs.
-            new_bugs_needing_research = []
-            for bug in open_bugs:
-                bug_id = bug.get("id", "")
-                if not bug_id:
-                    continue
-                _, research_idx = _read_latest_research(e2e_dir, bug_id)
-                if research_idx == 0:  # No research yet
-                    new_bugs_needing_research.append(bug)
-
+            # ── Phase 1.5 (collapsed): research now happens inline in fix ──
+            # Previously this spawned up to 10 parallel research agents before
+            # a single sequential fix agent. Each research agent re-primed
+            # ~300-600k input tokens of codebase context the fix agent would
+            # immediately re-prime again. Collapsing them lets the fix agent
+            # reuse one cache for both, saving an entire agent's wall-clock
+            # and a multiplicative chunk of input tokens. The fix prompt
+            # detects bugs without a research-N.md and instructs the agent
+            # to do the research itself (and write the file) before fixing.
+            #
+            # The supervisor's REDIRECT_RESEARCH path further down still
+            # spawns a dedicated research agent — that's an explicit handoff
+            # after a bug has already failed multiple fix attempts, where
+            # the dedicated agent's fresh perspective is the point.
+            new_bugs_needing_research = [
+                bug for bug in open_bugs
+                if bug.get("id") and _read_latest_research(e2e_dir, bug["id"])[1] == 0
+            ]
             if new_bugs_needing_research:
                 e2e_log(
-                    f"Phase 1.5: Research ({len(new_bugs_needing_research)} new bugs, "
-                    f"up to 10 in parallel)"
+                    f"Phase 1.5: skipping standalone research — {len(new_bugs_needing_research)} "
+                    f"new bug(s) will be researched inline by the fix agent"
                 )
-                research_items = []
-                for bug in new_bugs_needing_research:
-                    bug_id = bug["id"]
-                    e2e_log(f"  Researching {bug_id}: {bug.get('summary', '')[:60]}")
-                    research_prompt = self._build_e2e_research_prompt(
-                        bug, e2e_dir, spec_dir, ui_flow_content
-                    )
-                    research_task = Task(
-                        id=f"E2E-research-{bug_id}-{iteration}",
-                        description=f"Research {bug_id}",
-                        phase=task.phase, parallel=False,
-                        status=TaskStatus.RUNNING, line_num=0,
-                    )
-                    research_items.append((
-                        research_task, research_prompt,
-                        f"E2E-research-{bug_id}-{iteration}",
-                    ))
-                _wait_for_subagents_parallel(research_items, max_concurrency=10)
 
             # ── Per-bug supervisor check ──
             # For bugs that have hit 3+ fix attempts since last supervisor,
@@ -9797,7 +11575,7 @@ This is build-fix attempt {attempt} of {BUILD_FIX_MAX_ATTEMPTS}.
                     fix_summary = "(fix agent exited)"
                     if bfix_log.exists():
                         try:
-                            lines, _, _, _ = read_stream_output(bfix_log, 0)
+                            lines, _, _, _, _ = read_stream_output(bfix_log, 0)
                             if lines:
                                 fix_summary = lines[-1][:200]
                         except Exception:
@@ -10612,6 +12390,7 @@ Write your guidance to `{unblock_file}` with this format:
 
         # Build per-bug research and guidance sections
         research_sections = ""
+        bugs_needing_inline_research: list[tuple[str, str, str]] = []  # (id, summary, next_path)
         if e2e_dir:
             sections = []
             for bug in open_bugs:
@@ -10626,6 +12405,19 @@ Write your guidance to `{unblock_file}` with this format:
                 research_content, research_idx = _read_latest_research(e2e_dir, bug_id)
                 if research_content:
                     parts.append(f"**Research report** (research-{research_idx}.md):\n{research_content}")
+                else:
+                    # No research yet — we used to spawn a parallel research
+                    # agent for this. Now the fix agent does it inline and
+                    # writes the same research-1.md file, so downstream
+                    # verify/supervisor steps see identical artifacts.
+                    next_path = str(bug_d / "research-1.md")
+                    bugs_needing_inline_research.append(
+                        (bug_id, bug.get("summary", ""), next_path)
+                    )
+                    parts.append(
+                        f"**Research report**: NONE — write one to `{next_path}` "
+                        f"before fixing this bug (see 'Inline research' below)."
+                    )
 
                 # Include supervisor guidance if any
                 history = _read_bug_history(e2e_dir, bug_id)
@@ -10669,6 +12461,53 @@ already failed and what the research agent recommends.
 {chr(10).join(sections)}
 """
 
+        inline_research_section = ""
+        if bugs_needing_inline_research:
+            lines = [
+                f"- **{bid}** ({summary[:80]}) → write to `{path}`"
+                for (bid, summary, path) in bugs_needing_inline_research
+            ]
+            inline_research_section = f"""## Inline research (do this BEFORE fixing)
+
+The following bugs have no research report yet. For each one, you MUST
+investigate first and write a research report to the listed path BEFORE
+attempting any fix. Same file format and contract as the standalone
+research agent — verify and supervisor agents read these files.
+
+{chr(10).join(lines)}
+
+For each bug above:
+
+1. **Search the codebase** for the relevant source files (grep for class
+   names, composable / component / view-model names mentioned in the bug).
+2. **Read the code** — what does it actually do now? What's the gap vs. spec?
+3. **Search the web** if framework / API behavior is unclear.
+4. **Find working examples** of the same pattern elsewhere in the codebase.
+5. **Write the research file** with this structure (mkdir -p the parent dir):
+
+```markdown
+# Research: <BUG-ID> — <summary>
+
+## Root cause analysis
+[What's actually wrong in the code and why]
+
+## Evidence
+[Code snippets, doc quotes, working examples found in codebase]
+
+## Recommended fix strategy
+[Concrete approach — exact API calls, code patterns, file paths to modify]
+
+## What NOT to do
+[Approaches already tried that failed, and why]
+
+## Confidence
+[High/Medium/Low — and what would increase confidence if Low]
+```
+
+6. THEN apply the fix. Do not skip the research file — downstream agents
+   depend on it.
+"""
+
         return f"""You are an E2E fix agent. Your job is to fix ALL reported bugs in a single batch pass.
 
 ## Bugs to fix ({len(open_bugs)} total)
@@ -10679,10 +12518,14 @@ already failed and what the research agent recommends.
 
 {research_sections}
 
+{inline_research_section}
+
 ## Instructions
 
 1. Read `CLAUDE.md` for project conventions and build commands
-2. **Read all per-bug research and guidance above** before writing any code
+2. **Read all per-bug research and guidance above** before writing any code.
+   For bugs listed under "Inline research", do the research and write the
+   `research-1.md` file FIRST, then fix.
 3. For each bug:
    a. If research/guidance exists: follow the recommended fix strategy
    b. If previous fix attempts exist: ensure your approach is DIFFERENT from all of them
