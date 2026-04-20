@@ -276,6 +276,26 @@ Stops after 5 consecutive scheduling cycles with no progress (all agents stuck).
 
 When the user has completed planning (tasks.md exists) and asks to start or run implementation, tell them the command to run. Resolve the absolute path to the script based on where the skill is installed.
 
+### Cost & effectiveness reporting
+
+Every agent completion is logged to `{spec_dir}/run-log.jsonl` with per-agent token breakdowns and model attribution. A sibling script, `cost_report.py`, reads those logs and prints a dollar cost breakdown by model, phase, and phase×model matrix, along with E2E-loop-specific effectiveness signals.
+
+Run it after a feature finishes, or periodically, to see:
+- Total spend and token usage so far (feature-level or lifetime across all features)
+- Which phases dominate cost (`task`, `validate-review`, `e2e-executor`, etc.)
+- Whether model-choice changes actually landed (e.g., executor on Sonnet, verify on Sonnet)
+- How much of the cost comes from pre-cache-breakdown legacy events
+
+```bash
+# Per-feature
+python3 /path/to/.claude/skills/spec-kit/cost_report.py specs/001-feature/run-log.jsonl
+
+# Every feature in a project
+python3 /path/to/.claude/skills/spec-kit/cost_report.py --all specs/
+```
+
+Writes `cost-report.md` (display) and `cost-report.json` (machine-readable). See `reference/cost-reporting.md` for the full logging schema, legacy-data handling, pricing, and how to interpret the effectiveness signals.
+
 ---
 
 ## Environment preflight verification

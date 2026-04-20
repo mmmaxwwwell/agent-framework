@@ -121,6 +121,7 @@ class AgentSlot:
     attempt: int = 1  # which attempt this is for the task (1 = first try)
     input_tokens: int = 0     # cumulative input tokens (including cache)
     output_tokens: int = 0    # cumulative output tokens
+    model: str = "opus"       # model requested at spawn time (for cost accounting)
     is_ci_loop: bool = False  # True for the virtual CI loop orchestrator slot
     sub_agent_history: list[SubAgentRecord] = field(default_factory=list)
     active_sub_agent_id: Optional[int] = None  # agent_id of currently running sub-agent
@@ -2416,6 +2417,67 @@ def spawn_agent(task: Task, prompt: str, log_path: Path,
     return proc
 
 
+def extract_usage_breakdown(log_path: Path) -> dict:
+    """Scan a complete stream-json log and return a detailed token breakdown.
+
+    Returns dict with keys:
+      input_tokens_fresh        — non-cached input tokens
+      input_tokens_cache_read   — cache hits (cheap)
+      input_tokens_cache_create — cache writes (1.25x input cost)
+      output_tokens
+      model                     — last observed assistant model id (e.g. "claude-sonnet-4-6")
+
+    Prefers the authoritative `result` entry usage; falls back to the latest
+    non-synthetic assistant message.  Missing / unreadable logs return zeros.
+    """
+    out = {
+        "input_tokens_fresh": 0,
+        "input_tokens_cache_read": 0,
+        "input_tokens_cache_create": 0,
+        "output_tokens": 0,
+        "model": "",
+    }
+    try:
+        with open(log_path, "r") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return out
+
+    result_usage: dict | None = None
+    last_assistant_usage: dict | None = None
+    last_model = ""
+    for raw in lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if msg.get("type") == "result":
+            u = msg.get("usage") or {}
+            if u.get("input_tokens", 0) or u.get("output_tokens", 0):
+                result_usage = u
+        elif msg.get("type") == "assistant":
+            m = msg.get("message", {}) or {}
+            model = m.get("model", "")
+            if model == "<synthetic>":
+                continue
+            u = m.get("usage") or {}
+            if u.get("input_tokens", 0) or u.get("output_tokens", 0):
+                last_assistant_usage = u
+            if model:
+                last_model = model
+
+    usage = result_usage or last_assistant_usage or {}
+    out["input_tokens_fresh"] = usage.get("input_tokens", 0)
+    out["input_tokens_cache_read"] = usage.get("cache_read_input_tokens", 0)
+    out["input_tokens_cache_create"] = usage.get("cache_creation_input_tokens", 0)
+    out["output_tokens"] = usage.get("output_tokens", 0)
+    out["model"] = last_model
+    return out
+
+
 def read_stream_output(log_path: Path, last_pos: int) -> tuple[list[str], int, Optional[int], tuple[int, int]]:
     """Read new JSON lines from a stream-json log file.
     Returns (display_lines, new_position, exit_code_if_result, (input_tokens, output_tokens))."""
@@ -4512,6 +4574,104 @@ def _record_fix_attempt(e2e_dir: Path, bug_id: str, approach: str,
         "timestamp": datetime.now().isoformat(),
     })
     _write_bug_history(e2e_dir, bug_id, history)
+
+
+# ── Planner/executor helpers ───────────────────────────────────────────
+# Two-tier explore phase: Opus planner writes plan.md, Sonnet executor
+# walks it and writes handoff.md (resume marker) or blocker.md (stuck).
+# On blocker, a small Opus diagnostic writes unblock.md; executor retries.
+
+EXECUTOR_MAX_SPAWNS_PER_ITER = 5
+BLOCKER_MAX_RETRIES_PER_STEP = 3
+
+
+def _executor_dir(e2e_dir: Path) -> Path:
+    d = e2e_dir / "executor"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _blocker_step_dir(e2e_dir: Path, step_id: str) -> Path:
+    """Return per-step blocker dir. step_id is e.g. 'step-6' — caller sanitizes."""
+    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in step_id)[:64] or "step-unknown"
+    d = e2e_dir / "blockers" / safe
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _count_blocker_attempts(e2e_dir: Path, step_id: str) -> int:
+    """Count how many blocker-N.md files exist for a step."""
+    d = _blocker_step_dir(e2e_dir, step_id)
+    return len(list(d.glob("blocker-*.md")))
+
+
+def _list_prior_executor_attempts(e2e_dir: Path, step_id: str) -> list[Path]:
+    """Return summary paths for prior executor attempts on this step, in order."""
+    d = _blocker_step_dir(e2e_dir, step_id)
+    return sorted(d.glob("executor-summary-*.md"))
+
+
+def _list_prior_unblocks(e2e_dir: Path, step_id: str) -> list[Path]:
+    """Return unblock-N.md paths for this step, in order."""
+    d = _blocker_step_dir(e2e_dir, step_id)
+    return sorted(d.glob("unblock-*.md"))
+
+
+def _extract_executor_summary(log_path: Path, max_entries: int = 50) -> str:
+    """Build a mechanical summary of an executor session from its JSONL log.
+
+    Zero-LLM: just extracts tool calls, findings deltas, and final result.
+    Matches the existing "truncate, inline, overflow to disk" paradigm.
+    """
+    if not log_path.exists():
+        return "(no log)"
+    try:
+        lines = log_path.read_text().splitlines()
+    except OSError:
+        return "(log unreadable)"
+
+    tool_calls: list[str] = []
+    result_info = ""
+    for raw in lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            entry = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        etype = entry.get("type", "")
+        if etype == "assistant":
+            msg = entry.get("message", {})
+            for block in msg.get("content", []) or []:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    name = block.get("name", "?")
+                    inp = block.get("input", {}) or {}
+                    # Keep inputs terse — first ~80 chars of the string repr
+                    inp_str = json.dumps(inp, default=str)[:120]
+                    tool_calls.append(f"{name} {inp_str}")
+        elif etype == "result":
+            result_info = (
+                f"result: is_error={entry.get('is_error')} "
+                f"num_turns={entry.get('num_turns')} "
+                f"duration_ms={entry.get('duration_ms')}"
+            )
+
+    # Keep last max_entries tool calls
+    tool_calls = tool_calls[-max_entries:]
+    parts = [f"## Tool calls (last {len(tool_calls)})"]
+    parts.extend(f"- {c}" for c in tool_calls)
+    if result_info:
+        parts.append(f"\n## Result\n{result_info}")
+    return "\n".join(parts)
+
+
+def _write_executor_summary(e2e_dir: Path, step_id: str, attempt: int,
+                             log_path: Path):
+    """Extract + persist a mechanical summary of the executor's session."""
+    d = _blocker_step_dir(e2e_dir, step_id)
+    summary = _extract_executor_summary(log_path)
+    (d / f"executor-summary-{attempt}.md").write_text(summary)
 
 
 def check_circuit_breaker(spec_dir: str, window_minutes: int = 10,
@@ -6796,6 +6956,10 @@ class Runner:
                     _sd = getattr(self, '_current_spec_dir', '')
                     if _sd:
                         evt_type = "vr_complete" if agent.task.id.startswith("VR-") else "task_complete"
+                        # Extract detailed usage breakdown from the agent's log.
+                        # This gives us cache read/create separately + observed model id.
+                        breakdown = extract_usage_breakdown(agent.log_file) if agent.log_file else {}
+                        observed_model = breakdown.get("model", "") or agent.model
                         self._write_event(evt_type, _sd,
                                           task_id=agent.task.id,
                                           agent_id=agent.agent_id,
@@ -6803,7 +6967,11 @@ class Runner:
                                           exit_code=rc,
                                           duration_s=int(time.time() - agent.start_time),
                                           input_tokens=agent.input_tokens,
-                                          output_tokens=agent.output_tokens)
+                                          output_tokens=agent.output_tokens,
+                                          model=observed_model,
+                                          input_tokens_fresh=breakdown.get("input_tokens_fresh", 0),
+                                          input_tokens_cache_read=breakdown.get("input_tokens_cache_read", 0),
+                                          input_tokens_cache_create=breakdown.get("input_tokens_cache_create", 0))
 
                     finished.append(agent)
 
@@ -7557,6 +7725,125 @@ class Runner:
 
             return proc.returncode
 
+        def _wait_for_subagents_parallel(items, max_concurrency: int = 10,
+                                          caps: set[str] | None = None,
+                                          mcp_configs: list[Path] | None = None,
+                                          model: str = "opus") -> list[int]:
+            """Run multiple sub-agents in parallel, up to max_concurrency at a
+            time. `items` is a list of (sub_task, prompt, label) tuples.
+            Returns exit codes in input order. Applies the same idle/wall-clock
+            watchdogs as _wait_for_subagent. Raises AgentAuthError if any
+            agent hits a 401."""
+            @dataclass
+            class _Running:
+                idx: int
+                sub_task: Task
+                label: str
+                proc: subprocess.Popen
+                slot: AgentSlot
+                log_p: Path
+                aid: int
+                start: float
+                timeout_killed: bool = False
+
+            exit_codes: list[int | None] = [None] * len(items)
+            queue = list(enumerate(items))
+            running: list[_Running] = []
+
+            def _spawn_one(idx: int, sub_task: Task, prompt: str, label: str) -> _Running:
+                self.agent_counter += 1
+                aid = self.agent_counter
+                log_p = self.log_dir / f"agent-{aid}-{sub_task.id}-{self.timestamp}.jsonl"
+                stderr_p = self.log_dir / f"agent-{aid}-{sub_task.id}-{self.timestamp}.stderr"
+                proc = spawn_agent(sub_task, prompt, log_p, stderr_p,
+                                   extra_capabilities=caps,
+                                   mcp_config_paths=mcp_configs,
+                                   model=model)
+                slot = AgentSlot(
+                    agent_id=aid, task=sub_task, process=proc,
+                    pid=proc.pid, start_time=time.time(),
+                    log_file=log_p, status="running",
+                )
+                with self._lock:
+                    self.agents.append(slot)
+                e2e_log(f"Spawned {label} (Agent {aid}, pid {proc.pid})")
+                return _Running(idx=idx, sub_task=sub_task, label=label,
+                                proc=proc, slot=slot, log_p=log_p, aid=aid,
+                                start=time.time())
+
+            # Prime the pool
+            while queue and len(running) < max_concurrency:
+                idx, (sub_task, prompt, label) = queue.pop(0)
+                running.append(_spawn_one(idx, sub_task, prompt, label))
+
+            # Poll loop: wait for any to finish, then refill from queue
+            while running:
+                time.sleep(60)
+                now = time.time()
+                still_running: list[_Running] = []
+                for r in running:
+                    if r.proc.poll() is not None:
+                        # finished
+                        exit_codes[r.idx] = r.proc.returncode
+                        _finalize_subagent(r)
+                        continue
+                    # still alive — check watchdogs
+                    try:
+                        last_activity = r.log_p.stat().st_mtime
+                    except OSError:
+                        last_activity = r.start
+                    idle_s = now - last_activity
+                    wall_s = now - r.start
+                    kill_reason = ""
+                    if idle_s > AGENT_IDLE_TIMEOUT_S:
+                        kill_reason = f"idle for {int(idle_s)}s (no log output) — killing"
+                    elif wall_s > AGENT_HARD_TIMEOUT_S:
+                        kill_reason = f"exceeded {AGENT_HARD_TIMEOUT_S}s hard wall-clock limit — killing"
+                    if kill_reason:
+                        e2e_log(f"{r.label} (Agent {r.aid}, pid {r.proc.pid}) {kill_reason}")
+                        r.proc.kill()
+                        r.proc.wait()
+                        r.timeout_killed = True
+                        exit_codes[r.idx] = r.proc.returncode
+                        _finalize_subagent(r)
+                        continue
+                    still_running.append(r)
+                running = still_running
+                # refill
+                while queue and len(running) < max_concurrency:
+                    idx, (sub_task, prompt, label) = queue.pop(0)
+                    running.append(_spawn_one(idx, sub_task, prompt, label))
+
+            return [ec if ec is not None else 1 for ec in exit_codes]
+
+        def _finalize_subagent(r) -> None:
+            """Shared post-exit bookkeeping for a finished sub-agent."""
+            sub_status = "timeout" if r.timeout_killed else (
+                "done" if r.proc.returncode == 0 else "failed"
+            )
+            r.slot.status = sub_status
+            sub_in_tok, sub_out_tok = 0, 0
+            if r.log_p and r.log_p.exists():
+                _, _, _, (sub_in_tok, sub_out_tok) = read_stream_output(r.log_p, 0)
+            record = SubAgentRecord(
+                agent_id=r.aid, label=r.sub_task.id,
+                input_tokens=sub_in_tok, output_tokens=sub_out_tok,
+                elapsed_s=int(time.time() - r.slot.start_time), status=sub_status,
+            )
+            with self._lock:
+                for a in self.agents:
+                    if a.task.id == task.id and a.is_ci_loop:
+                        a.sub_agent_history.append(record)
+                        a.input_tokens += sub_in_tok
+                        a.output_tokens += sub_out_tok
+                        break
+                self.agents = [a for a in self.agents if a.agent_id != r.aid]
+            e2e_log(f"{r.label} completed (exit {r.proc.returncode}, {(sub_in_tok + sub_out_tok) // 1000}k tok)")
+            if r.proc.returncode != 0:
+                auth_err = check_auth_error(r.log_p)
+                if auth_err:
+                    raise AgentAuthError("Sub-agent authentication failed (401)")
+
         # ── Initialize platform runtime ──
         mcp_caps = task.capabilities & _MCP_CAPABILITIES
         if not mcp_caps:
@@ -7857,6 +8144,73 @@ class Runner:
 
         _PLATFORM_FIX_PLAYBOOK = _load_reference(playbook_path)
 
+        def _repeat_failure_section(attempt: int) -> str:
+            """If this attempt's failure signature (service + matched patterns)
+            matches a prior recorded attempt, the previous hypothesis did not
+            work. Tell the new agent explicitly so it drops that hypothesis
+            instead of re-trying it with a fresh face. This breaks the
+            pattern-lock-in loop where each agent re-derives the same wrong
+            answer from the same pattern match."""
+            parsed = getattr(self, "_last_platform_failure", {}) or {}
+            cur_service = (parsed.get("failure") or {}).get("failed_service") or ""
+            cur_patterns = set(parsed.get("matched") or [])
+            if not cur_service or not cur_patterns:
+                return ""
+            if not fix_history_path.exists():
+                return ""
+            try:
+                history = fix_history_path.read_text()
+            except OSError:
+                return ""
+            # Parse prior lines:
+            #   - attempt N: service=X port=P patterns=a,b at=...
+            # Skip the current attempt's own line (already appended).
+            prior_matches: list[str] = []
+            for line in history.splitlines():
+                m = re.match(
+                    r"-\s+attempt\s+(\d+):\s+service=(\S+)\s+port=\S+\s+patterns=(\S+)",
+                    line,
+                )
+                if not m:
+                    continue
+                prior_attempt_n = int(m.group(1))
+                prior_service = m.group(2)
+                prior_patterns = set(p for p in m.group(3).split(",") if p and p != "none")
+                if prior_attempt_n >= attempt:
+                    continue  # skip current + future
+                if prior_service != cur_service:
+                    continue
+                if not (prior_patterns & cur_patterns):
+                    continue
+                prior_matches.append(line)
+            if not prior_matches:
+                return ""
+            shared = ", ".join(sorted(cur_patterns))
+            return (
+                "\n## STOP — your predecessors already tried the obvious fix\n\n"
+                "This is not the first attempt at this exact failure. Prior fix-agents "
+                f"saw the same service (`{cur_service}`) hit the same pattern(s) "
+                f"(`{shared}`) and their fixes did not work — the boot is still failing.\n\n"
+                "Prior attempts with the same signature:\n\n"
+                "```\n" + "\n".join(prior_matches) + "\n```\n\n"
+                "**Falsification rule:** The hypothesis implied by the matched pattern is "
+                "now suspect. Do NOT re-apply it or a close variant. Before writing any "
+                "code, spend your first few actions *disproving the obvious hypothesis*:\n\n"
+                "- Run the diagnostic commands from the pattern section yourself and "
+                "  paste their output into your reasoning. Don't assume — verify.\n"
+                "- Check whether the tools the setup script depends on are actually in "
+                "  PATH (`command -v lsof`, `command -v ss`, etc.). Scripts that guard "
+                "  errors with `2>/dev/null || true` fail silently when a tool is missing.\n"
+                "- Check whether the 'ready' log line in the service log came from *this* "
+                "  run or a ghost process from a previous run (compare log mtime and pid "
+                "  against the pid file, and confirm the pid is actually alive).\n"
+                "- Inspect the setup script's actual behavior on *this* machine — do the "
+                "  kill paths it claims to use actually find and kill anything?\n\n"
+                "If the diagnostics contradict the matched pattern, state that explicitly "
+                "and pursue a different hypothesis. Exit 0 from a guarded shell script is "
+                "not proof of a fix.\n"
+            )
+
         def _build_platform_fix_prompt(cap: str, attempt: int, diag: str) -> str:
             playbook_section = ""
             if _PLATFORM_FIX_PLAYBOOK:
@@ -7865,6 +8219,7 @@ class Runner:
                     "These apply to every fix-agent. Read them before diving in.\n\n"
                     + _PLATFORM_FIX_PLAYBOOK
                 )
+            repeat_section = _repeat_failure_section(attempt)
             return f"""You are fixing a platform runtime initialization failure for task {task.id}.
 
 The runner tried to boot the `{cap}` platform runtime so it could run an E2E
@@ -7884,6 +8239,7 @@ writes BLOCKED.md and stops.
 - `mcp-ios`: uses `xcrun simctl`.
 
 {diag}
+{repeat_section}
 {playbook_section}
 
 ## Your job
@@ -8261,64 +8617,240 @@ The crash log is also saved at `{crash_log_file}`.
                         project_dir=Path(spec_dir).parent if spec_dir else None)
                 return
 
-            # ── Phase 1: EXPLORE (with MCP) ──
-            e2e_log(f"Phase 1: Explore (with MCP tools)")
-            try:
-                task_block = _extract_task_block(str(task_file), task.id)
-                e2e_log(f"DEBUG: task_block length={len(task_block)}")
-                explore_prompt = self._build_e2e_explore_prompt(
-                    spec_dir, findings_file, ui_flow_content, spec_content,
-                    iteration, e2e_dir, task, task_block,
-                    mcp_caps=mcp_caps,
-                )
-                e2e_log(f"DEBUG: prompt built, length={len(explore_prompt)}")
-            except Exception as exc:
-                import traceback
-                e2e_log(f"DEBUG: prompt build FAILED: {exc}")
-                e2e_log(f"DEBUG: {traceback.format_exc()}")
-                break
-            explore_task = Task(
-                id=f"E2E-explore-{iteration}",
-                description=f"E2E explore iteration {iteration}",
-                phase=task.phase, parallel=False,
-                status=TaskStatus.RUNNING, line_num=0,
-                capabilities=mcp_caps,
-            )
-            try:
-                explore_exit = _wait_for_subagent(explore_task, explore_prompt,
-                                   f"E2E-explore-{iteration}",
-                                   mcp_configs=mcp_config_paths,
-                                   model="opus")
-                e2e_log(f"DEBUG: explore_exit={explore_exit}")
-            except Exception as exc:
-                import traceback
-                e2e_log(f"DEBUG: spawn/wait FAILED: {exc}")
-                e2e_log(f"DEBUG: {traceback.format_exc()}")
-                break
+            # ── Resume check: skip explore if prior-run research is unfinished ──
+            # If findings.json already has open bugs and at least one lacks a
+            # research file, we were killed mid-cycle. Skip explore and let
+            # the existing research phase pick up only the un-researched bugs.
+            # This preserves research work already done for other bugs.
+            skipped_explore_for_resume = False
+            if findings_file.exists():
+                try:
+                    prior_findings = json.loads(findings_file.read_text())
+                    prior_open = [
+                        f for f in prior_findings.get("findings", [])
+                        if f.get("status") in ("new", "verified_broken")
+                    ]
+                    prior_missing_research = [
+                        b for b in prior_open
+                        if b.get("id") and _read_latest_research(e2e_dir, b["id"])[1] == 0
+                    ]
+                    if prior_open and prior_missing_research:
+                        e2e_log(
+                            f"RESUME: {len(prior_open)} open bugs from prior run, "
+                            f"{len(prior_missing_research)} lack research — "
+                            f"skipping explore, resuming at research phase"
+                        )
+                        findings = prior_findings
+                        skipped_explore_for_resume = True
+                except (json.JSONDecodeError, OSError):
+                    pass
 
-            # ── Overload detection: 529 → retry with opus ──
-            if explore_exit != 0:
-                explore_log_p = self.log_dir / f"agent-{self.agent_counter}-E2E-explore-{iteration}-{self.timestamp}.jsonl"
-                if explore_log_p.exists() and check_overloaded(explore_log_p):
-                    e2e_log(f"Explore agent hit 529 overloaded — retrying with opus")
-                    explore_task_retry = Task(
-                        id=f"E2E-explore-{iteration}",
-                        description=f"E2E explore iteration {iteration} (opus retry)",
-                        phase=task.phase, parallel=False,
-                        status=TaskStatus.RUNNING, line_num=0,
-                        capabilities=mcp_caps,
+            # ── Phase 1: EXPLORE — planner (Opus) → executor loop (Sonnet) ──
+            # Planner writes plan.md. Executor walks it, writing findings
+            # incrementally. On blocker, Opus diagnostic writes unblock;
+            # executor retries. Up to EXECUTOR_MAX_SPAWNS_PER_ITER respawns.
+            if skipped_explore_for_resume:
+                e2e_log(f"Phase 1: Explore SKIPPED (resume)")
+            else:
+                e2e_log(f"Phase 1: Explore (planner + executor loop)")
+            explore_exit = 0
+            if not skipped_explore_for_resume:
+                try:
+                    task_block = _extract_task_block(str(task_file), task.id)
+                except Exception as exc:
+                    import traceback
+                    e2e_log(f"DEBUG: task_block extract FAILED: {exc}")
+                    e2e_log(f"DEBUG: {traceback.format_exc()}")
+                    break
+
+                # Clean up stale exit files from prior iteration
+                exec_d = _executor_dir(e2e_dir)
+                for stale in (exec_d / "handoff.md", exec_d / "blocker.md",
+                              e2e_dir / "plan.md"):
+                    if stale.exists():
+                        stale.unlink()
+
+                # ── Phase 1a: Planner (Opus) ──
+                try:
+                    planner_prompt = self._build_e2e_planner_prompt(
+                        spec_dir, findings_file, ui_flow_content, spec_content,
+                        iteration, e2e_dir, task, task_block,
                     )
-                    try:
-                        explore_exit = _wait_for_subagent(explore_task_retry, explore_prompt,
-                                           f"E2E-explore-{iteration}-opus",
-                                           mcp_configs=mcp_config_paths,
-                                           model="opus")
-                        e2e_log(f"DEBUG: opus retry explore_exit={explore_exit}")
-                    except Exception as exc:
-                        import traceback
-                        e2e_log(f"DEBUG: opus retry spawn/wait FAILED: {exc}")
-                        e2e_log(f"DEBUG: {traceback.format_exc()}")
+                except Exception as exc:
+                    import traceback
+                    e2e_log(f"DEBUG: planner prompt build FAILED: {exc}")
+                    e2e_log(f"DEBUG: {traceback.format_exc()}")
+                    break
+
+                planner_task = Task(
+                    id=f"E2E-planner-{iteration}",
+                    description=f"E2E planner iteration {iteration}",
+                    phase=task.phase, parallel=False,
+                    status=TaskStatus.RUNNING, line_num=0,
+                    capabilities=set(),  # no MCP for planner
+                )
+                try:
+                    planner_exit = _wait_for_subagent(
+                        planner_task, planner_prompt,
+                        f"E2E-planner-{iteration}",
+                        model="opus")
+                    e2e_log(f"Planner exit={planner_exit}")
+                except Exception as exc:
+                    import traceback
+                    e2e_log(f"Planner spawn FAILED: {exc}")
+                    e2e_log(f"DEBUG: {traceback.format_exc()}")
+                    break
+
+                plan_file = e2e_dir / "plan.md"
+                if not plan_file.exists() or not plan_file.read_text().strip():
+                    e2e_log("Planner did not produce plan.md — treating as explore failure")
+                    explore_exit = 1
+                else:
+                    # ── Phase 1b: Executor loop (Sonnet) ──
+                    prior_handoff = ""
+                    prior_handoff_path: Path | None = None
+                    unblock_context = ""
+                    explore_exit = 0
+                    for spawn_num in range(1, EXECUTOR_MAX_SPAWNS_PER_ITER + 1):
+                        try:
+                            executor_prompt = self._build_e2e_executor_prompt(
+                                spec_dir, findings_file, ui_flow_content,
+                                e2e_dir, iteration, spawn_num,
+                                prior_handoff=prior_handoff,
+                                prior_handoff_path=prior_handoff_path,
+                                unblock_context=unblock_context,
+                                mcp_caps=mcp_caps,
+                            )
+                        except Exception as exc:
+                            import traceback
+                            e2e_log(f"Executor prompt build FAILED: {exc}")
+                            e2e_log(f"DEBUG: {traceback.format_exc()}")
+                            explore_exit = 1
+                            break
+
+                        executor_task = Task(
+                            id=f"E2E-executor-{iteration}-{spawn_num}",
+                            description=f"E2E executor iter {iteration} spawn {spawn_num}",
+                            phase=task.phase, parallel=False,
+                            status=TaskStatus.RUNNING, line_num=0,
+                            capabilities=mcp_caps,
+                        )
+                        try:
+                            exec_exit = _wait_for_subagent(
+                                executor_task, executor_prompt,
+                                f"E2E-executor-{iteration}-{spawn_num}",
+                                mcp_configs=mcp_config_paths,
+                                model="sonnet")
+                        except Exception as exc:
+                            import traceback
+                            e2e_log(f"Executor spawn FAILED: {exc}")
+                            e2e_log(f"DEBUG: {traceback.format_exc()}")
+                            explore_exit = 1
+                            break
+
+                        # Reset unblock_context — it's only for the spawn after a diagnostic
+                        unblock_context = ""
+
+                        exec_dir_p = _executor_dir(e2e_dir)
+                        handoff_p = exec_dir_p / "handoff.md"
+                        blocker_p = exec_dir_p / "blocker.md"
+
+                        if blocker_p.exists():
+                            blocker_content = blocker_p.read_text()
+                            # Extract step_id — first line matching "Blocked step: step-N"
+                            step_id = "unknown"
+                            for line in blocker_content.splitlines():
+                                if "Blocked step:" in line:
+                                    step_id = line.split("Blocked step:", 1)[1].strip().split()[0]
+                                    break
+                            e2e_log(f"Executor {spawn_num} BLOCKED on {step_id}")
+
+                            # Persist the blocker into its step dir
+                            step_dir = _blocker_step_dir(e2e_dir, step_id)
+                            blocker_attempt = _count_blocker_attempts(e2e_dir, step_id) + 1
+                            (step_dir / f"blocker-{blocker_attempt}.md").write_text(blocker_content)
+
+                            # Write mechanical executor summary for lazy-loading
+                            exec_log_p = self.log_dir / f"agent-{self.agent_counter}-E2E-executor-{iteration}-{spawn_num}-{self.timestamp}.jsonl"
+                            _write_executor_summary(e2e_dir, step_id, blocker_attempt, exec_log_p)
+
+                            blocker_p.unlink()  # consume
+
+                            if blocker_attempt > BLOCKER_MAX_RETRIES_PER_STEP:
+                                e2e_log(f"Step {step_id} exceeded {BLOCKER_MAX_RETRIES_PER_STEP} blocker retries — giving up on step, ending iteration")
+                                break
+
+                            # Spawn Opus diagnostic
+                            plan_content = plan_file.read_text()
+                            prior_unblocks = _list_prior_unblocks(e2e_dir, step_id)
+                            prior_summaries = _list_prior_executor_attempts(e2e_dir, step_id)
+                            try:
+                                diag_prompt = self._build_e2e_diagnostic_prompt(
+                                    e2e_dir, step_id, blocker_content, plan_content,
+                                    ui_flow_content, prior_unblocks, prior_summaries,
+                                    blocker_attempt,
+                                )
+                            except Exception as exc:
+                                import traceback
+                                e2e_log(f"Diagnostic prompt build FAILED: {exc}")
+                                e2e_log(f"DEBUG: {traceback.format_exc()}")
+                                break
+
+                            diag_task = Task(
+                                id=f"E2E-diagnostic-{iteration}-{spawn_num}",
+                                description=f"E2E diagnostic iter {iteration} step {step_id} attempt {blocker_attempt}",
+                                phase=task.phase, parallel=False,
+                                status=TaskStatus.RUNNING, line_num=0,
+                                capabilities=set(),
+                            )
+                            try:
+                                _wait_for_subagent(
+                                    diag_task, diag_prompt,
+                                    f"E2E-diagnostic-{iteration}-{spawn_num}",
+                                    model="opus")
+                            except Exception as exc:
+                                import traceback
+                                e2e_log(f"Diagnostic spawn FAILED: {exc}")
+                                e2e_log(f"DEBUG: {traceback.format_exc()}")
+                                break
+
+                            unblock_file = step_dir / f"unblock-{blocker_attempt}.md"
+                            if unblock_file.exists():
+                                unblock_context = unblock_file.read_text()
+                            else:
+                                e2e_log(f"Diagnostic did not produce unblock file — skipping step {step_id}")
+                                # Continue to next spawn without unblock; executor will move past the step
+
+                            # Loop back — next spawn retries the step with unblock inline
+                            continue
+
+                        if handoff_p.exists():
+                            handoff_content = handoff_p.read_text()
+                            if "Status: COMPLETE" in handoff_content:
+                                e2e_log(f"Executor {spawn_num} completed plan")
+                                break
+                            # PARTIAL — hand off to next spawn
+                            # Archive so next spawn can reference path
+                            archive_p = exec_dir_p / f"handoff-spawn-{spawn_num}.md"
+                            archive_p.write_text(handoff_content)
+                            prior_handoff = handoff_content
+                            prior_handoff_path = archive_p
+                            handoff_p.unlink()
+                            e2e_log(f"Executor {spawn_num} PARTIAL — continuing")
+                            continue
+
+                        # Neither file — treat as a crash
+                        e2e_log(f"Executor {spawn_num} exited without handoff/blocker (exit {exec_exit})")
+                        explore_exit = exec_exit if exec_exit != 0 else 1
                         break
+                    else:
+                        e2e_log(f"Executor loop hit max spawns ({EXECUTOR_MAX_SPAWNS_PER_ITER}) — ending iteration")
+
+            # ── Overload detection is handled at the per-spawn level inside
+            # the executor loop. The prior whole-phase retry relied on a single
+            # explore_prompt; under the planner/executor split there's no
+            # single prompt to replay. If 529s become common, add per-spawn
+            # retry inside the executor loop instead.
 
             # ── Crash detection: non-zero exit → immediate supervisor ──
             if explore_exit != 0:
@@ -8408,38 +8940,40 @@ The crash log is also saved at `{crash_log_file}`.
                     e2e_log("Crash supervisor produced no decision — stopping")
                     break
 
-            # Read findings (explore exited 0 but may not have produced output)
-            if not findings_file.exists():
-                e2e_log("No findings file produced — explore agent may have failed")
-                consecutive_explore_failures += 1
-                state["history"].append({
-                    "iteration": iteration, "phase": "explore",
-                    "result": "no_findings",
-                })
-                state_file.write_text(json.dumps(state, indent=2))
-                if consecutive_explore_failures >= MAX_CONSECUTIVE_EXPLORE_FAILURES:
-                    e2e_log(
-                        f"Explore produced no findings {consecutive_explore_failures} "
-                        f"consecutive times — stopping"
-                    )
-                    self.blocked_file.write_text(
-                        f"# BLOCKED: {task.id} — explore agent not producing findings\n\n"
-                        f"Explore agent exited 0 but produced no findings.json "
-                        f"{consecutive_explore_failures} times in a row.\n"
-                        f"Check agent logs in `{self.log_dir}/`\n"
-                    )
-                    break
-                continue
+            # Read findings (explore exited 0 but may not have produced output).
+            # Skipped when resuming — `findings` was already loaded from prior_findings.
+            if not skipped_explore_for_resume:
+                if not findings_file.exists():
+                    e2e_log("No findings file produced — explore agent may have failed")
+                    consecutive_explore_failures += 1
+                    state["history"].append({
+                        "iteration": iteration, "phase": "explore",
+                        "result": "no_findings",
+                    })
+                    state_file.write_text(json.dumps(state, indent=2))
+                    if consecutive_explore_failures >= MAX_CONSECUTIVE_EXPLORE_FAILURES:
+                        e2e_log(
+                            f"Explore produced no findings {consecutive_explore_failures} "
+                            f"consecutive times — stopping"
+                        )
+                        self.blocked_file.write_text(
+                            f"# BLOCKED: {task.id} — explore agent not producing findings\n\n"
+                            f"Explore agent exited 0 but produced no findings.json "
+                            f"{consecutive_explore_failures} times in a row.\n"
+                            f"Check agent logs in `{self.log_dir}/`\n"
+                        )
+                        break
+                    continue
 
-            try:
-                findings = json.loads(findings_file.read_text())
-            except json.JSONDecodeError:
-                e2e_log("Invalid findings.json — skipping this iteration")
-                consecutive_explore_failures += 1
-                if consecutive_explore_failures >= MAX_CONSECUTIVE_EXPLORE_FAILURES:
-                    e2e_log(f"Explore failed {consecutive_explore_failures} consecutive times — stopping")
-                    break
-                continue
+                try:
+                    findings = json.loads(findings_file.read_text())
+                except json.JSONDecodeError:
+                    e2e_log("Invalid findings.json — skipping this iteration")
+                    consecutive_explore_failures += 1
+                    if consecutive_explore_failures >= MAX_CONSECUTIVE_EXPLORE_FAILURES:
+                        e2e_log(f"Explore failed {consecutive_explore_failures} consecutive times — stopping")
+                        break
+                    continue
 
             # Reset on successful explore
             consecutive_explore_failures = 0
@@ -8465,7 +8999,10 @@ The crash log is also saved at `{crash_log_file}`.
             blocked_findings = sum(1 for f in all_entries if f.get("status") == "blocked")
             total_findings = len(all_entries)
 
-            if live_evidence == 0:
+            # On resume, the current-iteration log doesn't exist, so live_evidence
+            # will be 0 even for valid prior findings. The original run already
+            # passed this check (otherwise no research files would exist), so skip.
+            if live_evidence == 0 and not skipped_explore_for_resume:
                 cap_label = driver.capability if driver else "unknown"
                 mcp_status = driver.read_mcp_init_status(explore_log) if driver else None
                 status_note = (
@@ -8538,7 +9075,11 @@ The crash log is also saved at `{crash_log_file}`.
                     new_bugs_needing_research.append(bug)
 
             if new_bugs_needing_research:
-                e2e_log(f"Phase 1.5: Research ({len(new_bugs_needing_research)} new bugs)")
+                e2e_log(
+                    f"Phase 1.5: Research ({len(new_bugs_needing_research)} new bugs, "
+                    f"up to 10 in parallel)"
+                )
+                research_items = []
                 for bug in new_bugs_needing_research:
                     bug_id = bug["id"]
                     e2e_log(f"  Researching {bug_id}: {bug.get('summary', '')[:60]}")
@@ -8551,8 +9092,11 @@ The crash log is also saved at `{crash_log_file}`.
                         phase=task.phase, parallel=False,
                         status=TaskStatus.RUNNING, line_num=0,
                     )
-                    _wait_for_subagent(research_task, research_prompt,
-                                       f"E2E-research-{bug_id}-{iteration}")
+                    research_items.append((
+                        research_task, research_prompt,
+                        f"E2E-research-{bug_id}-{iteration}",
+                    ))
+                _wait_for_subagents_parallel(research_items, max_concurrency=10)
 
             # ── Per-bug supervisor check ──
             # For bugs that have hit 3+ fix attempts since last supervisor,
@@ -8919,7 +9463,7 @@ This is build-fix attempt {attempt} of {BUILD_FIX_MAX_ATTEMPTS}.
             _wait_for_subagent(verify_task, verify_prompt,
                                f"E2E-verify-{iteration}",
                                mcp_configs=mcp_config_paths,
-                               model="opus")
+                               model="sonnet")
 
             # Re-read findings after verify
             try:
@@ -9284,6 +9828,374 @@ Write your findings to `{findings_file}` as JSON:
 - Create directories: `mkdir -p {e2e_dir}/screenshots/`
 - **Update findings and progress after each screen** — don't wait until the end
 - If you feel you're running low on context (many tool calls), save your work and stop gracefully
+"""
+
+    # ── Planner / executor / diagnostic prompts ────────────────────────
+    # Opus planner decomposes the task into an ordered step list.
+    # Sonnet executor walks the plan, handing off between spawns.
+    # Opus diagnostic resolves blockers.
+
+    def _build_e2e_planner_prompt(self, spec_dir: str, findings_file: Path,
+                                   ui_flow: str, spec_content: str,
+                                   iteration: int, e2e_dir: Path,
+                                   parent_task: "Task | None" = None,
+                                   task_block: str = "") -> str:
+        """Opus planner: reads spec + progress, writes plan.md (ordered steps)."""
+        findings_inline, findings_overflow = _prepare_findings_context(
+            findings_file, e2e_dir)
+        progress_inline, progress_overflow = _prepare_progress_context(
+            e2e_dir / "progress.md", e2e_dir)
+
+        task_section = ""
+        if parent_task and task_block:
+            task_section = f"""## Your task scope
+
+**{parent_task.id}**: {parent_task.description}
+
+```
+{task_block}
+```
+
+Plan ONLY the exploration needed to satisfy this task's "Done when" criteria. Do not plan work outside this scope."""
+
+        plan_file = e2e_dir / "plan.md"
+
+        return f"""You are an E2E test planner. You produce an ordered step list for a Sonnet executor to walk through. You do NOT interact with the app — you only plan.
+
+## Your job
+
+Read the spec, UI flow, prior progress, and prior findings. Produce a concrete ordered list of test steps for THIS iteration. The executor will follow your plan step-by-step with MCP tools.
+
+{task_section}
+
+## Plan scope per iteration
+
+Plan ~10-20 steps — roughly one executor session. Do not try to plan every screen in one go; the loop runs many iterations. Prioritize:
+
+1. Screens/flows NOT already covered in `progress.md`
+2. Regressions to re-check (prior fixed bugs — have they stayed fixed?)
+3. Error paths within screens already touched
+
+Skip screens marked validated in progress unless you have reason to believe they regressed.
+
+## UI_FLOW.md (what should be tested)
+
+<ui_flow>
+{ui_flow}
+</ui_flow>
+
+## Specification (key requirements)
+
+<spec>
+{spec_content}
+</spec>
+
+{f'''## Previous exploration progress (what's already been validated)
+
+<progress>
+{progress_inline}
+</progress>
+{progress_overflow}
+''' if progress_inline else '## No previous progress — this is the first iteration.'}
+
+{f'''## Existing findings (bugs already found)
+
+<findings>
+{findings_inline}
+</findings>
+{findings_overflow}
+''' if findings_inline else '## No existing findings yet.'}
+
+## Output
+
+Write your plan to `{plan_file}` with this EXACT format:
+
+```markdown
+# E2E Plan — iteration {iteration}
+
+## Intent
+[2-3 sentences: what this iteration is focused on and why]
+
+## Steps
+
+### step-1: <short action phrase>
+- intent: [what outcome this step validates]
+- preconditions: [what state must exist before — "none" if fresh]
+- actions: [1-3 concrete MCP-tool-level actions, e.g. "browser_navigate to /checkout; browser_fill_form with test data; browser_click Continue"]
+- expected: [observable result — status code, visible element, URL, etc.]
+- on_mismatch: [what to write as a finding, or "skip if page is 500 — likely BUG-XXX"]
+
+### step-2: ...
+(repeat for each step)
+
+## Notes for executor
+[Any cross-step gotchas, e.g. "steps 3-5 share cart state — do not reset between them"]
+```
+
+## Rules
+
+- Each step must be independently skippable — if step 3 blocks, executor can move to step 4 without failing the iteration
+- Use `step-N` ids sequentially (step-1, step-2, ...) so blockers can reference them
+- Be specific about selectors/URLs/inputs — the executor is Sonnet and benefits from concreteness
+- Do NOT use MCP tools yourself — you are planning only
+- Do NOT write findings — that's the executor's job
+- Keep step count ~10-20; if more is needed, leave a note that another iteration is required
+- If you notice UI_FLOW.md has gaps (screens/flows not fully specified), add them to a "Spec gaps" section at the end
+"""
+
+    def _build_e2e_executor_prompt(self, spec_dir: str, findings_file: Path,
+                                    ui_flow: str, e2e_dir: Path, iteration: int,
+                                    spawn_num: int,
+                                    prior_handoff: str = "",
+                                    prior_handoff_path: Path | None = None,
+                                    unblock_context: str = "",
+                                    mcp_caps: set[str] | None = None) -> str:
+        """Sonnet executor: reads plan.md, walks steps, writes findings/handoff/blocker."""
+        plan_file = e2e_dir / "plan.md"
+        handoff_file = _executor_dir(e2e_dir) / "handoff.md"
+        blocker_file = _executor_dir(e2e_dir) / "blocker.md"
+
+        # Platform tool sections — reuse the same driver registry as explore
+        driver = _pick_driver(mcp_caps or set())
+        if driver is not None:
+            tools_section = driver.tools_prompt_section(e2e_dir)
+            screenshot_section = driver.screenshot_prompt_section(e2e_dir)
+        else:
+            tools_section = ("## Available MCP tools\n\n"
+                             "Read the function schemas to see what tools are exposed.\n")
+            screenshot_section = ""
+
+        # Backend env for connecting to services
+        backend_env = ""
+        project_dir = Path.cwd()
+        env_file = project_dir / "test" / "e2e" / ".state" / "env"
+        if env_file.exists():
+            backend_env = env_file.read_text()
+
+        # Prior handoff section
+        handoff_section = ""
+        if prior_handoff:
+            handoff_section = f"""## Resuming from prior executor spawn
+
+A previous executor spawn completed some steps and handed off. Continue from where it left off.
+
+<handoff>
+{prior_handoff}
+</handoff>
+
+Full handoff at `{prior_handoff_path}` if you need more detail."""
+
+        # Unblock context (only on retry after blocker)
+        unblock_section = ""
+        if unblock_context:
+            unblock_section = f"""## Unblock guidance (from diagnostic)
+
+A previous attempt on the current step got stuck. A diagnostic agent analyzed it and produced the following guidance. Apply it and retry the step.
+
+<unblock>
+{unblock_context}
+</unblock>"""
+
+        return f"""You are an E2E test executor. You follow a pre-written plan step-by-step and interact with the app via MCP tools. You do NOT improvise beyond the plan.
+
+## Your job
+
+1. Read the plan at `{plan_file}`
+2. Resume from wherever the last spawn left off (see handoff below, if any)
+3. For each remaining step: perform the actions, observe the result, compare to expected
+4. Write findings to `{findings_file}` for any observed ≠ expected
+5. When you complete a step, append a one-line progress note to `{e2e_dir}/progress.md`
+6. Exit gracefully — do NOT try to do the whole plan in one session if it's long
+
+## Exit protocol
+
+You have three ways to exit. Choose exactly ONE before you stop:
+
+**(A) Plan complete** — all steps in the plan are finished. Write `{handoff_file}` with:
+```markdown
+# Executor handoff (spawn {spawn_num})
+
+## Status: COMPLETE
+
+## Steps completed this spawn
+- step-N: [short result]
+...
+
+## Findings written
+[BUG-IDs added to findings.json this spawn, or "none"]
+```
+
+**(B) Partial — ready to hand off** — you've done useful work but feel you should stop (tool-call budget getting high, context feels loaded, etc.). Write `{handoff_file}`:
+```markdown
+# Executor handoff (spawn {spawn_num})
+
+## Status: PARTIAL
+
+## Steps completed this spawn
+- step-N: [short result]
+...
+
+## Next step to resume at: step-M
+
+## State left behind
+[Anything the next spawn needs to know — e.g. "cart has 2 items", "logged in as admin", "on /checkout page"]
+
+## Findings written
+[BUG-IDs added this spawn]
+```
+
+**(C) Blocked — cannot proceed on current step** — you tried a step, it didn't produce the expected result, you tried ONE alternate approach (different selector / waited and retried), and it still didn't work, AND you cannot tell if the mismatch is a bug to file or a precondition you got wrong. Write `{blocker_file}`:
+```markdown
+# Executor blocker (spawn {spawn_num})
+
+## Blocked step: step-N
+## Step intent: [from plan]
+
+## What I tried
+1. [exact tool call + result]
+2. [alternate attempt + result]
+
+## What I observed
+[snapshot / network / console excerpts — concrete]
+
+## What I expected per plan
+[from the step's `expected` field]
+
+## Why I'm blocked
+[one sentence: what decision you can't make — e.g. "Don't know if this 500 is BUG-015 resurfacing or a new bug; need to check if API was restarted after BUG-015 fix"]
+
+## Steps completed before blocking
+- step-N: [result]
+...
+```
+
+**IMPORTANT about option (C)**: a mismatch between observed and expected is usually a BUG, not a blocker. Write a finding and continue to the next step. Only write a blocker when you genuinely cannot determine whether to proceed or what to file. Blockers trigger an Opus diagnostic — use them sparingly.
+
+## Inline retry guidance
+
+Before declaring a blocker, on any failed step try ONCE more with:
+- A different selector (if element not found)
+- A `wait` + retry (if timing flake suspected)
+- Reading the console/network log to understand what's happening
+
+If the second attempt also fails in a way you can't classify, THEN write the blocker.
+
+{handoff_section}
+
+{unblock_section}
+
+{tools_section}
+{screenshot_section}
+
+## Plan (read with Read tool)
+
+Your plan is at `{plan_file}`. Read it first. Do not try to replan.
+
+## UI_FLOW.md (reference)
+
+<ui_flow>
+{ui_flow}
+</ui_flow>
+
+{f'''## Backend service connection info
+
+```
+{backend_env}
+```
+
+''' if backend_env else ''}
+
+## Rules
+
+- Follow the plan — do NOT invent new steps or explore outside it
+- Inline retry once before blocking; continue past bugs (they are findings, not blockers)
+- Update `{findings_file}` incrementally, after each finding
+- Append to `{e2e_dir}/progress.md` after each completed step
+- Exactly ONE exit file: `{handoff_file}` OR `{blocker_file}`, never both
+- Do NOT modify source code
+- Do NOT use curl/wget/fetch as a substitute for MCP tool calls
+"""
+
+    def _build_e2e_diagnostic_prompt(self, e2e_dir: Path, step_id: str,
+                                      blocker_content: str, plan_content: str,
+                                      ui_flow: str,
+                                      prior_unblocks: list[Path],
+                                      prior_summaries: list[Path],
+                                      attempt: int) -> str:
+        """Opus diagnostic: reads blocker + plan + prior attempts, writes unblock-N.md."""
+        blocker_dir = _blocker_step_dir(e2e_dir, step_id)
+        unblock_file = blocker_dir / f"unblock-{attempt}.md"
+
+        prior_unblock_lines = "\n".join(
+            f"- {p} (unblock-{i+1})" for i, p in enumerate(prior_unblocks)
+        ) or "(none — this is the first diagnostic for this step)"
+        prior_summary_lines = "\n".join(
+            f"- {p} (executor summary for attempt {i+1})" for i, p in enumerate(prior_summaries)
+        ) or "(none)"
+
+        return f"""You are an E2E diagnostic agent. An executor got blocked on a specific step. Your job is to figure out why and write concrete instructions so the next executor spawn can unblock.
+
+## Blocker (from executor)
+
+<blocker>
+{blocker_content}
+</blocker>
+
+## Plan step definition
+
+<plan>
+{plan_content}
+</plan>
+
+## Prior attempts on this step (lazy-load — read if you need more context)
+
+Prior unblock guidance files:
+{prior_unblock_lines}
+
+Prior executor session summaries (mechanical tool-call extracts):
+{prior_summary_lines}
+
+You MAY use the Read tool to open any of these files if the current blocker suggests the prior attempts are relevant. Do NOT read them by default.
+
+## UI_FLOW.md
+
+<ui_flow>
+{ui_flow}
+</ui_flow>
+
+## Your job
+
+1. Diagnose the root cause. The executor says it can't classify the observed state. You have more context — figure out what's actually happening.
+2. If the step is testing something that's legitimately broken in the app: tell the executor to **file it as a bug and skip the step**.
+3. If the step's expected state was wrong or the preconditions weren't met: tell the executor **exactly what to do differently**.
+4. If this is genuinely a spec ambiguity: tell the executor to **skip the step and flag it as a spec gap**.
+
+## Output
+
+Write your guidance to `{unblock_file}` with this format:
+
+```markdown
+# Unblock guidance — {step_id}, attempt {attempt}
+
+## Diagnosis
+[One paragraph: what's actually going on]
+
+## Action for next executor spawn
+[ONE of:]
+- FILE_AND_SKIP: File the blocker as a finding with summary "<short>" severity <critical|high|medium|low>, then skip this step.
+- RETRY_WITH: Try the step again, but [concrete modification — new selector, different preconditions, specific waits].
+- SKIP_SPEC_GAP: Skip the step. Note in progress.md: "step-N skipped — spec unclear about <aspect>".
+
+## Why
+[One sentence: why this is the right action]
+```
+
+## Rules
+
+- Be decisive — the executor needs one clear action, not a menu of options
+- Do NOT try to fix source code — you are diagnosing only
+- If you genuinely cannot diagnose, pick SKIP_SPEC_GAP (the planner will route around next iteration)
+- Keep it short — the executor reads this inline
 """
 
     def _build_e2e_fix_prompt(self, spec_dir: str, findings_file: Path,

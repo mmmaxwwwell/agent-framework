@@ -148,6 +148,7 @@ presets/                ← Quality presets, loaded once per project
   enterprise.md         ← Multi-user production
 run-tasks.sh            ← Bash wrapper for parallel_runner.py
 parallel_runner.py      ← Task runner: parses task list, spawns parallel agents
+cost_report.py          ← Post-hoc cost analyzer for run-log.jsonl (see reference/cost-reporting.md)
 ```
 
 Typical savings: **60-90%** fewer tokens per phase for poc/local presets. Enterprise interview is the worst case since it loads nearly all reference files.

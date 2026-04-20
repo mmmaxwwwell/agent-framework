@@ -47,6 +47,7 @@ reference/           # Enterprise knowledge base — loaded on demand by phase f
   pre-pr.md          # Pre-PR gate: single-command validation, multi-build discovery, non-vacuous checks
   e2e-runtime.md     # Real-runtime E2E: emulator, browser, simulator patterns, side-by-side architecture
   stripe.md          # Stripe / payment integration: listener scripts, env pattern, webhook contract, RUNBOOK, live-key guardrails
+  cost-reporting.md  # Post-hoc cost & effectiveness analysis via cost_report.py (reads run-log.jsonl, outputs per-model/per-phase dollar breakdown)
 presets/             # Quality presets — loaded once per project
   poc.md             # Proof of concept
   local.md           # Single-user local tool
