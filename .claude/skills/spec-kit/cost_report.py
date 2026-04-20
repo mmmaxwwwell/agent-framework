@@ -32,13 +32,15 @@ from pathlib import Path
 
 
 # ── Pricing (USD per 1M tokens) ────────────────────────────────────────
-# Source: Anthropic public pricing as of April 2026.  Edit if rates change.
+# Source: Anthropic public pricing as of 2026-04-19 for the Claude 4.x
+# family at standard ≤200K context (the harness spawns agents with
+# `--model opus|sonnet|haiku` with no 1M-context flag). Edit if rates change.
 PRICING = {
     "opus": {
-        "input": 15.00,
-        "cache_read": 1.50,
-        "cache_create": 18.75,
-        "output": 75.00,
+        "input": 5.00,
+        "cache_read": 0.50,
+        "cache_create": 6.25,
+        "output": 25.00,
     },
     "sonnet": {
         "input": 3.00,
@@ -47,10 +49,10 @@ PRICING = {
         "output": 15.00,
     },
     "haiku": {
-        "input": 0.80,
-        "cache_read": 0.08,
-        "cache_create": 1.00,
-        "output": 4.00,
+        "input": 1.00,
+        "cache_read": 0.10,
+        "cache_create": 1.25,
+        "output": 5.00,
     },
 }
 

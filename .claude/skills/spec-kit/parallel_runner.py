@@ -3619,6 +3619,7 @@ class PlatformRuntime:
     _booted: bool = False
     _mcp_process: Optional[subprocess.Popen] = None
     _mcp_config_path: Optional[Path] = None
+    _mcp_probe_stderr_path: Optional[Path] = None
 
     def boot(self, project_dir: Path, log_fn=None) -> bool:
         """Boot the platform runtime. Returns True on success."""
@@ -3757,6 +3758,117 @@ class PlatformRuntime:
         _log(f"MCP config written to {config_path}")
         return True
 
+    def probe_mcp_launch(self, project_dir: Path, log_fn=None) -> dict:
+        """Launch the configured MCP binary once and capture its stderr/stdout.
+
+        Called lazily by the platform-fix diagnostic builder when a runtime
+        failed to boot. The Claude CLI spawns MCP servers as subprocesses and
+        their stderr is not visible to the runner; if launch fails (bwrap
+        read-only /nix/store blocking `nix run`, placeholder binary, missing
+        deps) the only signal the runner sees is `_booted runtimes: []`.
+        This probe reproduces the launch under the same sandbox constraints
+        so the fix-agent sees the real error.
+
+        Returns a dict with: status ("launched" | "crashed" | "no-config" |
+        "error"), stderr (str), stdout_got_response (bool), message (str).
+        The caller owns rendering; this function never raises.
+        """
+        _log = log_fn or (lambda msg: print(f"[platform:{self.name}] {msg}", file=sys.stderr))
+
+        if not self._mcp_config_path or not self._mcp_config_path.exists():
+            return {"status": "no-config", "stderr": "", "stdout_got_response": False,
+                    "message": "MCP config file missing — start_mcp_server never ran."}
+
+        try:
+            config = json.loads(self._mcp_config_path.read_text())
+            server_cfg = config.get("mcpServers", {}).get(f"mcp-{self.name}", {})
+            cmd = [server_cfg["command"], *server_cfg.get("args", [])]
+        except (OSError, json.JSONDecodeError, KeyError) as e:
+            return {"status": "error", "stderr": "", "stdout_got_response": False,
+                    "message": f"could not read MCP config: {e!r}"}
+
+        stderr_path = self._mcp_config_path.parent / f"{self.name}.stderr"
+        self._mcp_probe_stderr_path = stderr_path
+
+        # Minimal JSON-RPC initialize request — any MCP server must respond
+        # to this, and the handshake is cheap.
+        init_req = (json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "platform-probe", "version": "0"},
+            },
+        }) + "\n").encode()
+
+        stderr_buf = b""
+        stdout_buf = b""
+        status = "error"
+        message = ""
+        try:
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, cwd=str(project_dir), bufsize=0,
+            )
+            try:
+                stdout_buf, stderr_buf = proc.communicate(input=init_req, timeout=5)
+                # Process exited on its own within 5s → it crashed or rejected
+                # the handshake. Whatever's in stderr is probably the reason.
+                status = "crashed"
+                message = f"MCP server exited with code {proc.returncode} within 5s."
+            except subprocess.TimeoutExpired:
+                # Healthy servers block waiting for more JSON-RPC. Timing out
+                # is the *good* outcome; drain what's buffered and SIGKILL.
+                proc.kill()
+                try:
+                    stdout_buf, stderr_buf = proc.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+                status = "launched"
+                message = "MCP server launched and was still running at t+5s."
+        except Exception as e:
+            message = f"probe failed to spawn: {e!r}"
+            stderr_buf = message.encode()
+
+        try:
+            stderr_path.write_bytes(stderr_buf)
+        except OSError:
+            pass
+
+        stdout_path = self._mcp_config_path.parent / f"{self.name}.stdout"
+        try:
+            stdout_path.write_bytes(stdout_buf)
+        except OSError:
+            pass
+
+        # Any valid JSON-RPC response on stdout means the server completed the
+        # initialize handshake — stderr is then just noise (warnings, etc.).
+        got_response = False
+        if stdout_buf:
+            for line in stdout_buf.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                    if isinstance(msg, dict) and msg.get("jsonrpc") == "2.0":
+                        got_response = True
+                        break
+                except json.JSONDecodeError:
+                    continue
+
+        _log(f"MCP probe: status={status} got_response={got_response} "
+             f"stderr_bytes={len(stderr_buf)}")
+
+        return {
+            "status": status,
+            "stderr": stderr_buf.decode("utf-8", errors="replace"),
+            "stderr_path": str(stderr_path),
+            "stdout_path": str(stdout_path),
+            "stdout_got_response": got_response,
+            "message": message,
+        }
+
     def teardown(self, log_fn=None):
         """Stop the runtime and MCP server."""
         _log = log_fn or (lambda msg: print(f"[platform:{self.name}] {msg}", file=sys.stderr))
@@ -3773,6 +3885,13 @@ class PlatformRuntime:
         if self._mcp_config_path and self._mcp_config_path.exists():
             self._mcp_config_path.unlink()
             self._mcp_config_path = None
+
+        if self._mcp_probe_stderr_path and self._mcp_probe_stderr_path.exists():
+            self._mcp_probe_stderr_path.unlink()
+            stdout_path = self._mcp_probe_stderr_path.parent / f"{self.name}.stdout"
+            if stdout_path.exists():
+                stdout_path.unlink()
+            self._mcp_probe_stderr_path = None
 
         if self.name == "android":
             subprocess.run(["adb", "emu", "kill"], capture_output=True, timeout=30)
@@ -4220,6 +4339,88 @@ class PlatformManager:
             self._log("E2E backend services stopped")
         except Exception as e:
             self._log(f"E2E teardown error: {e}")
+        self._e2e_services_started = False
+
+    def reset_e2e_services(self, project_dir: Path) -> None:
+        """Force-kill anything the previous E2E attempt left behind, then
+        mark services as not-started so the next `ensure_runtime` call will
+        re-run setup.sh from a clean slate.
+
+        Called between retries in the platform-init loop. Without this, each
+        failed attempt piles another node/setup.sh onto the host, and the
+        next attempt's setup.sh finds its ports already taken by ghosts it
+        cannot see through the pid-file guard.
+
+        Strategy, in order of increasing violence:
+          1. Run teardown.sh if it exists (project's own cleanup path).
+          2. Kill pids recorded in .dev/e2e-state/*.pid (if still alive).
+          3. Kill any process listening on the known E2E ports.
+        """
+        state_dir = project_dir / ".dev" / "e2e-state"
+
+        # 1. Run teardown.sh if the project has one.
+        teardown_script = project_dir / "test" / "e2e" / "teardown.sh"
+        if teardown_script.exists():
+            self._log(f"reset_e2e: running {teardown_script}")
+            try:
+                subprocess.run(
+                    ["bash", str(teardown_script)],
+                    capture_output=True, text=True, timeout=60,
+                    cwd=str(project_dir),
+                )
+            except Exception as e:
+                self._log(f"reset_e2e: teardown.sh raised {e!r}")
+
+        # 2. Kill pids in state dir.
+        if state_dir.is_dir():
+            for pid_file in sorted(state_dir.glob("*.pid")):
+                try:
+                    raw = pid_file.read_text().strip()
+                    pid_s = raw.split()[0] if raw else ""
+                    if pid_s.isdigit():
+                        pid = int(pid_s)
+                        try:
+                            os.kill(pid, 9)
+                            self._log(f"reset_e2e: killed pid {pid} from {pid_file.name}")
+                        except ProcessLookupError:
+                            pass
+                        except PermissionError:
+                            self._log(f"reset_e2e: no permission to kill pid {pid}")
+                except OSError:
+                    pass
+                try:
+                    pid_file.unlink()
+                except OSError:
+                    pass
+
+        # 3. Kill listeners on known E2E ports. We don't hard-code the port
+        #    list here — we read it from setup.sh if possible, falling back
+        #    to a standard set covering postgres/supertokens/api/astro.
+        candidate_ports = {5432, 3567, 3000, 4321}
+        setup_script = project_dir / "test" / "e2e" / "setup.sh"
+        if setup_script.exists():
+            try:
+                txt = setup_script.read_text()
+                for m in re.finditer(r"PORT_[A-Z]+=(\d+)", txt):
+                    candidate_ports.add(int(m.group(1)))
+            except OSError:
+                pass
+
+        for port in sorted(candidate_ports):
+            try:
+                r = subprocess.run(
+                    ["ss", "-tlnpH", f"sport = :{port}"],
+                    capture_output=True, text=True, timeout=5)
+                pids = set(re.findall(r"pid=(\d+)", r.stdout))
+                for pid_s in pids:
+                    try:
+                        os.kill(int(pid_s), 9)
+                        self._log(f"reset_e2e: killed pid {pid_s} holding :{port}")
+                    except (ProcessLookupError, PermissionError):
+                        pass
+            except Exception as e:
+                self._log(f"reset_e2e: ss check for :{port} failed ({e})")
+
         self._e2e_services_started = False
 
     def ensure_runtime(self, capability: str, project_dir: Path) -> Optional[PlatformRuntime]:
@@ -7950,6 +8151,62 @@ class Runner:
             except Exception as e:
                 return f"(ss failed: {e})"
 
+        def _e2e_process_tree() -> str:
+            """Snapshot E2E-related processes. Surfaces stale setup.sh / node /
+            tsx / astro / supertokens instances from previous attempts — the
+            kind of ghost that holds a port and makes a retry look like a
+            fresh timeout."""
+            try:
+                r = subprocess.run(
+                    ["ps", "-eo", "pid,ppid,etimes,cmd", "--no-headers"],
+                    capture_output=True, text=True, timeout=5)
+                if r.returncode != 0:
+                    return f"(ps failed: rc={r.returncode})"
+                wanted = re.compile(
+                    r"(test/e2e/setup\.sh|node .*dist/index\.js|tsx .*src/index\.ts|"
+                    r"astro .*dev|io\.supertokens\.Main|pg_ctl|postgres:\s)"
+                )
+                matches = [l for l in r.stdout.splitlines() if wanted.search(l)]
+                if not matches:
+                    return "(no E2E-related processes)"
+                return "\n".join(matches)
+            except Exception as e:
+                return f"(ps failed: {e})"
+
+        def _pid_files_status() -> str:
+            """Cross-check .dev/e2e-state/*.pid against real processes. A pid
+            file pointing at a reused/unrelated pid is the classic cause of
+            'already running, skipping start' logic mis-firing."""
+            state = project_dir / ".dev" / "e2e-state"
+            if not state.is_dir():
+                return f"(no state dir at {state.relative_to(project_dir)})"
+            lines: list[str] = []
+            for pid_file in sorted(state.glob("*.pid")):
+                try:
+                    raw = pid_file.read_text().strip()
+                except OSError as e:
+                    lines.append(f"- {pid_file.name}: unreadable ({e})")
+                    continue
+                pid_s = raw.split()[0] if raw else ""
+                if not pid_s.isdigit():
+                    lines.append(f"- {pid_file.name}: empty/invalid ({raw!r})")
+                    continue
+                try:
+                    r = subprocess.run(
+                        ["ps", "-p", pid_s, "-o", "args=", "--no-headers"],
+                        capture_output=True, text=True, timeout=5)
+                    if r.returncode != 0 or not r.stdout.strip():
+                        lines.append(
+                            f"- {pid_file.name}: pid={pid_s} DEAD "
+                            f"(stale file — setup.sh 'already running' guard will mis-fire "
+                            f"if the pid later gets reused)"
+                        )
+                    else:
+                        lines.append(f"- {pid_file.name}: pid={pid_s} alive — `{r.stdout.strip()}`")
+                except Exception as e:
+                    lines.append(f"- {pid_file.name}: pid={pid_s} check failed ({e})")
+            return "\n".join(lines) if lines else "(no .pid files)"
+
         def _match_patterns(failure: dict, service_log_tail: str) -> list[str]:
             """Match the failure signature against the pattern library.
 
@@ -8063,6 +8320,73 @@ class Runner:
             lines.append(f"- _e2e_services_started: {self._platform_manager._e2e_services_started}")
             lines.append(f"- _booted runtimes: {list(self._platform_manager._runtimes.keys())}")
 
+            # Probe the MCP server binary now, lazily. The Claude CLI spawns
+            # MCP servers as subprocesses and their stderr is invisible to the
+            # runner — when boot fails with services up but `_booted` empty,
+            # the root cause is almost always in that invisible stderr.
+            # Re-running the launch here captures it under the same sandbox
+            # constraints the CLI faces.
+            rt = self._platform_manager._runtimes.get(cap)
+            if rt is not None and hasattr(rt, "probe_mcp_launch"):
+                probe = rt.probe_mcp_launch(project_dir, log_fn=self._log)
+                err_text = probe["stderr"].strip()
+                err_lines = err_text.splitlines() if err_text else []
+
+                def _render_stderr(note_if_empty: str) -> None:
+                    if err_lines:
+                        tail = err_lines[-20:]
+                        lines.append("```")
+                        lines.append("\n".join(tail))
+                        lines.append("```")
+                        if len(err_lines) > 20:
+                            try:
+                                rel = Path(probe["stderr_path"]).relative_to(project_dir)
+                                rel_str = str(rel)
+                            except ValueError:
+                                rel_str = probe["stderr_path"]
+                            lines.append(
+                                f"*showing last 20 of {len(err_lines)} lines — "
+                                f"full log: `{rel_str}`*"
+                            )
+                    else:
+                        lines.append(f"*({note_if_empty})*")
+
+                if probe["status"] == "launched" and probe["stdout_got_response"]:
+                    lines.append(
+                        f"\n## MCP launch probe: ✅ `{cap}` responded to initialize\n\n"
+                        f"*The binary launched and completed the JSON-RPC handshake. "
+                        f"MCP launch is working; the failure is elsewhere (service "
+                        f"boot, emulator/browser state, or a race between them).*"
+                    )
+                elif probe["status"] == "launched":
+                    lines.append(
+                        f"\n## MCP launch probe: ⚠ `{cap}` launched but never responded\n\n"
+                        f"*{probe['message']} No valid JSON-RPC response appeared on stdout "
+                        f"within 5s. Likely a placeholder binary, protocol-version mismatch, "
+                        f"or a server that wedges during `initialize`. Stderr below:*\n"
+                    )
+                    _render_stderr("stderr was empty")
+                elif probe["status"] == "crashed":
+                    lines.append(
+                        f"\n## MCP launch probe: ❌ `{cap}` crashed on launch\n\n"
+                        f"*{probe['message']} This is the root cause — fix this before "
+                        f"looking at setup.sh or service logs. Stderr:*\n"
+                    )
+                    _render_stderr(
+                        "stderr was empty — server may have died before flushing; "
+                        "check exit code in message above"
+                    )
+                elif probe["status"] == "no-config":
+                    lines.append(
+                        f"\n## MCP launch probe: ⚠ `{cap}` has no config\n\n"
+                        f"*{probe['message']} The runner never reached `start_mcp_server`, "
+                        f"which means the failure happened earlier (setup.sh or emulator boot).*"
+                    )
+                else:  # "error"
+                    lines.append(
+                        f"\n## MCP launch probe: error\n\n*{probe['message']}*"
+                    )
+
             setup_log = project_dir / "test" / "e2e" / ".state" / "setup-failure.log"
             failure = _parse_setup_failure(setup_log)
 
@@ -8101,6 +8425,44 @@ class Runner:
                     f"\n## Port binding for {failure['failed_port']}\n\n"
                     f"```\n{binding}\n```"
                 )
+
+            # Explicit EADDRINUSE callout — the most common root cause when a
+            # prior attempt left a node server behind, and the signal is buried
+            # in the service log tail above. Surface it at the top level.
+            if service_log_tail and re.search(r"EADDRINUSE|address already in use",
+                                              service_log_tail, re.IGNORECASE):
+                lines.append(
+                    "\n## ⚠ EADDRINUSE detected in service log\n\n"
+                    "The service **did** start, tried to bind its port, and crashed "
+                    "because another process was already listening. This is almost "
+                    "always a stale process from a previous setup.sh run (or a prior "
+                    "platform-fix attempt). See the process tree and pid-file sections "
+                    "below, then kill the stale pid before re-running setup.sh.\n"
+                )
+
+            # Always attach the process tree + pid-file cross-check. These are
+            # cheap, small, and catch the single most common missed hypothesis:
+            # 'a prior attempt's server is still alive and holding the port.'
+            lines.append("\n## E2E-related processes on this host\n")
+            lines.append(
+                "*If you see more than one `setup.sh` or more than one `node dist/index.js`, "
+                "a prior attempt did not clean up. Kill it before retrying.*\n"
+            )
+            lines.append("```")
+            lines.append(_e2e_process_tree())
+            lines.append("```")
+
+            lines.append("\n## `.dev/e2e-state/*.pid` cross-check\n")
+            lines.append(
+                "*`setup.sh` uses `kill -0 $pid` to decide if a service is 'already "
+                "running' — but that check passes for **any** live pid, including "
+                "reused pids owned by unrelated processes. If a pid file says DEAD "
+                "or points at something that isn't our API/Astro/SuperTokens, delete "
+                "the pid file before retrying.*\n"
+            )
+            lines.append("```")
+            lines.append(_pid_files_status())
+            lines.append("```")
 
             matched = _match_patterns(failure, service_log_tail)
             pattern_section = _extract_pattern_sections(matched)
@@ -8220,7 +8582,7 @@ class Runner:
                     + _PLATFORM_FIX_PLAYBOOK
                 )
             repeat_section = _repeat_failure_section(attempt)
-            return f"""You are fixing a platform runtime initialization failure for task {task.id}.
+            return rf"""You are fixing a platform runtime initialization failure for task {task.id}.
 
 The runner tried to boot the `{cap}` platform runtime so it could run an E2E
 test loop, but the boot failed. This is attempt **{attempt}/{PLATFORM_INIT_MAX_ATTEMPTS}**.
@@ -8244,18 +8606,42 @@ writes BLOCKED.md and stops.
 
 ## Your job
 
-1. **Read the diagnostics above first.** The runner has already identified
-   the failing service, attached its log tail, shown the port binding, and
-   matched the failure against known patterns. Use that — don't re-explore
-   the repo from scratch.
-2. If a pattern matched, its "Fix options" section lists ranked preferences.
-   Start there.
-3. Form a hypothesis, apply the smallest fix that addresses it, then
-   **verify by reproducing from a clean state** (kill stale processes,
+**Mandatory first actions — before forming any hypothesis, gather ground truth.**
+The diagnostics above are a summary. Summaries can mask the actual error.
+Run these commands and paste the output into your reasoning *before* editing
+anything. If any result contradicts the matched pattern, abandon the pattern
+and chase the contradiction.
+
+1. **Read the failing service's raw log, not just the tail we quoted.**
+   Open `.dev/e2e-state/api.log` / `astro.log` / `supertokens.log` (whichever
+   matches the failing service) and search for `EADDRINUSE`, `address already
+   in use`, `Error:`, `FATAL`, `crashed`, and the service's own startup-
+   success line. "wait_for_port timed out" almost never means the service
+   silently hung — it usually means the service logged an error and died,
+   or a prior run's ghost process is still bound to the port.
+2. **Snapshot live processes.** Run:
+   ```
+   ps -eo pid,ppid,etimes,cmd --no-headers \
+     | grep -E 'setup\.sh|node .*dist/index|tsx .*src/index|astro .*dev|io\.supertokens\.Main'
+   ```
+   If you see more than one `setup.sh`, more than one API node process, or
+   processes with `etimes` far larger than this retry's age, a prior attempt
+   is still alive. Kill them before anything else.
+3. **Check port ownership directly.** For the failing port P, run
+   `ss -tlnpH "sport = :P"` and note the pid. Cross-check against
+   `cat .dev/e2e-state/*.pid` — if the pid file names a different pid than
+   `ss` shows, or names a pid whose `ps -p $PID -o args=` is unrelated
+   (e.g. `sshd`, `bash`), the pid file is stale and setup.sh's
+   "already running" guard will mis-fire. Delete the stale pid file.
+4. **Only now** consult the matched pattern's "Fix options". Apply the
+   smallest fix that addresses what the evidence actually shows — which may
+   not be what the pattern predicted.
+5. **Verify by reproducing from a clean state**: kill all stale processes,
    remove `.dev/e2e-state/*.pid`, re-run `bash test/e2e/setup.sh`, confirm
-   exit 0). Verification is required — "exit 0 from the guarded happy path"
-   is not the same as a real fix.
-4. On your final message, follow the "Finishing" section of the playbook
+   exit 0 AND that it logs the failing service as ready. "exit 0 from the
+   guarded happy path" is not the same as a real fix — if your fix only
+   skipped the failing step, it hasn't worked.
+6. On your final message, follow the "Finishing" section of the playbook
    (root cause / fix / verification / residual risk).
 
 ## Constraints
@@ -8331,6 +8717,17 @@ Succeed = exit 0 from a cold re-run of setup.sh (or the relevant boot step).
                     raise
                 except Exception as exc:
                     e2e_log(f"Platform fix agent raised {exc!r} — continuing retry loop")
+
+                # Reset backend services before the next retry so the upcoming
+                # ensure_runtime() call re-runs setup.sh from a clean slate.
+                # Without this, each failed attempt leaves another setup.sh +
+                # node/astro/supertokens behind, and attempt N+1's setup.sh
+                # finds its ports held by ghosts from attempts 1..N.
+                try:
+                    e2e_log(f"Resetting E2E services before attempt {attempt + 1}")
+                    self._platform_manager.reset_e2e_services(project_dir)
+                except Exception as exc:
+                    e2e_log(f"reset_e2e_services raised {exc!r} — continuing anyway")
 
             if not runtime:
                 platform_init_failed = True
