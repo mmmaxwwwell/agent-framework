@@ -13,7 +13,9 @@ Compare three configurations of the spec-kit parallel runner across the same tas
 | 5 | Planner + sub-agents | Sonnet | Sonnet | $21.82 | 89% | full-sonnet-split |
 | 6 | Single agent (no split) | Sonnet | — | $39.10 | 80% | sonnet-only |
 
-Projected costs are based on analysis of 29 completed tasks (870 API messages, 86.6M tokens) from the nix-key project at API rates (Opus: $15/$75/$18.75/$1.875 per M for input/output/cache-create/cache-read; Sonnet: $3/$15/$3.75/$0.375).
+Projected costs are based on analysis of 29 completed tasks (870 API messages, 86.6M tokens) from the nix-key project at API rates. The original projections used Opus rates of $15/$75/$18.75/$1.875 per M for input/output/cache-create/cache-read; Sonnet at $3/$15/$3.75/$0.375.
+
+**Note (2026-04-20):** Opus rates at standard ≤200K context have been corrected to $5/$25/$6.25/$0.50 per M. The Opus-heavy configs (1, 2, 3) in the table above are overstated by ~3×; actual cost is roughly one-third of the listed dollar amount. The hybrid and full-sonnet configs (4, 5, 6) are largely unaffected (Sonnet rates unchanged). See `reference/cost-reporting.md` § Pricing for current rates; re-run `cost_report.py` on any existing `run-log.jsonl` to get corrected totals.
 
 **Minimum benchmark set**: Configs 1 (baseline), 4 (hybrid), and 5 (full-sonnet-split). Config 2 is already implemented. Configs 3 and 6 are optional if time permits.
 

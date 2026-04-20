@@ -283,3 +283,45 @@ Nix flake for expected AVD name.
 
 - Running an emulator without `-no-window -no-audio -no-snapshot` on CI.
 - Ignoring missing `/dev/kvm` — emulation will be unusably slow.
+
+---
+
+## Signature: mcp-launch-failed
+
+**Match:** Boot diagnostics show `_e2e_services_started: True` AND `_booted runtimes: []` with services (Postgres / SuperTokens / API / Astro) listening on their ports. setup.sh exited 0. The failure is specifically that the Claude CLI could not spawn the MCP server.
+
+**Typical root cause:** The MCP server binary itself can't launch, and the Claude CLI's stderr is invisible to the runner so the only visible signal is "no runtimes booted."
+
+Common causes:
+
+- **bwrap sandbox + `nix run`.** When `.mcp.json` is configured as `{"command": "nix", "args": ["run", ".#mcp-android"]}`, `nix run` needs write access to `/nix/var/nix/db/big-lock`. The runner launches Claude inside a bwrap sandbox with `--ro-bind /nix/store /nix/store`, making the nix store read-only. `nix run` fails with "Permission denied" and the MCP server never starts.
+- **Placeholder binary.** The `nix-mcp-debugkit` flake input resolved to a placeholder store path (either from a stale cache or a build that silently fell through). The binary exists on PATH but immediately exits or prints an unrelated help message.
+- **Missing shared library.** The binary launched in the runner's shell (where the devShell packages are on PATH) but the Claude CLI spawns it in a reduced env where LD_LIBRARY_PATH or similar isn't populated.
+- **MCP protocol mismatch.** The server speaks an older MCP version than the Claude CLI expects (e.g. `2024-05-15` vs. `2024-11-05`). Server launches, CLI sends `initialize`, server rejects and exits.
+
+**Diagnostic commands:**
+
+```bash
+# Read the probe's captured stderr — this is the authoritative error.
+cat .specify/mcp/android.stderr
+cat .specify/mcp/android.stdout
+
+# Reproduce the launch outside the sandbox. If this works but the probe fails,
+# the issue is sandbox/env-related.
+nix develop --command mcp-android --emulator < /dev/null &
+
+# Reproduce inside bwrap to confirm the sandbox is the constraint.
+# (The runner's probe does this automatically — see cost-reporting.md § Prompt-caching strategy.)
+```
+
+**Fix options (ranked):**
+
+1. **Direct binary on PATH instead of `nix run`.** In the project flake's devShell, add the MCP binary itself (`mcp-android`, `mcp-browser`) to `packages`, then change `.mcp.json` to `{"command": "mcp-android"}` with no `nix run` wrapper. The binary is on PATH after `nix develop` and the Claude CLI can spawn it inside the sandbox without needing write access to the nix store.
+2. **Refresh the flake input.** If `nix-mcp-debugkit` evaluates to a placeholder: `nix flake update nix-mcp-debugkit` in the project, then re-enter `nix develop`.
+3. **Upgrade the MCP server.** If the stderr shows a protocol-version rejection, bump `nix-mcp-debugkit` to a commit that speaks the CLI's version.
+
+**Anti-patterns:**
+
+- Editing `test/e2e/setup.sh`. setup.sh is not the failure path — services are up. Agents that chase setup.sh logs waste 2-4 attempts before noticing.
+- Raising the boot timeout. The MCP server either launches in <1s or doesn't launch at all; time is not the variable.
+- Re-running `nix develop` from inside the runner without re-entering the sandbox. The devShell the runner sees is frozen at runner start.

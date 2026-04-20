@@ -5,6 +5,19 @@ These are not task-specific — they apply to every fix-agent, every time.
 They exist because cold-start agents default to "explore the repo and guess,"
 which burns tokens and often fixes the wrong thing.
 
+## Read the MCP launch probe first (platform-init failures only)
+
+When the runner spawns you for a `platform_init_fail`, the diagnostic block starts with a section labeled `## MCP launch probe:` with one of four outcomes:
+
+- **✅ launched and responded to initialize** — the MCP server itself is fine. The failure is elsewhere: a backend service didn't come up, the emulator/browser isn't healthy, or there's a race between them. Skip the rest of the probe discussion and work the service logs / pid cross-check below.
+- **⚠ launched but never responded** — the binary starts but doesn't complete the JSON-RPC handshake within 5s. Usually a placeholder binary, a protocol-version mismatch (server speaks an older MCP version), or a bug where the server wedges during `initialize`. Check the stderr block; if it's empty, run the binary yourself under the same shell and feed it an `initialize` request manually.
+- **❌ crashed on launch** — this is the root cause. The stderr excerpt in the probe section *is* the error. Fix that; do not chase setup.sh, service logs, or pid files. Common culprits: `nix run` blocked by bwrap's read-only `/nix/store`, missing shared libraries, or a missing env var that the Claude CLI scrubs but the runner's parent shell had.
+- **⚠ no-config** — the runner never reached `start_mcp_server`, meaning the failure was earlier in the boot path (setup.sh or emulator boot). Treat like a non-MCP failure and work the service logs.
+
+The probe is a *lazy re-launch*: the runner re-runs the MCP binary under the same sandbox constraints as the Claude CLI at diagnostic-build time. That makes its stderr authoritative in a way that setup.sh logs are not — setup.sh reports "MCP did not boot" but has no visibility into *why*.
+
+If the probe section contradicts any other section of the diagnostic (a matched pattern, a prior-attempt claim, etc.), **trust the probe**. The other sections are heuristics built from setup.sh's external view; the probe has the actual process stderr.
+
 ## Core principle: reproduce before hypothesizing
 
 Do not form a hypothesis from logs alone. Logs are frozen snapshots and may

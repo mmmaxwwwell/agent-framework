@@ -71,15 +71,35 @@ The JSON output (`cost-report.json`) is the same data in structured form for scr
 
 ## Pricing
 
-Prices in the script are public Anthropic rates as of April 2026 and live at the top of `cost_report.py` in the `PRICING` dict. If Anthropic rates change, edit that dict — everything downstream recomputes.
+Prices in the script are public Anthropic rates as of 2026-04-19 for the Claude 4.x family at standard ≤200K context. The harness spawns agents via `--model opus|sonnet|haiku` with no 1M-context flag, so these are the rates that apply to every run. They live at the top of `cost_report.py` in the `PRICING` dict. If Anthropic rates change, edit that dict — everything downstream recomputes.
 
 Per-family rates (USD per 1M tokens):
 
 | Family | Input | Cache read | Cache create | Output |
 |---|---:|---:|---:|---:|
-| Opus | $15.00 | $1.50 | $18.75 | $75.00 |
+| Opus | $5.00 | $0.50 | $6.25 | $25.00 |
 | Sonnet | $3.00 | $0.30 | $3.75 | $15.00 |
-| Haiku | $0.80 | $0.08 | $1.00 | $4.00 |
+| Haiku | $1.00 | $0.10 | $1.25 | $5.00 |
+
+Historical note: Opus rates were corrected on 2026-04-20 from the original entries ($15 / $1.50 / $18.75 / $75 per M). Cost reports generated before that date overestimate Opus spend by 3× at standard context; re-run the reporter on existing `run-log.jsonl` files to get corrected totals.
+
+## Prompt-caching strategy
+
+Every byte that shows up unchanged in successive agent prompts is a candidate for Anthropic's prompt cache, which hits at ~10% of the fresh-input rate. The runner is structured to maximize that hit rate:
+
+1. **Reference files are loaded once as module constants, not inlined per-agent.** The playbook (`reference/fix-agent-playbook.md`) and the E2E pattern library (`reference/e2e-failure-patterns.md`) are read via `_load_reference()` and embedded in prompts via stable template slots. Every fix-agent spawned in a session sees the same bytes at the same prompt offsets, so the second and subsequent agents hit cache on those sections.
+2. **Variable content is pushed to the tail.** Per-attempt diagnostics (process tree, port bindings, failing log tails, matched patterns, prior-attempt history, MCP probe stderr) come *after* the stable reference blocks. Only those bytes differ between attempts, so only those bytes are cache-create / fresh-input.
+3. **Rendering is deterministic.** Diagnostics that are identical between attempts (e.g. the instructions for "what 'boot the runtime' means") use f-string interpolation only for the capability name — everything else is literal. Non-determinism (timestamps, random IDs, changing file sizes) would blow the cache every call.
+
+Cache hit rates observed in production: fix-agents in a multi-attempt platform-init loop routinely hit 95–98% on input tokens. The first agent in a fresh session pays cache_create for the full prompt (~115K tokens at 1.25× input = ~$0.72 on Opus at the corrected 2026-04-19 rate), and every subsequent agent in the loop pays ~$0.05–$0.15 cache_read for the same prefix. A 10-attempt platform-fix loop therefore costs ~$1–$2 in cached input, not ~$7–$10 as naïve math would suggest.
+
+What this costs you if you're not careful:
+
+- **Prepending timestamps or attempt numbers to cached sections.** The attempt counter belongs in the *variable* tail, not in the stable header.
+- **Loading reference files per-call instead of at module scope.** `open(...).read()` inside `_build_platform_fix_prompt` would serialize differently on disk I/O variance and bust the cache.
+- **Injecting full log dumps into the stable section.** Logs grow monotonically — what was stable on attempt 1 changes by attempt 2. Keep logs in the tail.
+
+When adding new diagnostic content, ask: "Will this be byte-identical on the next attempt?" If yes, put it in the stable prefix. If no, put it in the diagnostic tail *after* the playbook, the capability description, and the pattern sections.
 
 ## Legacy-data policy
 
