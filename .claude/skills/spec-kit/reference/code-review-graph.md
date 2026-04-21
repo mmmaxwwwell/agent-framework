@@ -315,9 +315,14 @@ test-logs. Specifically:
 3. **Prompt injection**: every agent prompt (implement, validate, review)
    includes a short stanza with the graph CLI cheat-sheet and the path to
    the MCP server's socket (if running).
-4. **Review augmentation**: the review prompt builder invokes
-   `code-review-graph detect-changes --since <base_sha>` and splices the
-   JSON into the prompt so the agent starts with the impact analysis.
+4. **Review augmentation**: `build_validate_review_prompt` calls
+   `_code_review_graph_detect_changes(base_sha)` (wraps
+   `code-review-graph detect-changes --base <sha>`) and splices a
+   formatted summary into the review section — risk score, top changed
+   functions with caller counts, affected flows, test gaps. The review
+   agent starts its first turn already knowing the blast radius, instead
+   of having to discover it via tool calls. No-op when the graph isn't
+   installed.
 
 ## Continuous refresh — who owns what
 

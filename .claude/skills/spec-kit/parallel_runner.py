@@ -1881,6 +1881,27 @@ git diff {base_sha}...HEAD
 
 Run that command to see the changes for this phase."""
 
+    # Pre-compute code-review-graph impact analysis (blast radius, risk
+    # score, test gaps) scoped to the phase diff.  Splicing this into the
+    # prompt saves the review agent a tool call and gets graph-backed
+    # prioritization into the first turn of context.  No-op when the
+    # graph isn't installed or the call fails.
+    graph_impact_section = ""
+    impact = _code_review_graph_detect_changes(full_base_sha)
+    if impact is not None:
+        formatted = _format_detect_changes_for_prompt(impact)
+        graph_impact_section = f"""
+### Graph impact analysis (pre-computed from `code-review-graph detect-changes`)
+
+This is a risk-scored blast radius of the phase diff, computed from the
+knowledge graph before you were spawned.  Use it to prioritize: high-risk
+changes and test gaps first, low-risk isolated changes last.  You can
+cross-check any entry with the MCP tools (`get_impact_radius_tool`,
+`query_graph_tool`) if you need more detail on a specific symbol.
+
+{formatted}
+"""
+
     # Read prior review findings for context (cycle 2+)
     prior_section = ""
     if review_cycle > 1:
@@ -2076,6 +2097,7 @@ If you cannot write "Unvalidated build systems: None" — if ANY modified build 
 ### Diff scope
 
 {diff_section}
+{graph_impact_section}
 {prior_section}
 ### Review and fix
 
@@ -2218,6 +2240,101 @@ def _code_review_graph_update(timeout: int = 120) -> None:
         )
     except (subprocess.TimeoutExpired, OSError):
         pass
+
+
+def _code_review_graph_detect_changes(base_sha: str,
+                                       timeout: int = 60) -> Optional[dict]:
+    """Run `code-review-graph detect-changes --base <sha>` and return parsed JSON.
+
+    Returns the upstream shape:
+        {"summary": str, "risk_score": float,
+         "changed_functions": [...], "affected_flows": [...],
+         "test_gaps": [...], "review_priorities": [...]}
+
+    Returns None if the binary is unavailable, the command fails, or the
+    output isn't valid JSON.  Used by the review-prompt builder to splice
+    graph-backed impact analysis into the review agent's prompt — saves
+    the agent a tool call and gets risk + blast-radius into the first
+    turn of context.
+    """
+    if not _detect_code_review_graph():
+        return None
+    try:
+        result = subprocess.run(
+            ["code-review-graph", "detect-changes", "--base", base_sha],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            return None
+        return json.loads(result.stdout)
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+        return None
+
+
+def _format_detect_changes_for_prompt(impact: dict, max_items: int = 10) -> str:
+    """Render a detect-changes dict into a compact prompt section.
+
+    Keeps the section bounded: top N changed functions, top N test gaps,
+    all affected flows (usually few), and the overall risk score.  The
+    raw JSON can be very large on big phase diffs — this truncates to
+    what a reviewer actually needs in the first turn.
+    """
+    lines = []
+    risk = impact.get("risk_score", 0.0) or 0.0
+    lines.append(f"**Overall risk score**: {risk:.2f}")
+    summary = (impact.get("summary") or "").strip()
+    if summary:
+        lines.append(f"**Summary**: {summary.splitlines()[0]}")
+
+    # Upstream shape (v2.3.2 detect-changes): each item in changed_functions,
+    # test_gaps, review_priorities is a Node dict with: id, kind, name,
+    # qualified_name, file_path, line_start, line_end, language,
+    # parent_name, is_test, risk_score.  Format uniformly.
+    def _fmt_symbol(sym: dict) -> str:
+        name = sym.get("name") or "?"
+        # Upstream uses `file_path` in changed_functions and review_priorities,
+        # but `file` in test_gaps.  Check both.
+        path = sym.get("file_path") or sym.get("file") or "?"
+        line = sym.get("line_start")
+        loc = f"{path}:{line}" if line is not None else path
+        risk_val = sym.get("risk_score")
+        risk_str = f" (risk={risk_val:.2f})" if isinstance(risk_val, (int, float)) else ""
+        return f"- `{name}` at `{loc}`{risk_str}"
+
+    changed_fns = impact.get("changed_functions") or []
+    if changed_fns:
+        lines.append("")
+        lines.append(f"**Changed functions/classes** (top {min(len(changed_fns), max_items)} of {len(changed_fns)}, sorted by risk):")
+        for fn in changed_fns[:max_items]:
+            lines.append(_fmt_symbol(fn))
+
+    flows = impact.get("affected_flows") or []
+    if flows:
+        lines.append("")
+        lines.append(f"**Affected flows** ({len(flows)}):")
+        for flow in flows[:max_items]:
+            fname = flow.get("name") or flow.get("id") or "?"
+            fsize = flow.get("size") or flow.get("node_count") or "?"
+            lines.append(f"- `{fname}` ({fsize} nodes)")
+
+    gaps = impact.get("test_gaps") or []
+    if gaps:
+        lines.append("")
+        lines.append(f"**Test gaps** (top {min(len(gaps), max_items)} of {len(gaps)} — changed symbols with no test coverage):")
+        for gap in gaps[:max_items]:
+            lines.append(_fmt_symbol(gap))
+
+    priorities = impact.get("review_priorities") or []
+    if priorities:
+        lines.append("")
+        lines.append(f"**Review priorities** (top {min(len(priorities), max_items)} of {len(priorities)} — start here):")
+        for p in priorities[:max_items]:
+            if isinstance(p, str):
+                lines.append(f"- {p}")
+            else:
+                lines.append(_fmt_symbol(p))
+
+    return "\n".join(lines)
 
 
 # ── GitHub token acquisition ──────────────────────────────────────────
