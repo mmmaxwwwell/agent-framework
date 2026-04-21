@@ -59,6 +59,112 @@ Three tiers of security tooling, integrated into CI:
 | **Tier 2 (recommended)** | Snyk (reachability analysis), Semgrep Team (cross-file), FOSSA (license compliance), SonarCloud (quality gates) | Paid |
 | **Tier 3 (ecosystem)** | `eslint-plugin-security` (Node.js), `bandit` (Python), OWASP Dependency-Check (Java) | Free |
 
+### code-review-graph — first-class knowledge graph (pinned v2.3.2)
+
+Every spec-kit project gets a persistent tree-sitter knowledge graph wired in
+at Phase 0 and kept fresh for the entire project lifetime. The graph answers
+"what exists in this codebase and how does it connect" — a question `git grep`
+and `rg` can't answer. Agents query it before adding new code (to avoid
+duplicating existing symbols), reviewers use it for blast-radius analysis
+instead of raw diffs, and the runner runs `update` at phase boundaries so
+downstream agents see fresh data.
+
+**Single source of truth**: the pinned Nix derivation lives inside this skill
+at `code-review-graph/flake.nix`. Bumping v2.3.2 → v2.4.x is one edit here;
+every consuming project picks it up on the next `nix develop`. No per-project
+version drift possible.
+
+**Lifecycle (what happens on `nix develop`)**:
+
+1. **Package**: `code-review-graph` binary on PATH (built from GitHub tag
+   `v2.3.2` via `buildPythonApplication`, with `pythonRelaxDeps` for upstream's
+   overly-tight caret pins and overrides to skip flaky transitive tests).
+2. **Auto-install, once per tool version**: the `mkShellHook` runs
+   `code-review-graph install --repo $PWD --platform claude-code
+   --no-instructions -y` if `.code-review-graph/installed-v<version>` is
+   missing, then touches the marker. This step:
+   - Merges `code-review-graph` into `.mcp.json` (preserving any existing
+     servers — kanix's `mcp-android`/`mcp-browser` stay untouched)
+   - Drops upstream Claude skills into `.claude/skills/` (`review-changes`,
+     `explore-codebase`, `refactor-safely`, `debug-issue`)
+   - Registers `PostToolUse` + `SessionStart` hooks in `.claude/settings.json`
+     (PostToolUse runs `code-review-graph update --skip-flows` after every
+     Edit/Write/Bash with a 30 s timeout)
+   - Installs a `.git/hooks/pre-commit` hook that runs `detect-changes --brief`
+   - `--no-instructions` suppresses the upstream CLAUDE.md injection so
+     spec-kit's own stanza (from `code-review-graph/CLAUDE-STANZA.md`) isn't
+     duplicated
+3. **First build (async)**: if `.code-review-graph/graph.db` is missing, start
+   `code-review-graph build` in the background. Shell returns immediately.
+4. **Subsequent entries**: run `code-review-graph update` in the background
+   (fast, incremental) to pick up any out-of-shell git operations.
+5. **Watcher**: spawn `code-review-graph watch` in the background with a
+   PID-file-gated idempotency check. Reuses any existing watcher.
+6. **MCP server**: `autoInstall` has already registered `code-review-graph serve`
+   in `.mcp.json`, so Claude Code spawns it on demand via stdio. The hook
+   does **not** start a separate long-lived server (MCP on stdio is more
+   reliable than a dangling daemon).
+
+**Continuous refresh** — four complementary mechanisms:
+
+| Event | Refresh mechanism | Owner |
+|-------|-------------------|-------|
+| File edit inside Claude session | `PostToolUse` hook runs `update --skip-flows` after Edit/Write/Bash | `.claude/settings.json` |
+| File edit outside Claude (editor save, git checkout) | `code-review-graph watch` (watchdog filesystem events) | shellHook background process |
+| Phase complete in runner | `_code_review_graph_update()` called before each validate-review spawn | `parallel_runner.py` |
+| Shell entry | Background `update` run catches anything missed between sessions | shellHook |
+
+**Runner integration** (`parallel_runner.py`):
+
+- `_detect_code_review_graph()` — memoized PATH check; no-op when not installed
+- `_code_review_graph_update()` — synchronous `update`, 120 s timeout, errors swallowed
+- Called at the validate-review spawn point so every review agent gets a fresh graph
+
+**Agent-facing guidance** lives in the project's `CLAUDE.md`, installed from
+`code-review-graph/CLAUDE-STANZA.md` during Phase 0. Key rules:
+
+1. Always call `get_minimal_context_tool(task="…")` first — returns ~100 tokens
+   with risk, communities, flows, and suggested next tools
+2. Use `detail_level="minimal"` on subsequent calls — tools default to verbose
+3. Query before creating (`semantic_search_nodes_tool`, `query_graph_tool`)
+4. Name real modules, not invented ones
+5. Start reviews with `detect_changes_tool` / `get_review_context_tool`, not
+   raw `git diff`
+6. If the graph and the code disagree, trust the code but log it
+
+**Upstream skills** the agent can invoke by name (auto-installed):
+
+| Skill | Purpose |
+|-------|---------|
+| `review-changes` | Diff review with graph-backed blast radius |
+| `explore-codebase` | Navigate unfamiliar areas by graph topology |
+| `refactor-safely` | Walk impacted callers before editing |
+| `debug-issue` | Trace bugs via dependency/flow edges |
+
+**State directory** (`.code-review-graph/`, git-ignored):
+
+- `graph.db` — SQLite WAL-mode knowledge graph
+- `installed-v<version>` — marker file that gates the `autoInstall` step
+- `build.pid` / `watch.pid` — PID files for idempotent lifecycle
+- `build.log` / `watch.log` / `update.log` / `install.log` — per-phase logs
+
+**Troubleshooting**:
+
+- `crg-stop` shell function — kills watcher + any MCP daemon and clears PID files
+- Delete `.code-review-graph/graph.db` — forces a full rebuild on next entry
+- Delete `.code-review-graph/installed-v*` — forces the auto-install to re-run
+- DB lock: SQLite WAL auto-recovers; only one build at a time
+- Schema drift after version bump: auto-install marker re-fires on version change
+
+**Upgrade procedure**:
+
+1. Edit `version = "2.3.2";` in `code-review-graph/flake.nix`
+2. Update the `fetchFromGitHub` `hash` (use `nix-prefetch-url --unpack --name source <tarball>`)
+3. `nix flake lock --update-input code-review-graph` in every consuming project
+4. Next `nix develop` picks up the new binary + re-runs `autoInstall` (marker is version-scoped)
+
+Full reference: `reference/code-review-graph.md`.
+
 ### Implementation phase (Phase 7)
 
 - **Integration testing** — Real servers, real processes, no mocks at system boundaries. Structured test output that agents parse. Custom test reporters.
@@ -148,7 +254,12 @@ reference/              ← Knowledge base, loaded on demand by phase files
   agent-file-schemas.md ← IC-AGENT-* schemas for every cross-agent file (findings.json, plan.md, handoff.md, etc.)
   verification.md       ← Completion-claim verification rules
   stripe.md             ← Stripe / payment integration reference
+  code-review-graph.md  ← code-review-graph first-class integration (flake pinning, shellHook, lifecycle, runner wiring)
   cost-reporting.md     ← Cost & cache analysis for cost_report.py
+code-review-graph/      ← Pinned Nix flake for code-review-graph v2.3.2 (single source of truth)
+  flake.nix             ← buildPythonApplication + mkShellHook library function
+  flake.lock            ← Committed lock — bumping tool version = edit flake.nix + relock
+  CLAUDE-STANZA.md      ← Template stanza phases/install.md appends to the project CLAUDE.md
 presets/                ← Quality presets, loaded once per project
   poc.md                ← Proof of concept
   local.md              ← Single-user local tool
