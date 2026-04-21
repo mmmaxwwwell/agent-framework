@@ -77,12 +77,32 @@
                                      # (merges MCP config, drops skills, installs hooks)
           , mcpPort ? 7333
           , stateDir ? ".code-review-graph"
-          # Deprecated: v2.3.2 CLI does not accept --exclude; excludes come
-          # from .gitignore + DEFAULT_IGNORE_PATTERNS in the upstream tool.
-          # Kept for backwards compatibility with callers that still pass it;
-          # the value is ignored.  Add project-specific excludes to .gitignore.
+          # Project-specific exclude patterns. v2.3.2's CLI has no --exclude
+          # flag, but the tool natively reads `.code-review-graphignore` at
+          # the repo root (see upstream incremental.py:_load_ignore_patterns).
+          # mkShellHook writes these as a managed block in that file on
+          # every shell entry (idempotent — only rewrites on content change).
+          # Each entry is a glob pattern; bare names are auto-suffixed with
+          # `/**` so they match at any depth (e.g. `node_modules` matches
+          # `packages/app/node_modules/foo.js` in monorepos).
+          #
+          # The upstream DEFAULT_IGNORE_PATTERNS already covers most of the
+          # common noise (node_modules, .venv, dist, build, .dart_tool, .next,
+          # vendor, .gradle, .pub-cache, coverage, *.min.js, package-lock.json,
+          # etc.) so only list things NOT in that default set. Commit the
+          # resulting `.code-review-graphignore` so all contributors share it.
           , excludeDirs ? [ ]
           }:
+          let
+            # Each pattern: if it already contains a glob character, pass as-is;
+            # otherwise treat it as a directory and append `/**`.
+            hasGlob = p: builtins.match ".*[*?].*" p != null;
+            normalizePattern = p: if hasGlob p then p else "${p}/**";
+            ignorePatterns = map normalizePattern excludeDirs;
+            ignoreBlock =
+              if ignorePatterns == [ ] then ""
+              else builtins.concatStringsSep "\n" ignorePatterns + "\n";
+          in
           ''
             # code-review-graph lifecycle — auto-maintained knowledge graph
             export CODE_REVIEW_GRAPH_STATE_DIR="$PWD/${stateDir}"
@@ -98,6 +118,53 @@
               local pidfile="$1"
               [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null
             }
+
+            # Managed `.code-review-graphignore` block. Rewrites the block
+            # on content change only — idempotent and diff-friendly. Anything
+            # outside the BEGIN/END markers is preserved (users can add
+            # their own patterns below the block). Upstream semantics:
+            # patterns use fnmatch-style globs; `<dir>/**` matches nested
+            # occurrences at any depth.
+            _crg_ignore_file="$PWD/.code-review-graphignore"
+            _crg_marker_begin="# BEGIN code-review-graph managed (from flake.nix excludeDirs)"
+            _crg_marker_end="# END code-review-graph managed"
+            _crg_desired_block=$(cat <<'CRG_IGNORE_EOF'
+${ignoreBlock}CRG_IGNORE_EOF
+            )
+            _crg_write_ignore_block() {
+              local existing="" before="" after=""
+              [ -f "$_crg_ignore_file" ] && existing=$(cat "$_crg_ignore_file")
+              if printf '%s\n' "$existing" | grep -qF "$_crg_marker_begin"; then
+                before=$(printf '%s\n' "$existing" | sed "/$_crg_marker_begin/,\$d")
+                after=$(printf '%s\n' "$existing" | sed "1,/$_crg_marker_end/d")
+              else
+                before="$existing"
+                after=""
+              fi
+              {
+                [ -n "$before" ] && printf '%s\n' "$before"
+                if [ -n "$_crg_desired_block" ]; then
+                  printf '%s\n' "$_crg_marker_begin"
+                  printf '%s' "$_crg_desired_block"
+                  printf '%s\n' "$_crg_marker_end"
+                fi
+                [ -n "$after" ] && printf '%s\n' "$after"
+              } > "$_crg_ignore_file.tmp"
+              # Only replace if content actually changed (preserves mtime,
+              # avoids spurious "dirty tree" warnings from nix develop).
+              if ! cmp -s "$_crg_ignore_file.tmp" "$_crg_ignore_file" 2>/dev/null; then
+                mv "$_crg_ignore_file.tmp" "$_crg_ignore_file"
+                echo "[code-review-graph] updated .code-review-graphignore"
+              else
+                rm -f "$_crg_ignore_file.tmp"
+              fi
+              # If desired block is empty AND file only contained our managed
+              # block, remove the file entirely.
+              if [ -f "$_crg_ignore_file" ] && [ -z "$_crg_desired_block" ] && ! grep -qv "^$\|^#" "$_crg_ignore_file"; then
+                rm -f "$_crg_ignore_file"
+              fi
+            }
+            _crg_write_ignore_block
 
             ${pkgs.lib.optionalString autoInstall ''
             # Auto-install: merges `code-review-graph` into .mcp.json (preserving

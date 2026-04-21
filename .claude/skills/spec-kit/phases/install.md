@@ -58,7 +58,16 @@ haven't already.
        projectName = "<your-project-name>";
        watch = true;      # keep graph fresh as files change
        serveMcp = false;  # set true if the project wants an MCP server
-       # extend excludeDirs if the project has large generated dirs
+       # Project-specific graph excludes (on top of upstream defaults which
+       # already cover node_modules/.venv/dist/build/.dart_tool/etc). These
+       # get written to a managed block in `.code-review-graphignore`.
+       # See reference/code-review-graph.md § "Per-project excludes".
+       excludeDirs = [
+         # Examples — add your project's generated / vendored / log dirs:
+         # "stl"           # 3D model renders
+         # "test-logs"     # test output artifacts
+         # "fixtures/**/*.json"  # glob patterns also work
+       ];
      };
    in pkgs.mkShell {
      packages = [ crg /* ... */ ];
@@ -72,11 +81,32 @@ haven't already.
    files — must never be committed):
 
    ```gitignore
-   # code-review-graph state
+   # code-review-graph state (build artifacts, not the ignore policy)
    .code-review-graph/
    ```
 
-5. **Install the CLAUDE.md stanza** so every agent spawned in this project
+   Note: do **not** add `.code-review-graphignore` to `.gitignore` — that
+   file is the per-project exclude policy and must be committed so every
+   contributor indexes the same scope (see next step).
+
+5. **Commit `.code-review-graphignore`** (auto-generated from `excludeDirs`):
+
+   After entering the devshell once, the shellHook writes
+   `.code-review-graphignore` at the repo root with a managed block
+   derived from `excludeDirs`. Stage and commit it:
+
+   ```bash
+   git add .code-review-graphignore flake.nix flake.lock
+   git commit -m "chore: wire code-review-graph exclude policy"
+   ```
+
+   If `excludeDirs = [ ]`, the file is not created. Anything a contributor
+   adds *outside* the `# BEGIN … # END` managed block is preserved on
+   re-entry. See `reference/code-review-graph.md § Per-project excludes`
+   for the full behavior (idempotent rewrites, glob syntax, when to
+   force-rebuild after changes).
+
+6. **Install the CLAUDE.md stanza** so every agent spawned in this project
    reads graph-usage guidance automatically (no prompt-builder edits
    needed in parallel_runner.py):
 
@@ -89,7 +119,7 @@ haven't already.
      exist). Place it after any existing project-specific sections.
    - If the stanza is already present (idempotent re-runs), skip.
 
-6. **Verify the bootstrap**:
+7. **Verify the bootstrap**:
 
    ```bash
    nix develop --command bash -c 'code-review-graph --version && ls .code-review-graph/'
@@ -102,7 +132,7 @@ haven't already.
    block on it; subsequent phases can poll for `.code-review-graph/graph.db`
    (or `code_graph.db`) if they need a fully-built graph.
 
-7. **Record in interview-notes** (if/when the interview starts):
+8. **Record in interview-notes** (if/when the interview starts):
    `code-review-graph: wired at phase 0, watcher active, CLAUDE.md stanza installed`.
 
 **If the project is not Nix-based** (no `flake.nix`, no `which nix`): the

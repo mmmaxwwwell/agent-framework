@@ -81,7 +81,7 @@ it as a flake input and pull both the binary and a shellHook helper.
 | `serveMcp` | `false` | Start an MCP server (`code-review-graph serve`) as a long-running background process. **Usually leave `false`** — Claude Code starts the MCP server on demand via `.mcp.json` (stdio), which is more reliable than a dangling daemon |
 | `autoInstall` | `true` | Run `code-review-graph install --repo $PWD --platform claude-code --no-instructions -y` once per tool version. Merges the MCP server into `.mcp.json` (preserving other entries), drops upstream skills into `.claude/skills/`, installs `PostToolUse` + `SessionStart` hooks into `.claude/settings.json`, and a git pre-commit hook. Gated by `.code-review-graph/installed-v<version>` marker — bumping the pinned version re-triggers. Idempotent. Pass `autoInstall = false` if you manage `.mcp.json` / `.claude/settings.json` from another source and want the skill to stay hands-off |
 | `stateDir` | `".code-review-graph"` | Where the SQLite graph db + logs + PID files live |
-| `excludeDirs` | `[ ]` | **Deprecated / no-op.** v2.3.2 does not accept `--exclude`. The CLI honors `.gitignore` + a built-in `DEFAULT_IGNORE_PATTERNS` list (includes `node_modules/`, `.venv/`, `dist/`, `build/`, `.dart_tool/`, etc.). Add project-specific excludes to `.gitignore`. Kept for API compatibility; future upstream versions may reintroduce the flag |
+| `excludeDirs` | `[ ]` | Project-specific patterns to exclude. Written to `.code-review-graphignore` as a managed block (see [Per-project excludes](#per-project-excludes) below). Bare names are auto-suffixed with `/**` so they match at any depth. The upstream `DEFAULT_IGNORE_PATTERNS` already covers most common noise, so only list things NOT in that default set |
 
 ### What `autoInstall` does (and why `--no-instructions`)
 
@@ -99,6 +99,135 @@ registration in `.claude/settings.json`, and the git pre-commit hook.
 
 A `crg-stop` shell function is defined automatically — it kills the watcher
 and MCP server and clears PID files.
+
+## Per-project excludes
+
+`code-review-graph` v2.3.2 does **not** accept `--exclude` on the CLI. Instead
+it reads a `.code-review-graphignore` file at the repo root (upstream:
+`code_review_graph/incremental.py::_load_ignore_patterns`), in addition to
+a built-in `DEFAULT_IGNORE_PATTERNS` list. `mkShellHook` plugs into this
+mechanism via the `excludeDirs` parameter.
+
+### How `excludeDirs` becomes `.code-review-graphignore`
+
+On every `nix develop`, `mkShellHook` rewrites a **managed block** inside
+`.code-review-graphignore`:
+
+```
+# BEGIN code-review-graph managed (from flake.nix excludeDirs)
+stl/**
+test-logs/**
+logs/**
+*.generated.ts
+# END code-review-graph managed
+```
+
+Rules:
+
+1. **Content-addressed idempotency**: the writer computes the desired block,
+   compares it to what's already on disk, and only replaces the file if the
+   two differ. No spurious "dirty tree" churn when the list hasn't changed.
+2. **Preserves user additions**: anything outside the BEGIN/END markers is
+   kept as-is. Contributors can add one-off patterns below the managed
+   block without losing them on next shell entry.
+3. **Auto-glob suffix**: bare names (`node_modules`, `stl`) are rewritten
+   to `node_modules/**`, `stl/**` so they match nested occurrences — the
+   same semantics `_should_ignore` uses for `<dir>/**` patterns. Patterns
+   that already contain `*` or `?` are passed through unchanged.
+4. **Self-cleanup**: if `excludeDirs = [ ]` and the file only contains our
+   (now-empty) managed block, the file is removed. Projects with no custom
+   excludes don't carry a stray empty file.
+
+### What's already excluded by default (don't duplicate)
+
+Upstream `DEFAULT_IGNORE_PATTERNS` covers (non-exhaustive):
+
+- `node_modules/**`, `.git/**`, `__pycache__/**`, `*.pyc`
+- `.venv/**`, `venv/**`, `dist/**`, `build/**`, `.next/**`, `target/**`
+- `vendor/**` (PHP/Composer), `.bundle/**` (Ruby), `.gradle/**`, `*.jar`
+- `.dart_tool/**`, `.pub-cache/**` (Flutter/Dart)
+- `coverage/**`, `.cache/**`, `*.min.js`, `*.min.css`, `*.map`
+- `*.lock`, `package-lock.json`, `yarn.lock`
+- `*.db`, `*.sqlite`, `*.db-journal`, `*.db-wal`
+- `.code-review-graph/**` (the tool's own state dir)
+
+Check the current list at
+`https://github.com/tirth8205/code-review-graph/blob/v2.3.2/code_review_graph/incremental.py`
+(search for `DEFAULT_IGNORE_PATTERNS`). If your project relies on an exclude
+*not* in that list, put it in `excludeDirs`.
+
+### What to put in `excludeDirs`
+
+Good candidates:
+
+- **Generated output directories** not already covered by defaults — e.g.
+  `stl/` (3D model renders), `public/build/` in some frameworks, custom
+  codegen targets like `src/generated/`.
+- **Test artifacts** — `test-logs/`, `test-results/`, `playwright-report/`,
+  `.pytest_cache/`.
+- **Agent artifacts** — `validate/`, `attempts/`, `ci-debug/` (spec-kit
+  runner writes these; they're pure noise in the graph).
+- **Large data fixtures** parsed as "code" by tree-sitter but meaningless —
+  e.g. `fixtures/**/*.json` can be excluded with a glob pattern.
+- **Vendored third-party source** that isn't your code — e.g. `third_party/**`,
+  `external/**`, `extern/**`.
+
+Bad candidates (don't add):
+
+- Anything already in `DEFAULT_IGNORE_PATTERNS` — duplicate, redundant.
+- `.git/` — already excluded; excluding it again is harmless but noisy.
+- Your actual source directories — obviously.
+
+### Glob syntax reference
+
+`_should_ignore` uses `fnmatch` with a monorepo-friendly tweak: patterns of
+the form `<dir>/**` match at any depth (so `node_modules/**` also matches
+`packages/*/node_modules/foo.js`). Other glob syntax:
+
+| Pattern | Matches |
+|---------|---------|
+| `dir/**` | Everything under `dir/` at any depth (auto-applied to bare names) |
+| `*.ext` | Any file with that extension at root level |
+| `**/*.ext` | Any file with that extension at any depth |
+| `path/to/file.js` | Exactly that file |
+| `prefix*` | Anything starting with `prefix` at root |
+| `!pattern` | **Not supported** — there is no negation |
+
+### Workflow
+
+1. Add a `.code-review-graphignore`-worthy directory? Add it to `excludeDirs`
+   in `flake.nix`, re-enter the shell, **commit both `flake.nix` and the
+   regenerated `.code-review-graphignore`**. All contributors inherit it.
+2. Need a one-off exclude that doesn't warrant a flake change? Edit
+   `.code-review-graphignore` directly *outside* the managed block — it
+   survives regeneration.
+3. After changing `excludeDirs`, force a rebuild so stale nodes from
+   newly-excluded paths are purged:
+   ```bash
+   rm .code-review-graph/graph.db && code-review-graph build
+   ```
+   Otherwise `update` only re-parses changed files and won't notice that
+   previously-indexed paths should now be dropped.
+
+### Why not `.gitignore`?
+
+`.gitignore` is also consulted by `code-review-graph`, and you might be
+tempted to put everything there. But the two serve different purposes:
+
+- `.gitignore` = "don't check these into git"
+- `.code-review-graphignore` = "don't index these in the knowledge graph"
+
+These overlap a lot but aren't identical. Examples of divergence:
+
+- Generated files you **do** commit (some teams commit `dist/` or
+  `stl/` for deployment) — git tracks them, but you still don't want them
+  in the graph.
+- Fixture data you **do** commit but shouldn't be parsed as code.
+- Paths only Claude/agents should see as "out of scope", but that humans
+  still want in git.
+
+Using `.code-review-graphignore` keeps graph scope decisions separate from
+version-control decisions, which matters when the two policies drift.
 
 ## Build-time expectations
 
@@ -226,8 +355,14 @@ Only the CLI command names change.
 - **Graph db is not portable across versions** — bumping `code-review-graph`
   past a minor release may invalidate the schema. Runner should detect
   schema-version mismatch and re-run `build`.
-- **Excluded dirs matter** — forgetting to exclude `node_modules` adds tens
-  of thousands of irrelevant nodes and balloons build time. `mkShellHook`
-  defaults exclude common culprits; extend per-project.
+- **Excluded dirs matter** — forgetting to exclude generated/vendored
+  content adds thousands of irrelevant nodes and balloons build time.
+  Upstream `DEFAULT_IGNORE_PATTERNS` covers `node_modules` and other
+  common culprits; project-specific additions go in `excludeDirs`, which
+  writes to a managed block in `.code-review-graphignore` (see
+  [Per-project excludes](#per-project-excludes)).
+- **Changing `excludeDirs` after the first build** — `update` is
+  incremental and won't purge nodes from paths that are *newly* excluded.
+  Force a rebuild: `rm .code-review-graph/graph.db && code-review-graph build`.
 - **MCP server = long-lived process** — make sure `crg-stop` is called on
   exit, or use the PID file to clean up stale servers on next shell entry.
