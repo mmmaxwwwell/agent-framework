@@ -77,11 +77,12 @@
                                      # (merges MCP config, drops skills, installs hooks)
           , mcpPort ? 7333
           , stateDir ? ".code-review-graph"
-          , excludeDirs ? [ "node_modules" ".direnv" "result" "dist" ".venv" "__pycache__" "build" ".dart_tool" ]
+          # Deprecated: v2.3.2 CLI does not accept --exclude; excludes come
+          # from .gitignore + DEFAULT_IGNORE_PATTERNS in the upstream tool.
+          # Kept for backwards compatibility with callers that still pass it;
+          # the value is ignored.  Add project-specific excludes to .gitignore.
+          , excludeDirs ? [ ]
           }:
-          let
-            excludeArgs = builtins.concatStringsSep " " (map (d: "--exclude ${d}") excludeDirs);
-          in
           ''
             # code-review-graph lifecycle — auto-maintained knowledge graph
             export CODE_REVIEW_GRAPH_STATE_DIR="$PWD/${stateDir}"
@@ -125,11 +126,11 @@
             # Subsequent entries: quick `update` in the background.
             if [ ! -f "$CODE_REVIEW_GRAPH_STATE_DIR/graph.db" ] && [ ! -f "$CODE_REVIEW_GRAPH_STATE_DIR/code_graph.db" ]; then
               echo "[code-review-graph] building initial graph in background (first run — may take minutes)..."
-              ( code-review-graph build ${excludeArgs} >"$CODE_REVIEW_GRAPH_STATE_DIR/build.log" 2>&1 ) &
+              ( code-review-graph build >"$CODE_REVIEW_GRAPH_STATE_DIR/build.log" 2>&1 ) &
               echo $! > "$CODE_REVIEW_GRAPH_STATE_DIR/build.pid"
             ${pkgs.lib.optionalString buildOnEnter ''
             else
-              ( code-review-graph update ${excludeArgs} >>"$CODE_REVIEW_GRAPH_STATE_DIR/update.log" 2>&1 ) &
+              ( code-review-graph update >>"$CODE_REVIEW_GRAPH_STATE_DIR/update.log" 2>&1 ) &
             ''}
             fi
 
@@ -137,7 +138,7 @@
             # Watcher: keep the graph fresh as files change.  Idempotent:
             # reuse an existing watcher if one is already running.
             if ! _crg_is_running "$_crg_pid_file"; then
-              ( code-review-graph watch ${excludeArgs} >"$_crg_log" 2>&1 ) &
+              ( code-review-graph watch >"$_crg_log" 2>&1 ) &
               echo $! > "$_crg_pid_file"
               echo "[code-review-graph] watcher started (pid $(cat "$_crg_pid_file"), log: $_crg_log)"
             fi

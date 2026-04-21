@@ -81,7 +81,7 @@ it as a flake input and pull both the binary and a shellHook helper.
 | `serveMcp` | `false` | Start an MCP server (`code-review-graph serve`) as a long-running background process. **Usually leave `false`** — Claude Code starts the MCP server on demand via `.mcp.json` (stdio), which is more reliable than a dangling daemon |
 | `autoInstall` | `true` | Run `code-review-graph install --repo $PWD --platform claude-code --no-instructions -y` once per tool version. Merges the MCP server into `.mcp.json` (preserving other entries), drops upstream skills into `.claude/skills/`, installs `PostToolUse` + `SessionStart` hooks into `.claude/settings.json`, and a git pre-commit hook. Gated by `.code-review-graph/installed-v<version>` marker — bumping the pinned version re-triggers. Idempotent. Pass `autoInstall = false` if you manage `.mcp.json` / `.claude/settings.json` from another source and want the skill to stay hands-off |
 | `stateDir` | `".code-review-graph"` | Where the SQLite graph db + logs + PID files live |
-| `excludeDirs` | `[node_modules .direnv result dist .venv __pycache__ build .dart_tool]` | Dirs ignored by build/update/watch |
+| `excludeDirs` | `[ ]` | **Deprecated / no-op.** v2.3.2 does not accept `--exclude`. The CLI honors `.gitignore` + a built-in `DEFAULT_IGNORE_PATTERNS` list (includes `node_modules/`, `.venv/`, `dist/`, `build/`, `.dart_tool/`, etc.). Add project-specific excludes to `.gitignore`. Kept for API compatibility; future upstream versions may reintroduce the flag |
 
 ### What `autoInstall` does (and why `--no-instructions`)
 
@@ -115,9 +115,9 @@ shell returns immediately; agents that need the graph should check for
 ## CLI cheat-sheet
 
 ```bash
-code-review-graph build [--exclude DIR]...    # one-time initial parse
-code-review-graph update [--exclude DIR]...   # incremental refresh
-code-review-graph watch  [--exclude DIR]...   # long-running watcher
+code-review-graph build                       # one-time initial parse
+code-review-graph update                      # incremental refresh (since HEAD~1)
+code-review-graph watch                       # long-running watcher
 code-review-graph detect-changes              # risk-scored diff impact (HEAD vs prev)
 code-review-graph visualize --format svg -o graph.svg
 code-review-graph wiki > docs/ARCHITECTURE.md # generate markdown from graph
