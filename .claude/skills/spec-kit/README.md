@@ -266,17 +266,17 @@ How outputs flow between roles within a feature run. Files written by one role a
 
 ```mermaid
 flowchart TD
-    tasks[tasks.md] --> impl[task-implementer]
-    impl --> claim["claims/completion-{TASK_ID}.json"]
-    impl -.on rejection.-> rej["claims/rejection-{TASK_ID}.md"]
-    rej -.feeds next.-> impl
-    claim --> done{all tasks [x]?}
+    tasks["tasks.md"] --> impl["task-implementer"]
+    impl --> claim["claims/completion-TASK_ID.json"]
+    impl -. "on rejection" .-> rej["claims/rejection-TASK_ID.md"]
+    rej -. "feeds next" .-> impl
+    claim --> done{"all tasks done?"}
     done -- no --> impl
-    done -- yes --> vr[validate-review]
-    vr --> rep["validate/{N}.md"]
-    vr --> verdict{PASS or FAIL?}
-    verdict -- PASS --> next[next phase]
-    verdict -- FAIL --> vrfix[vr-fix]
+    done -- yes --> vr["validate-review"]
+    vr --> rep["validate/N.md"]
+    vr --> verdict{"PASS or FAIL?"}
+    verdict -- PASS --> nextphase["next phase"]
+    verdict -- FAIL --> vrfix["vr-fix"]
     vrfix --> vr
 ```
 
@@ -284,67 +284,67 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    setup[bash test/e2e/setup.sh] --> services{services up?}
-    services -- no --> svcfix[services-fix]
+    setup["bash test/e2e/setup.sh"] --> services{"services up?"}
+    services -- no --> svcfix["services-fix"]
     svcfix --> setup
-    services -- yes --> intgate[Integration test gate]
-    intgate --> intfail{tests fail?}
-    intfail -- yes --> intfix[integration fix loop]
-    intfix --> streak{unproductive streak?}
-    streak -- yes --> meta[pre-e2e-meta-fix]
+    services -- yes --> intgate["Integration test gate"]
+    intgate --> intfail{"tests fail?"}
+    intfail -- yes --> intfix["integration fix loop"]
+    intfix --> streak{"unproductive streak?"}
+    streak -- yes --> meta["pre-e2e-meta-fix"]
     streak -- no --> intgate
     meta --> intgate
-    intfail -- no --> platform[Platform runtime bringup]
-    platform --> pfix{boot ok?}
-    pfix -- no --> pfx[platform-fix]
+    intfail -- no --> platform["Platform runtime bringup"]
+    platform --> pfix{"boot ok?"}
+    pfix -- no --> pfx["platform-fix"]
     pfx --> matched["matched signatures + fix-history.md"]
-    matched --> pstreak{unproductive streak?}
-    pstreak -- yes --> pmeta[platform-fix meta]
+    matched --> pstreak{"unproductive streak?"}
+    pstreak -- yes --> pmeta["platform-fix meta"]
     pstreak -- no --> platform
     pmeta --> platform
-    pfix -- yes --> ready[E2E ready to run]
+    pfix -- yes --> ready["E2E ready to run"]
 ```
 
 #### E2E iteration loop
 
 ```mermaid
 flowchart TD
-    explore[e2e-explore] --> exit{exit code?}
-    exit -- crash --> crash[e2e-crash-supervisor]
-    crash -- STOP --> stop[stop loop]
+    explore["e2e-explore"] --> exit{"exit code?"}
+    exit -- crash --> crash["e2e-crash-supervisor"]
+    crash -- STOP --> stop["stop loop"]
     crash -- CONTINUE --> explore
     exit -- ok --> findings["findings.json + screenshots/ + progress.md"]
-    findings --> sup[e2e-supervisor]
-    sup --> dec{decision?}
+    findings --> sup["e2e-supervisor"]
+    sup --> dec{"decision?"}
     dec -- STOP --> stop
-    dec -- REDIRECT --> guidance[guidance.md] --> explore
-    dec -- CONTINUE --> planner[e2e-planner]
-    planner --> plan[plan.md]
-    plan --> executor[e2e-executor]
+    dec -- REDIRECT --> guidance["guidance.md"] --> explore
+    dec -- CONTINUE --> planner["e2e-planner"]
+    planner --> plan["plan.md"]
+    plan --> executor["e2e-executor"]
     executor --> outputs["findings.json + progress.md + handoff.md"]
-    executor -.stuck step.-> blocker[blocker.md]
-    blocker --> diag[e2e-diagnostic]
+    executor -. "stuck step" .-> blocker["blocker.md"]
+    blocker --> diag["e2e-diagnostic"]
     diag --> unblock["unblock-N.md"]
     unblock --> executor
-    outputs -.infra blockers in handoff.-> fix[e2e-fix]
-    outputs --> bugs{open_bugs non-empty?}
-    bugs -- no --> regression[e2e-regression]
+    outputs -. "infra blockers in handoff" .-> fix["e2e-fix"]
+    outputs --> bugs{"open_bugs non-empty?"}
+    bugs -- no --> regression["e2e-regression"]
     bugs -- yes --> fix
     fix --> research["research-N.md (inline if missing)"]
-    research --> edits[code edits + commits]
-    edits --> verify[e2e-verify]
-    verify --> evidence["verify-evidence-{iter}.md + findings status"]
-    evidence --> resolved{all fixed?}
+    research --> edits["code edits + commits"]
+    edits --> verify["e2e-verify"]
+    verify --> evidence["verify-evidence-iter.md + findings status"]
+    evidence --> resolved{"all fixed?"}
     resolved -- yes --> regression
-    resolved -- no --> bugsup[e2e-bug-supervisor per bug]
-    bugsup --> bdec{decision?}
+    resolved -- no --> bugsup["e2e-bug-supervisor per bug"]
+    bugsup --> bdec{"decision?"}
     bdec -- DIRECT_FIX --> fix
-    bdec -- REDIRECT_RESEARCH --> research2[e2e-research]
-    research2 --> nextiter[next iteration → planner]
-    bdec -- ESCALATE --> escal[e2e-escalation]
+    bdec -- REDIRECT_RESEARCH --> research2["e2e-research"]
+    research2 --> nextiter["next iteration to planner"]
+    bdec -- ESCALATE --> escal["e2e-escalation"]
     escal --> blocked["BLOCKED.md (human)"]
-    regression --> rpass{PASS?}
-    rpass -- yes --> markdone[mark task done]
+    regression --> rpass{"PASS?"}
+    rpass -- yes --> markdone["mark task done"]
     rpass -- no --> fix
     nextiter --> planner
 ```
@@ -353,16 +353,16 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    cifail[gh run failed] --> diagnose[ci-diagnose]
+    cifail["gh run failed"] --> diagnose["ci-diagnose"]
     diagnose --> diag["attempt-N-diagnosis.md"]
-    diag --> cifix[ci-fix]
-    cifix --> commit[commit; no push]
-    commit --> localval[ci-local-validate]
-    localval --> result["attempt-N-local-{iter}.md"]
-    result --> verdict{PASS?}
+    diag --> cifix["ci-fix"]
+    cifix --> commit["commit (no push)"]
+    commit --> localval["ci-local-validate"]
+    localval --> result["attempt-N-local-iter.md"]
+    result --> verdict{"PASS?"}
     verdict -- no --> cifix
-    verdict -- yes --> finalize[ci-finalize]
-    finalize --> pr[gh pr create + tasks.md mark]
+    verdict -- yes --> finalize["ci-finalize"]
+    finalize --> pr["gh pr create + tasks.md mark"]
 ```
 
 **Key contracts (file → consumer):**
