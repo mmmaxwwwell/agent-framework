@@ -85,21 +85,25 @@ Historical note: Opus rates were corrected on 2026-04-20 from the original entri
 
 ## Prompt-caching strategy
 
-Every byte that shows up unchanged in successive agent prompts is a candidate for Anthropic's prompt cache, which hits at ~10% of the fresh-input rate. The runner is structured to maximize that hit rate:
+The runner spawns each agent as a fresh `claude` CLI process. The agent's instructions are written to a per-agent prompt file (`logs/agent-N-<task>.log.prompt.md`) that the agent Reads as its first tool call. **The path of that prompt file is unique per spawn**, so any content inlined into the prompt body lives at a per-spawn path and gets no cache benefit across spawns.
 
-1. **Reference files are loaded once as module constants, not inlined per-agent.** The playbook (`reference/fix-agent-playbook.md`) and the E2E pattern library (`reference/e2e-failure-patterns.md`) are read via `_load_reference()` and embedded in prompts via stable template slots. Every fix-agent spawned in a session sees the same bytes at the same prompt offsets, so the second and subsequent agents hit cache on those sections.
-2. **Variable content is pushed to the tail.** Per-attempt diagnostics (process tree, port bindings, failing log tails, matched patterns, prior-attempt history, MCP probe stderr) come *after* the stable reference blocks. Only those bytes differ between attempts, so only those bytes are cache-create / fresh-input.
-3. **Rendering is deterministic.** Diagnostics that are identical between attempts (e.g. the instructions for "what 'boot the runtime' means") use f-string interpolation only for the capability name — everything else is literal. Non-determinism (timestamps, random IDs, changing file sizes) would blow the cache every call.
+The cache mechanism that actually works for cross-spawn agents is **Claude Code's Read tool result cache**: when two agents Read the same absolute file path with identical content within the 5-minute cache TTL window, the second Read is a cache hit (priced at ~10% of fresh input). The runner is structured around this:
 
-Cache hit rates observed in production: fix-agents in a multi-attempt platform-init loop routinely hit 95–98% on input tokens. The first agent in a fresh session pays cache_create for the full prompt (~115K tokens at 1.25× input = ~$0.72 on Opus at the corrected 2026-04-19 rate), and every subsequent agent in the loop pays ~$0.05–$0.15 cache_read for the same prefix. A 10-attempt platform-fix loop therefore costs ~$1–$2 in cached input, not ~$7–$10 as naïve math would suggest.
+1. **Reference content is NEVER inlined into prompt bodies.** Instead, each prompt builder emits a "Required reading" (Tier 1) block listing absolute paths to reference files, and a "Reference index" (Tier 2) pointer to `reference/index.md` for on-demand lookups. The agent Reads each file by path. See `_required_reads_block` and `_reference_index_pointer` in `parallel_runner.py`, plus the "Two-tier prompt loading" section of the README.
+2. **Reference file paths are stable across spawns.** They're computed once at module scope from `__file__` (`_REF_DIR = Path(__file__).parent / "reference"`). The same role spawned twice produces a Tier-1 block with byte-identical paths, so spawn 2's Read of `reference/testing.md` hits cache_read on spawn 1's Read.
+3. **Per-attempt diagnostics go in the variable tail.** Logs, attempt numbers, claim file lists, process tree snapshots — these all live in the role-specific tail of the prompt body. They don't matter for cross-spawn caching (the prompt-file Read is uncached anyway), but they shouldn't be in the stable Tier-1/Tier-2 blocks either, for clarity.
+4. **Tier-1 path lists are literal per role.** The list is hardcoded in each prompt builder (e.g., e2e-fix's Tier-1 is always `[fix-agent-playbook.md, e2e-failure-patterns.md]`). Don't generate the list from runtime state unless the result is byte-stable across all spawns of that role.
+
+Cache hit rates observed: fix-agents in a multi-attempt platform-init loop routinely hit 95–98% cache_read on the reference content (playbook ~11KB, patterns library ~13KB, index ~5KB). The first agent in a fresh 5-min cache window pays cache_create on each file's Read; subsequent agents pay cache_read on the same paths. A 10-attempt platform-fix loop therefore costs ~$0.10–$0.30 in cached reference-content reads, not ~$5–$10 of inlined cache_create on every spawn.
 
 What this costs you if you're not careful:
 
-- **Prepending timestamps or attempt numbers to cached sections.** The attempt counter belongs in the *variable* tail, not in the stable header.
-- **Loading reference files per-call instead of at module scope.** `open(...).read()` inside `_build_platform_fix_prompt` would serialize differently on disk I/O variance and bust the cache.
-- **Injecting full log dumps into the stable section.** Logs grow monotonically — what was stable on attempt 1 changes by attempt 2. Keep logs in the tail.
+- **Inlining reference file content into a prompt builder f-string.** This was the previous strategy and was wrong: the bytes live in a per-spawn prompt file path, so they're never cache-shared. Always pass paths.
+- **Per-spawn variability in Tier-1 paths.** If you build the path list from `task.capabilities` or any per-spawn state, two spawns may get different paths and lose the cross-spawn cache. Keep the list literal per call site.
+- **Editing a referenced file mid-run.** If a fix-agent edits `reference/testing.md` (it shouldn't), the next agent's Read sees different content and pays cache_create instead of cache_read. The reference dir should be treated as immutable during a feature run.
+- **Per-attempt content in the Tier-1/Tier-2 blocks.** Putting `attempt: 3` in the Tier-1 header doesn't break cross-spawn cache (the prompt body itself isn't cached), but it confuses the role/cache mental model. Keep variable content in the role-specific tail.
 
-When adding new diagnostic content, ask: "Will this be byte-identical on the next attempt?" If yes, put it in the stable prefix. If no, put it in the diagnostic tail *after* the playbook, the capability description, and the pattern sections.
+When adding new reference content: put it in a new file under `reference/`, add a row to `reference/index.md`, and add the path to the relevant role's `_required_reads_block` call (if mandatory) or rely on the index for opt-in reads. **Do not inline.**
 
 ## Legacy-data policy
 

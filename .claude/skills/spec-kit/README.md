@@ -112,7 +112,11 @@ phases/
   plan.md               ← Phase 5: architecture walkthrough and plan generation
   tasks.md              ← Phase 6: task list generation
   implement.md          ← Phase 7: runner, fix-validate loop, auto-unblocking
-reference/              ← Enterprise knowledge base, loaded on demand by phase files
+reference/              ← Knowledge base, loaded on demand by phase files
+                          AND Read by spawned runner agents (see "Two-tier
+                          prompt loading" below). Stable paths → Read-tool
+                          result cache hits across spawns.
+  index.md              ← Decision-tree: "if you're doing X, read Y" — the Tier-2 pointer every runner-spawned agent gets
   testing.md            ← Integration testing, structured output, stub processes
   logging.md            ← Structured logging spec
   errors.md             ← Error hierarchy, propagation
@@ -124,6 +128,7 @@ reference/              ← Enterprise knowledge base, loaded on demand by phase
   observability.md      ← Metrics, tracing
   migration.md          ← Migration & versioning
   cicd.md               ← CI/CD pipeline, agentic feedback loop
+  nix-ci.md             ← Nix-specific CI rules (daemon flags, devshell, flake check, bwrap)
   dx.md                 ← Developer experience tooling
   ui-flow.md            ← UI_FLOW.md spec
   data-model.md         ← Data model depth
@@ -138,7 +143,11 @@ reference/              ← Enterprise knowledge base, loaded on demand by phase
   pre-pr.md             ← Pre-PR gate: single-command validation, non-vacuous checks
   e2e-runtime.md        ← Real-runtime E2E: emulator, browser, simulator patterns
   mcp-e2e.md            ← MCP-driven E2E exploration
+  fix-agent-playbook.md ← General debugging heuristics for any spawned fix-agent (falsification rule, anti-patterns, claim format)
+  e2e-failure-patterns.md ← Library of known platform-runtime failure signatures, matched per-attempt
   verification.md       ← Completion-claim verification rules
+  stripe.md             ← Stripe / payment integration reference
+  cost-reporting.md     ← Cost & cache analysis for cost_report.py
 presets/                ← Quality presets, loaded once per project
   poc.md                ← Proof of concept
   local.md              ← Single-user local tool
@@ -152,6 +161,42 @@ cost_report.py          ← Post-hoc cost analyzer for run-log.jsonl (see refere
 ```
 
 Typical savings: **60-90%** fewer tokens per phase for poc/local presets. Enterprise interview is the worst case since it loads nearly all reference files.
+
+## Two-tier prompt loading (runner-spawned agents)
+
+Every agent the runner spawns (`task-implementer`, `vr-fix`, `validate-review`, `services-fix`, `pre-e2e-meta-fix`, `platform-fix`, `e2e-explore`/`planner`/`executor`/`fix`/`verify`/`research`/`bug-supervisor`, `ci-diagnose`/`fix`/`local-validate`) receives the same canonical prompt skeleton:
+
+```
+{role-specific preamble}
+
+## Required reading (Tier 1 — do these reads BEFORE planning your work)
+- /abs/path/CLAUDE.md
+- /abs/path/reference/<file matching the role>.md
+... (2–3 files per role, hardcoded in the builder)
+
+## Reference index (Tier 2 — read on demand)
+For situations not covered above, consult /abs/path/reference/index.md.
+
+{role-specific body, variable diagnostic content at the tail}
+```
+
+**Why this exists.** The runner spawns each agent as a fresh `claude` CLI process. The agent reads its instructions from a per-agent prompt file written by `parallel_runner.py`. That prompt file lives at a different path for each spawn (`logs/agent-N-<task>.log.prompt.md`), so **content inlined in the prompt body is NOT shared across spawns** — every spawn pays cache_create on its prompt-file Read, regardless of how byte-stable the content is. The prompt-prefix-cache strategy that works for Anthropic SDK direct callers does NOT carry over to Claude Code CLI invocations.
+
+**What does cache.** Claude Code's Read tool result cache. When two agents Read the **same file path** with **identical file content** within the **5-minute cache TTL**, the second Read is a cache hit (priced at ~10% of fresh input). So the runner inlines no reference content; it tells each agent which reference files to Read by absolute path. Within a fix-loop (10 platform-fix attempts in 5 minutes), attempts 2..N hit cache_read on the playbook + patterns library + index, paying full cache_create only on attempt 1.
+
+**Tier 1 — mandatory reads.** Hardcoded list per role. The agent is told it MUST Read these files first. The list is short (2–4 files) and always contains the references whose content is load-bearing for that role's evaluation criteria (e.g., `testing.md` for any role that writes or runs tests). See `_required_reads_block` in `parallel_runner.py`.
+
+**Tier 2 — reference index.** A pointer to `reference/index.md`, which is a decision-tree table of "if you are doing X, read Y." The agent Reads `index.md` once, then Reads any cited file based on its situation. Both reads cache cross-spawn.
+
+**Cache-correctness rules** (preserve these when adding new content to a prompt):
+
+1. Never inline reference file content into a prompt builder's f-string. The bytes won't be cache-shared across spawns. Always pass the file path and let the agent Read.
+2. The Tier-1 path list per role is a literal list at the call site. Don't generate it from runtime state (e.g., from task capabilities) unless the result is byte-stable across spawns.
+3. The role string interpolated into the Tier-1 block (`f"...as the {role} agent..."`) is fine as long as the role is stable per call site (e.g., always `"e2e-fix"`).
+4. Don't append per-attempt content (timestamps, attempt numbers, claim files) into the Tier-1/Tier-2 blocks — keep variable content in the role-specific tail.
+5. When you add a new reference file, add a row to `reference/index.md`. When a role's mandatory references change, update the role's `_required_reads_block` call.
+
+A determinism check (renders each builder twice with identical inputs and asserts byte-equality) lives in the audit trail; if you change a builder, run it locally with the same inputs twice and confirm the output is byte-identical.
 
 ## parallel_runner.py state machine
 

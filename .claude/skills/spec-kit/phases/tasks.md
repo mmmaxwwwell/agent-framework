@@ -234,6 +234,41 @@ When generating tasks for a multi-runtime project:
 
 **This checklist is the mechanism. Without it, the initial kanix task list shipped with zero MCP setup tasks and missed six E2E categories — that's the failure mode this checklist prevents.**
 
+#### Part D — Integration test hardening phase (MANDATORY when the project has `[needs: e2e-loop]` tasks)
+
+Every project that ships `[needs: e2e-loop]` tasks MUST include a dedicated **integration test hardening phase** that runs *before* the E2E phase and gates it. This phase catches at the API tier what would otherwise only be discovered via the ~100× more expensive E2E crawl.
+
+The phase has two layers:
+
+**Layer 1 — per-file hardening, one task per `*.integration.test.ts`** (or equivalent in other languages). Each task has the same shape:
+
+```markdown
+- [ ] T<N> Harden `<path>.integration.test.ts` — <subdomain summary> [<FR tags>]
+  Done when: file runs green against live services (source `test/e2e/.state/env.sh` first); no `describe.skip`/`canRun`/`if(!svcUp)return` skip guards; every vacuous assertion (`toBeDefined()` alone, `toBeTruthy()` alone, bare `typeof`) replaced with concrete behavior assertions; every public handler the file covers has both happy-path AND error-path tests; no mocking of DB / auth server / internal service-to-service calls; every FR the file tags is verified by at least one `it()` block that drives the real end-to-end path.
+```
+
+Order the per-file tasks by subdomain dependency (infrastructure → auth → catalog → cart → orders → inventory → admin → fulfillment → payments → support → evidence → contributors → notifications). Mark every per-file task non-parallel (no `[P]`) — integration tests share Postgres/SuperTokens/ports; parallel execution pollutes fixtures. See `reference/testing.md` § "Test tier taxonomy" rule 8.
+
+**Layer 2 — cross-domain user-flow mirror tests, one task per E2E task** (see `reference/testing.md` § "Test tier taxonomy" rule 7). Each E2E task in the downstream E2E phase gets a paired `flows/*.integration.test.ts` task here that walks the same multi-step flow via direct API calls. These are the cheap sibling to E2E: when an E2E fails, the mirror tells you whether the bug is in the API or past it.
+
+```markdown
+- [ ] T<M> Flow test: <flow name> [mirrors T<E2E-task-id>, <SC/FR tags>]
+  Done when: new `<src-root>/flows/<flow-name>.integration.test.ts` walks the full multi-step flow via HTTP against live services: <step 1> → <step 2> → ... → <final assertion on state>. Runs green with zero skips.
+```
+
+**Phase validation task** (last in the phase):
+
+```markdown
+- [ ] T<Z> Phase <N> validation
+  Done when: `bash test/e2e/setup.sh` exits 0; running the project's test command with the env sourced exits 0 with 0 failures AND 0 skips; every FR referenced in this phase's tasks has at least one `it()` block that drives the real end-to-end path; runner-verified.json for this phase shows passed=true.
+```
+
+**Why Layer 1 is one task per file rather than one big task**: integration test files can be 500+ lines covering many endpoints. A single agent asked to "harden 55 files" will either OOM its context or produce surface-level passes. One-task-per-file bounds each agent's scope (~3-6 files of context total: the test, the app code it exercises, the spec fragment) and lets the runner track per-file progress.
+
+**Why Layer 2 is not just more E2E tasks**: API-level integration tests are 10-100× faster to diagnose than MCP-driven E2E. A bug that takes 30 minutes to track down via screenshots + tool calls takes 30 seconds via test stack trace. The mirror layer means the expensive E2E only runs after the cheap test confirmed the API layer is green.
+
+**Placement**: this phase goes *immediately before* the E2E phase. The pre-E2E gate in the runner will automatically run the integration test suite before any `[needs: e2e-loop]` task's MCP crawl, but that's a safety net — the hardening phase is the dedicated pass that gets the suite to green.
+
 **CRITICAL: One screen per E2E task.** Each screen gets its own task. This gives each explore agent a fresh context window — screenshots and tool calls don't accumulate across screens, which avoids context overflow and keeps token usage ~5x lower. It also gets the research→fix→verify loop running faster and prevents one hard bug from blocking progress on other screens.
 
 Only bundle two screens in one task when they are **tightly coupled** (e.g., you must create an item on ScreenA before you can view ScreenB). If in doubt, split them.

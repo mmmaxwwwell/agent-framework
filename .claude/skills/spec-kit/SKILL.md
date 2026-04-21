@@ -22,6 +22,9 @@ phases/              # One file per workflow phase — load only what's needed
   tasks.md           # Phase 6: task list generation
   implement.md       # Phase 7: autonomous runner, fix-validate, auto-unblocking
 reference/           # Enterprise knowledge base — loaded on demand by phase files
+                     # AND by spawned runner agents (see "Two-tier prompt
+                     # loading" in README.md). Stable paths → cache hits.
+  index.md           # Decision-tree index: "if you are doing X, read Y" — every runner-spawned agent gets this as a Tier-2 pointer
   testing.md         # Integration testing, structured output, stub processes, fix-validate loop, security scan validation
   logging.md         # Structured logging spec
   errors.md          # Error hierarchy, propagation
@@ -33,6 +36,7 @@ reference/           # Enterprise knowledge base — loaded on demand by phase f
   observability.md   # Metrics, tracing
   migration.md       # Migration & versioning
   cicd.md            # CI/CD pipeline, local security scan validation, agentic CI feedback loop
+  nix-ci.md          # Nix-specific CI rules (NIX_REMOTE=daemon, devshell, flake check background, bwrap sandbox)
   dx.md              # Developer experience tooling
   ui-flow.md         # UI_FLOW.md spec
   data-model.md      # Data model depth
@@ -46,6 +50,10 @@ reference/           # Enterprise knowledge base — loaded on demand by phase f
   readme.md          # Human-facing README.md structure, sections, quality checklist
   pre-pr.md          # Pre-PR gate: single-command validation, multi-build discovery, non-vacuous checks
   e2e-runtime.md     # Real-runtime E2E: emulator, browser, simulator patterns, side-by-side architecture
+  mcp-e2e.md         # MCP-driven E2E exploration loop (explore/plan/execute/verify), findings.json shape, per-platform tool semantics
+  fix-agent-playbook.md # General debugging heuristics for any spawned fix-agent: falsification rule, anti-patterns, claim format
+  e2e-failure-patterns.md # Library of known platform-runtime failure signatures, matched per-attempt by the runner
+  verification.md    # Deterministic completion-claim verification rules
   stripe.md          # Stripe / payment integration: listener scripts, env pattern, webhook contract, RUNBOOK, live-key guardrails
   cost-reporting.md  # Post-hoc cost & effectiveness analysis via cost_report.py (reads run-log.jsonl, outputs per-model/per-phase dollar breakdown)
 presets/             # Quality presets — loaded once per project

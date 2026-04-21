@@ -38,6 +38,86 @@ from pathlib import Path
 from typing import Optional
 
 
+# ── Two-tier reference loading (file-Read based, cache-friendly) ─────────
+#
+# Each spawned agent receives a per-agent prompt FILE (different path per
+# spawn) and is told to Read it. That means content INLINED into the
+# prompt is NOT shared across spawns — it lives in a unique file path
+# every time. Cross-spawn caching only works when the agent reads a file
+# at a stable path (e.g. /abs/path/reference/testing.md): Claude Code's
+# Read tool caches results by path+content within the 5-min TTL, so the
+# second agent's Read of the same path hits cache.
+#
+# Therefore:
+#   Tier 1 = "MUST read these files first" (paths, not content). Stable
+#            paths get cross-spawn cache hits when the same role spawns
+#            again within 5 minutes — the typical fix loop.
+#   Tier 2 = "consult the index for which file matches your situation"
+#            (path to index.md, not its content). Same caching benefit
+#            for any file the agent then reads on demand.
+#
+# Do NOT inline reference file content into prompt bodies — it duplicates
+# bytes into every per-agent prompt file (different paths → no cache
+# sharing) and bloats fresh input on every spawn.
+
+_REF_DIR = Path(__file__).parent / "reference"
+_REF_INDEX_PATH = str(_REF_DIR / "index.md")
+
+
+def _required_reads_block(role: str, abs_paths: list[str]) -> str:
+    """Render the canonical Tier-1 required-reading block for a role.
+
+    The ``role`` string is stable per call site (e.g. always "e2e-fix"),
+    and ``abs_paths`` is a literal list per role — keep them literal so
+    the rendered block is byte-identical across spawns. The cache benefit
+    comes from the agent's subsequent Read tool calls hitting the Read
+    result cache (path+content keyed) on spawn 2..N within 5 minutes.
+    """
+    if not abs_paths:
+        return ""
+    lines = [
+        "## Required reading (do these reads BEFORE planning your work)",
+        "",
+        f"You MUST Read the following files first as the {role} agent. "
+        "Do not skip — they encode rules and conventions you will be "
+        "evaluated against. These reads are cheap because the file paths "
+        "are stable and Claude Code caches Read results across spawns "
+        "within the 5-minute cache TTL.",
+        "",
+    ]
+    lines.extend(f"- {p}" for p in abs_paths)
+    lines.extend([
+        "",
+        "After reading, proceed with the work described below.",
+    ])
+    return "\n".join(lines)
+
+
+def _reference_index_pointer() -> str:
+    """Render the canonical Tier-2 reference-index pointer.
+
+    Tells the agent the path to ``reference/index.md`` so it can Read
+    that file once and consult the table for which other reference
+    files match the situation. The path is stable across all spawns,
+    so the Read of index.md is a cache hit on every spawn after the
+    first one in the cache window. Same for any reference file the
+    agent then chooses to read from the index's recommendations.
+
+    We pass the path, not the content — inlining the content would
+    duplicate ~5KB into every per-agent prompt file (which has a
+    unique path per spawn, defeating the cache).
+    """
+    return (
+        "## Reference index (read on demand)\n"
+        "\n"
+        f"For situations not covered by the required reads above, consult `{_REF_INDEX_PATH}` "
+        "— it's a decision-tree table mapping situations to reference files. "
+        "Read it once, then Read any specific reference files it points you to. "
+        "Both reads cache across spawns within 5 minutes, so erring on the side "
+        "of reading is cheap.\n"
+    )
+
+
 # ── Exceptions ─────────────────────────────────────────────────────────
 
 
@@ -1340,8 +1420,19 @@ def build_prompt(task_file: str, spec_dir: str, learnings_file: str,
         if Path(learnings_file).exists():
             inline_learnings = Path(learnings_file).read_text()
 
+    _required = _required_reads_block(
+        "task-implementer",
+        [
+            "CLAUDE.md",
+            str(_REF_DIR / "testing.md"),
+        ],
+    )
+    _ref_index = _reference_index_pointer()
+
     prompt = f"""You are an implementation agent for a spec-kit project. Your job is to execute exactly ONE task from the task list, then stop.
 {nix_note}
+{_required}
+
 ## Your assigned task
 
 You are assigned task **{task.id}**: {task.description}
@@ -1350,9 +1441,7 @@ This task is in phase **{task.phase}**.
 
 ## Step 1: Read context
 
-Read `CLAUDE.md` (if it exists) for build/test commands and project conventions.
-
-**Your task list** (phase-filtered — other phases shown as summaries):
+You have already Read the required files above. **Your task list** (phase-filtered — other phases shown as summaries):
 
 <task-list>
 {inline_tasks}
@@ -1386,6 +1475,8 @@ Below is a manifest of available reference files. **Do NOT read these unless you
 - Tasks referencing feature behavior → `spec.md`
 - Phase-fix tasks → ALL files in `{spec_dir}/validate/<phase>/` plus `test-logs/`
 - **Most implementation tasks do NOT need spec.md, plan.md, or data-model.md** — the task description contains what you need
+
+{_ref_index}
 
 ## Step 2: Execute your assigned task ({task.id})
 
@@ -1580,7 +1671,13 @@ def build_vr_fix_prompt(spec_dir: str, task_file: str, learnings_file: str,
 
     prior_section = ""
     if len(prior_failures) > 1:
-        prior_section = "## Prior validation attempts\n" + "\n".join(f"- {p}" for p in prior_failures) + "\n"
+        # Cap to last 3 — older failure headers add nothing once the
+        # latest report is inlined.
+        prior_section = (
+            "## Prior validation attempts (last 3)\n"
+            + "\n".join(f"- {p}" for p in prior_failures[-3:])
+            + "\n"
+        )
 
     nix_note = ""
     if (Path.cwd() / "flake.nix").exists():
@@ -1590,9 +1687,20 @@ def build_vr_fix_prompt(spec_dir: str, task_file: str, learnings_file: str,
             "directly. Do NOT prefix commands with `nix develop --command`.\n"
         )
 
+    _required = _required_reads_block(
+        "vr-fix",
+        [
+            str(_REF_DIR / "testing.md"),
+            str(_REF_DIR / "fix-agent-playbook.md"),
+        ],
+    )
+    _ref_index = _reference_index_pointer()
+
     return f"""You are a fix agent for phase **{phase.name}** ({phase_slug}). A validation agent
 ran tests/linting and found failures. Your job is to fix them.
 {nix_note}
+{_required}
+
 ## Context
 
 - **Phase**: {phase.name} ({phase_slug})
@@ -1601,14 +1709,11 @@ ran tests/linting and found failures. Your job is to fix them.
 - **Learnings file**: `{learnings_file}`
 - **Validation directory**: `{validate_dir}/`
 
-{prior_section}
-## Latest validation failure
-
-{failure_text}
+{_ref_index}
 
 ## Instructions
 
-1. Read the failure report above carefully. Identify every distinct failure.
+1. Read the failure report below carefully. Identify every distinct failure.
 2. Read the relevant source files to understand the root cause of each failure.
 3. Read `{task_file}` to understand what each task in this phase was supposed to do.
 4. Read `{learnings_file}` for any prior context or gotchas.
@@ -1622,6 +1727,12 @@ ran tests/linting and found failures. Your job is to fix them.
 
 **Do NOT modify the task list** — the runner manages task status.
 **Do NOT write validation files** — the runner will re-run VR after you finish.
+**Do NOT skip tests to make them pass** — see testing.md § Zero-skips rule.
+
+{prior_section}
+## Latest validation failure
+
+{failure_text}
 """
 
 
@@ -1784,10 +1895,24 @@ Check if your prior fixes were applied correctly and look for any NEW issues —
 
     review_file = f"{validate_dir}/review-{review_cycle}.md"
 
+    _required = _required_reads_block(
+        "validate-review",
+        [
+            "CLAUDE.md",
+            str(_REF_DIR / "testing.md"),
+            str(_REF_DIR / "pre-pr.md"),
+        ],
+    )
+    _ref_index = _reference_index_pointer()
+
     return f"""You are a phase validate+review agent for **{phase.name}** ({phase_slug}). Review cycle #{review_cycle}.
 
 Your job has two parts: (1) run tests, (2) if tests pass, review the diff for bugs and fix them.
 {nix_note}
+{_required}
+
+{_ref_index}
+
 ## Context
 
 - **Phase**: {phase.name} ({phase_slug})
@@ -1854,6 +1979,8 @@ Report any missing artifacts or failed commands as FAIL (same as test failure).
 **CRITICAL — unable to validate = FAIL:** If a phase modifies source code in a build system but you cannot run that build system's tests (toolchain missing, SDK not available, emulator won't boot), that is a **FAIL**. Either fix the environment or write FAIL. A validation that only tests Go when the phase modified Kotlin is incomplete and MUST be FAIL.
 
 **CRITICAL — zero test results = FAIL:** If you run a test command and it reports 0 passed, 0 failed, 0 skipped, that means the test runner found nothing to execute. This is NOT a pass — it means test discovery is broken (wrong directory, missing wrapper script, `| tee` swallowing exit codes). Zero results from a build system with changed source files is FAIL.
+
+**CRITICAL — any skipped test = FAIL:** If `skip > 0` in the test summary, the phase is FAIL. No exceptions, no matter the reason. `describe.skip`, `t.Skip`, `pytest.mark.skipif`, `if (!canRun) return`, try/catch that swallows setup errors — all equivalent silent-skip loopholes. If the test didn't run, treat it as FAIL and fix it. Do NOT add more skip guards to "hide" the problem; the fix is to remove the guard and make the test run against live services. If a test physically cannot run in the target environment (iOS tests on Linux, emulator-only Android tests in a Linux-only runner), exclude it from the test list at list-building time (separate file pattern, separate npm script, CI matrix) — it must be absent, not skipped. See `reference/testing.md` § "Zero-skips rule" for the full pattern.
 
 **Step 6 — Stub detection** (if the phase implements interfaces, integrations, or external library wrappers):
 Check DI modules, factory methods, and provider functions for implementations that return hardcoded values, only set boolean flags, or contain no calls to the external library they claim to wrap. Specifically:
@@ -1959,9 +2086,22 @@ Read `{task_file}` and for each task completed in this phase, cross-reference th
 
 Any spec-conformance violation is a bug — fix it the same way you'd fix a null pointer or missing error check.
 
+**Test depth audit (MANDATORY — do this BEFORE the bug scan):**
+
+Read every test file in the diff. Each of the following is a violation; fix violations by editing the test (or writing a missing one), not by waiving the rule:
+
+1. **No skip guards of any kind.** Banned in committed code: `describe.skip`, `it.skip`, `test.skip`, `@pytest.mark.skipif`, `t.Skip(...)`, `const canRun = ...; describe = canRun ? describe : describe.skip`, `if (!svcUp) return;` inside `beforeAll` / `it` blocks, try/catch blocks in `beforeAll` that swallow setup errors and set a "gate" variable. A test that didn't run is a skip, and skips fail the build unconditionally. See `reference/testing.md` § "Zero-skips rule" for the full ban list and the correct `beforeAll(assert-deps)` replacement pattern.
+2. **Correct tier placement.** A test that drives the mobile UI / browser belongs in the E2E tier (`test/e2e/` or `*.e2e.test.ts`) — not in `*.integration.test.ts`. A test that calls an API endpoint against a real DB belongs in the integration tier — not in a unit file with mocks. A test whose entire coverage comes from `vi.mock(...)` / `jest.mock(...)` of an internal module is a unit test at best and often vacuous. Miscategorized tests break the runner's gate ordering. See `reference/testing.md` § "Test tier taxonomy".
+3. **Non-vacuous assertions.** Every test MUST assert specific observable behavior. Banned assertion shapes: `expect(x).toBeDefined()`, `expect(x).toBeTruthy()`, `expect(x).not.toThrow()` as the ONLY assertion, `expect(result.length).toBeGreaterThan(0)` without checking any element's content, bare `expect(typeof x).toBe("object")`. These pass when the code is broken as long as it returns *something*. Replace with concrete checks on field values, status codes, computed results.
+4. **No mocking inside tier boundaries.** Integration tests must not mock the database, the auth server, or internal service-to-service calls — those are *inside* the integration boundary and mocking them defeats the point. Unit tests must not mock internal modules from the same package. Mocks are only appropriate at the *outer* edge of the tier (e.g. a unit test may mock an external HTTP client; an integration test may stub a paid third-party SaaS).
+5. **Error-path coverage.** If the task adds a new endpoint, handler, or public function, the diff MUST include both a happy-path test AND at least one error-path test (invalid input, missing auth, not-found, conflict, timeout — whichever are reachable). A PR that adds a feature with only happy-path coverage is incomplete.
+6. **Behavior, not implementation.** A test that asserts "function X was called with args Y" is fragile and brittle. Prefer asserting the resulting state change or externally observable response. Spy-based tests are acceptable only when there's no externally observable signal (e.g. verifying a log line was emitted, or a side-effect-only listener fired).
+
+Any test-depth violation is a bug. The test is wrong until it covers real behavior. Fix the test in this review pass — do not defer to a follow-up task.
+
 **Be exhaustive in a single pass.** Each review cycle costs a full agent spawn — finding one issue per pass wastes tokens. Review every file in the diff before committing any fixes, so you have the full picture.
 
-**Only fix things that are clearly wrong.** Do not refactor, rename, reorganize, or improve code style. Do not add tests beyond what the task specified. Do not add comments or documentation. The bar is: "would this cause a bug, security issue, data loss, or spec-conformance violation in production?"
+**Only fix things that are clearly wrong.** Do not refactor, rename, reorganize, or improve code style. Do not add tests beyond what the task specified (beyond the error-path coverage rule above — those ARE part of the task by definition). Do not add comments or documentation. The bar is: "would this cause a bug, security issue, data loss, or spec-conformance violation in production?"
 
 ### Re-run tests after fixes
 
@@ -3344,6 +3484,71 @@ def _write_e2e_completion_claim(spec_dir: str, task_id: str, e2e_dir: Path,
     claim_path.write_text(json.dumps(claim, indent=2))
 
 
+def _scan_for_skipped_tests() -> list[tuple[str, int, list[str]]]:
+    """Scan known test-summary file locations for skipped-test counts.
+
+    Returns a list of (summary_path, skip_count, skipped_test_names) tuples
+    for every summary file found with skip > 0. Empty list means no skips
+    detected (or no summary files exist — see caller for handling).
+
+    This is the belt-and-suspenders enforcement of the zero-skips rule: even
+    if a project's reporter lied about exit code, the runner refuses to
+    accept a phase with skipped tests. See `reference/testing.md` §
+    "Zero-skips rule".
+    """
+    results: list[tuple[str, int, list[str]]] = []
+
+    # Common summary file locations across harnesses. Each entry may contain
+    # fields named differently (skip/skipped); tolerate both.
+    candidate_paths = [
+        Path("test-logs/summary.json"),
+        Path("test-logs/test-results.json"),
+        Path("api/test-logs/summary.json"),
+        Path("api/test-logs/test-results.json"),
+    ]
+    # Also sweep any summary.json / test-results.json under test-logs/
+    for root in (Path("test-logs"), Path("api/test-logs")):
+        if root.is_dir():
+            candidate_paths.extend(root.rglob("summary.json"))
+            candidate_paths.extend(root.rglob("test-results.json"))
+
+    seen: set[Path] = set()
+    for p in candidate_paths:
+        try:
+            rp = p.resolve()
+        except OSError:
+            continue
+        if rp in seen or not p.is_file():
+            continue
+        seen.add(rp)
+        try:
+            data = json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        # Tolerate different field names.
+        skip_count = 0
+        for key in ("skip", "skipped"):
+            val = data.get(key)
+            if isinstance(val, int):
+                skip_count = val
+                break
+        if skip_count <= 0:
+            continue
+        # Best-effort: collect skipped test names if present.
+        names: list[str] = []
+        results_arr = data.get("results")
+        if isinstance(results_arr, list):
+            for r in results_arr:
+                if isinstance(r, dict) and r.get("status") == "skipped":
+                    n = r.get("name")
+                    if isinstance(n, str):
+                        names.append(n)
+        results.append((str(p), skip_count, names[:20]))  # cap name list
+    return results
+
+
 def _discover_test_commands() -> list[tuple[str, str]]:
     """Discover build/test/lint commands from CLAUDE.md and Makefile.
 
@@ -3370,17 +3575,54 @@ def _discover_test_commands() -> list[tuple[str, str]]:
         if android_dir.exists():
             commands.append((f"{gw} ktlintCheck", "Kotlin lint"))
 
-    # Check for package.json scripts
-    pkg_json = Path("package.json")
-    if pkg_json.exists():
+    # Check for package.json scripts at root AND in common monorepo subdirs.
+    # A monorepo without a root package.json (e.g. an api/ + site/ split)
+    # still has tests that must run; we scan well-known subdir names.
+    def _detect_pkg_runner(dir_: Path) -> str:
+        """Return 'pnpm', 'yarn', or 'npm' based on lockfiles in dir_."""
+        if (dir_ / "pnpm-lock.yaml").exists():
+            return "pnpm"
+        if (dir_ / "yarn.lock").exists():
+            return "yarn"
+        return "npm"
+
+    def _pkg_commands(pkg_path: Path, label_prefix: str) -> list[tuple[str, str]]:
         try:
-            pkg = json.loads(pkg_json.read_text())
-            scripts = pkg.get("scripts", {})
-            for name in ["test", "lint", "build", "check", "typecheck"]:
-                if name in scripts:
-                    commands.append((f"npm run {name}", f"npm run {name}"))
+            pkg = json.loads(pkg_path.read_text())
         except (json.JSONDecodeError, OSError):
-            pass
+            return []
+        scripts = pkg.get("scripts", {})
+        cmds: list[tuple[str, str]] = []
+        dir_ = pkg_path.parent
+        runner = _detect_pkg_runner(dir_)
+        # Build the "run script N in dir_" invocation. Each of pnpm/yarn/npm
+        # exposes a different flag for targeting a subdir.
+        if dir_ == Path("."):
+            run = f"{runner} run" if runner != "pnpm" else "pnpm run"
+        else:
+            if runner == "pnpm":
+                run = f"pnpm --dir {dir_} run"
+            elif runner == "yarn":
+                run = f"yarn --cwd {dir_} run"
+            else:
+                run = f"npm --prefix {dir_} run"
+        for name in ["test", "lint", "build", "check", "typecheck"]:
+            if name in scripts:
+                cmds.append(
+                    (f"{run} {name}", f"{label_prefix}{runner} run {name}")
+                )
+        return cmds
+
+    root_pkg = Path("package.json")
+    if root_pkg.exists():
+        commands.extend(_pkg_commands(root_pkg, ""))
+
+    # Common monorepo subdirs — scan any that has a package.json + a test script.
+    # Order matters only for log readability.
+    for sub in ("api", "backend", "server", "site", "web", "frontend", "client"):
+        sub_pkg = Path(sub) / "package.json"
+        if sub_pkg.exists():
+            commands.extend(_pkg_commands(sub_pkg, f"{sub}: "))
 
     # Check for Cargo.toml (Rust)
     if Path("Cargo.toml").exists():
@@ -3542,16 +3784,15 @@ def _count_recent_platform_failures(
         elif ev == "platform_fix_claim" and pending_fail:
             root_cause = rec.get("root_cause")
             verified = bool(rec.get("verified"))
-            # Real progress: verified fix OR a new root_cause we haven't
-            # seen on the current streak. Either resets the streak.
-            if verified or (root_cause and root_cause != prev_root_cause):
+            # Real progress means a *verified* fix. A new-but-unverified
+            # root_cause used to reset the streak, but in practice agents
+            # kept naming fresh shallow causes on every attempt without
+            # ever getting the capability to boot, so meta-fix never fired.
+            # Only a verified claim resets now.
+            if verified:
                 streak = 0
+            if root_cause:
                 prev_root_cause = root_cause
-            else:
-                # Same (or missing) root_cause → still unproductive; keep
-                # the streak incremented from the fail event above.
-                if root_cause:
-                    prev_root_cause = root_cause
             pending_fail = False
     return streak, prev_root_cause
 
@@ -5116,6 +5357,16 @@ class PlatformManager:
 
         self._e2e_services_started = False
 
+    def ensure_services_only(self, project_dir: Path) -> bool:
+        """Bring up the backend service stack without booting any platform runtime.
+
+        Used by the pre-E2E integration test gate, which needs the API /
+        database / auth services live but not the emulator or browser. Safe
+        to call before or alongside `ensure_runtime` — the underlying
+        `_start_e2e_services` is idempotent.
+        """
+        return self._start_e2e_services(project_dir)
+
     def ensure_runtime(self, capability: str, project_dir: Path) -> Optional[PlatformRuntime]:
         """Boot a platform runtime if not already running. Returns the runtime or None on failure."""
         if capability not in _MCP_CAPABILITIES:
@@ -5265,30 +5516,75 @@ class PlatformManager:
         return paths
 
     def _detect_android_package(self, project_dir: Path) -> Optional[str]:
-        """Detect the Android app package name from build.gradle or manifest."""
-        # Try build.gradle.kts first
-        for gradle_path in [
-            project_dir / "android" / "app" / "build.gradle.kts",
-            project_dir / "android" / "app" / "build.gradle",
-            project_dir / "app" / "build.gradle.kts",
-            project_dir / "app" / "build.gradle",
-        ]:
-            if gradle_path.exists():
-                content = gradle_path.read_text()
-                m = re.search(r'applicationId\s*[=:]\s*["\']([^"\']+)["\']', content)
-                if m:
-                    return m.group(1)
+        """Detect the Android app package name from build.gradle or manifest.
 
-        # Try AndroidManifest.xml
-        for manifest_path in [
-            project_dir / "android" / "app" / "src" / "main" / "AndroidManifest.xml",
-            project_dir / "app" / "src" / "main" / "AndroidManifest.xml",
-        ]:
-            if manifest_path.exists():
-                content = manifest_path.read_text()
-                m = re.search(r'package\s*=\s*"([^"]+)"', content)
-                if m:
-                    return m.group(1)
+        Handles three layouts:
+          1. Single-app at project_dir (android/app/... or app/...)
+          2. Multi-app monorepo with ANDROID_BUILD_ROOT env var pointing at
+             the target subdirectory (e.g. "admin", "customer")
+          3. Multi-app monorepo with no override — walks candidate build
+             roots discovered by _find_android_build_roots and returns the
+             first match. Kept consistent with _build_install_android so
+             the health check targets the same app the build step chose.
+        """
+        def _read_gradle(root: Path) -> Optional[str]:
+            for name in ("build.gradle.kts", "build.gradle"):
+                p = root / "android" / "app" / name
+                if p.exists():
+                    m = re.search(
+                        r'applicationId\s*[=:]\s*["\']([^"\']+)["\']',
+                        p.read_text(),
+                    )
+                    if m:
+                        return m.group(1)
+                # Plain Gradle layout (no Flutter "android/" wrapper)
+                p = root / "app" / name
+                if p.exists():
+                    m = re.search(
+                        r'applicationId\s*[=:]\s*["\']([^"\']+)["\']',
+                        p.read_text(),
+                    )
+                    if m:
+                        return m.group(1)
+            return None
+
+        def _read_manifest(root: Path) -> Optional[str]:
+            for p in (
+                root / "android" / "app" / "src" / "main" / "AndroidManifest.xml",
+                root / "app" / "src" / "main" / "AndroidManifest.xml",
+            ):
+                if p.exists():
+                    m = re.search(r'package\s*=\s*"([^"]+)"', p.read_text())
+                    if m:
+                        return m.group(1)
+            return None
+
+        def _detect_in(root: Path) -> Optional[str]:
+            return _read_gradle(root) or _read_manifest(root)
+
+        # 1. Fixed layout at project_dir
+        pkg = _detect_in(project_dir)
+        if pkg:
+            return pkg
+
+        # 2. Explicit override for multi-app repos
+        override = os.environ.get("ANDROID_BUILD_ROOT")
+        if override:
+            pkg = _detect_in(project_dir / override)
+            if pkg:
+                return pkg
+
+        # 3. Walk candidate build roots (multi-app monorepo fallback)
+        try:
+            candidates = self._find_android_build_roots(project_dir)
+        except Exception:
+            candidates = []
+        for cand in candidates:
+            if cand == project_dir:
+                continue  # already tried above
+            pkg = _detect_in(cand)
+            if pkg:
+                return pkg
 
         return None
 
@@ -5613,6 +5909,124 @@ def _write_executor_summary(e2e_dir: Path, step_id: str, attempt: int,
     d = _blocker_step_dir(e2e_dir, step_id)
     summary = _extract_executor_summary(log_path)
     (d / f"executor-summary-{attempt}.md").write_text(summary)
+
+
+def _parse_infra_blockers(handoff_text: str) -> list[dict]:
+    """Extract infrastructure blockers from an executor handoff.
+
+    Returns a list of dicts, one per `### BLOCKER-<slug>` block found
+    inside the `## Infrastructure blockers` section. Each dict has:
+      - slug: the identifier after BLOCKER- (sanitized)
+      - body: the raw markdown body of the block
+
+    Returns [] if the section is absent or malformed.
+    """
+    lines = handoff_text.splitlines()
+    # Find the section header
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip().lower() == "## infrastructure blockers":
+            start = i + 1
+            break
+    if start is None:
+        return []
+
+    # Find the end of the section (next H2 or EOF)
+    end = len(lines)
+    for j in range(start, len(lines)):
+        stripped = lines[j].strip()
+        if stripped.startswith("## ") and not stripped.startswith("### "):
+            end = j
+            break
+
+    section = lines[start:end]
+
+    # Split by `### BLOCKER-` markers
+    blockers: list[dict] = []
+    current_slug: Optional[str] = None
+    current_body: list[str] = []
+
+    def _flush():
+        if current_slug is not None:
+            body = "\n".join(current_body).strip()
+            if body:
+                blockers.append({"slug": current_slug, "body": body})
+
+    for line in section:
+        stripped = line.strip()
+        if stripped.startswith("### BLOCKER-"):
+            _flush()
+            raw_slug = stripped[len("### BLOCKER-"):].strip()
+            # Sanitize: keep alnum, dash, underscore only; lowercase
+            current_slug = "".join(
+                c.lower() if c.isalnum() or c in "-_" else "-"
+                for c in raw_slug
+            )[:64] or "unknown"
+            current_body = []
+        elif current_slug is not None:
+            current_body.append(line)
+        # Lines before any ### BLOCKER- are intro text — ignored
+    _flush()
+    return blockers
+
+
+def _synthesize_infra_findings(
+    e2e_dir: Path, blockers: list[dict], iteration: int, spawn_num: int
+) -> list[str]:
+    """Write infrastructure-blocker findings to findings.json.
+
+    Creates one finding per blocker (status `new`, category `infrastructure`).
+    Also writes the blocker body to `bugs/<BUG-ID>/research-1.md` so the
+    fix agent can read the full context when it runs. Returns the BUG-IDs
+    that were added or updated.
+    """
+    findings_file = e2e_dir / "findings.json"
+    try:
+        existing = json.loads(findings_file.read_text()) if findings_file.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        existing = {}
+    if not isinstance(existing, dict):
+        existing = {}
+    current = list(existing.get("findings") or [])
+
+    touched: list[str] = []
+    for blk in blockers:
+        bug_id = f"INFRA-{blk['slug']}"
+        # Skip if already present and not closed
+        already = next(
+            (f for f in current if f.get("id") == bug_id), None
+        )
+        bug_d = _bug_dir(e2e_dir, bug_id)
+        bug_d.mkdir(parents=True, exist_ok=True)
+        research = bug_d / "research-1.md"
+        if not research.exists():
+            research.write_text(
+                f"# Research: {bug_id}\n\n"
+                f"Auto-generated from executor handoff "
+                f"(iteration {iteration}, spawn {spawn_num}).\n\n"
+                f"## Executor report\n\n{blk['body']}\n"
+            )
+        if already is None:
+            current.append({
+                "id": bug_id,
+                "summary": f"Infrastructure blocker: {blk['slug']}",
+                "status": "new",
+                "category": "infrastructure",
+                "source": f"executor-iter{iteration}-spawn{spawn_num}",
+                "bug_dir": str(bug_d),
+            })
+            touched.append(bug_id)
+        else:
+            # Re-open if previously marked fixed — executor still sees it
+            if already.get("status") not in ("new", "verified_broken"):
+                already["status"] = "verified_broken"
+            already["category"] = "infrastructure"
+            already["bug_dir"] = str(bug_d)
+            touched.append(bug_id)
+
+    existing["findings"] = current
+    findings_file.write_text(json.dumps(existing, indent=2))
+    return touched
 
 
 def check_circuit_breaker(spec_dir: str, window_minutes: int = 10,
@@ -6054,9 +6468,27 @@ what was already tried and avoid repeating failed fixes:
     if (Path.cwd() / "flake.nix").exists():
         nix_note = "**Environment**: This project uses Nix. Your PATH includes all devshell tools.\n\n"
 
+    # Tier-1 reads: cicd.md (CI mental model) + nix-ci.md (always — the
+    # agent can skip-read if not a Nix project, but including the path
+    # unconditionally keeps the prompt block byte-stable across projects
+    # so the cache key doesn't depend on `flake.nix` presence).
+    _required = _required_reads_block(
+        "ci-diagnose",
+        [
+            str(_REF_DIR / "cicd.md"),
+            str(_REF_DIR / "nix-ci.md"),
+        ],
+    )
+    _ref_index = _reference_index_pointer()
+
     return f"""You are a CI failure diagnosis agent for task **{task_id}**, attempt #{attempt}.
 
-{nix_note}## Your job
+{nix_note}
+{_required}
+
+{_ref_index}
+
+## Your job
 
 Analyze the CI failure and write a diagnosis to `{debug_dir}/attempt-{attempt}-diagnosis.md`.
 
@@ -6123,35 +6555,54 @@ def build_ci_fix_prompt(task_id: str, attempt: int, debug_dir: Path,
     diagnosis_file = debug_dir / f"attempt-{attempt}-diagnosis.md"
     history_files = sorted(debug_dir.glob("attempt-*-diagnosis.md"))
 
+    # Inline the diagnosis so the fix agent has it directly — its only
+    # purpose is to act on the diagnosis. Forcing a Read first wastes a
+    # tool call and risks the agent skipping the read entirely.
+    diagnosis_inline = ""
+    if diagnosis_file.exists():
+        try:
+            diagnosis_inline = diagnosis_file.read_text()
+        except OSError:
+            pass
+
     nix_note = ""
-    nix_commands_note = ""
     if (Path.cwd() / "flake.nix").exists():
         nix_note = "**Environment**: This project uses Nix. Your PATH includes all devshell tools.\n\n"
-        nix_commands_note = """
-### Nix note
 
-You are inside a sandbox. Do NOT run `nix develop --command` (fails on store writes).
-Do NOT run `nix flake check` — it runs VM tests that take 10-20 min and the validate agent
-handles that. For `nixfmt --check`, run it directly (it's already in PATH).
-
-"""
+    _required = _required_reads_block(
+        "ci-fix",
+        [
+            "CLAUDE.md",
+            str(_REF_DIR / "cicd.md"),
+            str(_REF_DIR / "nix-ci.md"),
+        ],
+    )
+    _ref_index = _reference_index_pointer()
 
     return f"""You are a CI fix agent for task **{task_id}**, attempt #{attempt}.
 
-{nix_note}## Your job
+{nix_note}
+{_required}
 
-1. Read `CLAUDE.md` for the project's build, lint, and test commands
-2. Read the diagnosis at `{diagnosis_file}`
-3. Read the latest local validation result in `{debug_dir}/` (the most recent `attempt-*-local-*.md` file)
-4. Apply the recommended fix
-5. Run **fast checks only** to verify your fix doesn't break the basics (see below)
-6. Commit your changes (but do NOT push — the runner handles pushing)
+{_ref_index}
+
+## Your job
+
+1. Read the diagnosis below (already inlined — no Read needed).
+2. Read the latest local validation result in `{debug_dir}/` (the most recent `attempt-*-local-*.md` file).
+3. Apply the recommended fix.
+4. Run **fast checks only** to verify your fix doesn't break the basics (see below).
+5. Commit your changes (but do NOT push — the runner handles pushing).
+
+## Diagnosis (inlined — this is the source of truth for what to fix)
+
+```markdown
+{diagnosis_inline or '(no diagnosis file at ' + str(diagnosis_file) + ' — read prior attempt files in ' + str(debug_dir) + ' to reconstruct context)'}
+```
 
 ## Context files
 
-- **CLAUDE.md** — read this FIRST for build/test/lint commands
 - **CI workflow**: `.github/workflows/ci.yml` (or equivalent) — reference for what CI runs
-- **Diagnosis**: `{diagnosis_file}` — read this to understand what to fix
 - **Prior attempts**: `{debug_dir}/` — contains logs, diagnoses, and validation results from all attempts
 - **Learnings**: `{learnings_file}` — project-specific gotchas
 
@@ -6178,7 +6629,7 @@ need to duplicate that work.
 If a fast check fails after your fix, fix it and re-run. You have up to **3 iterations** of
 fast checks. If fast checks still fail after 3 tries, commit what you have and document the
 remaining issues in `{debug_dir}/attempt-{attempt}-fix-notes.md`.
-{nix_commands_note}
+
 ## GitHub Actions: verify inputs before modifying
 
 When fixing a GitHub Actions `with:` block, do NOT guess input names from memory.
@@ -6214,28 +6665,8 @@ def build_ci_local_validate_prompt(task_id: str, attempt: int, local_iteration: 
     It does NOT fix anything — just validates and reports.
     """
     nix_note = ""
-    nix_commands_note = ""
     if (Path.cwd() / "flake.nix").exists():
         nix_note = "**Environment**: This project uses Nix. Your PATH includes all devshell tools.\n\n"
-        nix_commands_note = """
-### Nix-specific command instructions
-
-You are running inside a sandbox. To run nix commands that need the daemon:
-
-- **ALWAYS** set `NIX_REMOTE=daemon` when running nix commands
-- **ALWAYS** pass `--extra-experimental-features 'nix-command flakes'` to nix
-- **NEVER** pipe nix output through `head`, `tail`, or any truncation
-- **NEVER** use `nix develop --command` inside the sandbox — it will fail on store writes
-- `nix flake check --print-build-logs` runs NixOS VM tests that take **10-20 minutes**. Use a timeout of at least 1800 seconds (30 min). Run it in the background and use TaskOutput to wait for it.
-- **Write output to a file** so you can examine any portion after the command finishes:
-  ```
-  NIX_REMOTE=daemon nix --extra-experimental-features 'nix-command flakes' flake check --print-build-logs > /tmp/nix-flake-check.log 2>&1; echo "EXIT_CODE=$?" >> /tmp/nix-flake-check.log
-  ```
-- After the command finishes, read the exit code and the **last 200 lines** of `/tmp/nix-flake-check.log` — the critical errors (service crashes, test assertion failures, FTL messages) are always at the end.
-- If it failed, also search the log file for `FTL`, `FAIL`, `error:`, and `failed with` to find the root cause.
-- Include the relevant error output in your report — the fix agent needs to see the actual error messages, not just "exit code 1".
-
-"""
 
     prior_section = ""
     if prior_output:
@@ -6250,12 +6681,28 @@ address these failures. Re-run everything from scratch to verify.
 
 """
 
+    _required = _required_reads_block(
+        "ci-local-validate",
+        [
+            ".github/workflows/ci.yml",
+            str(_REF_DIR / "nix-ci.md"),
+        ],
+    )
+    _ref_index = _reference_index_pointer()
+
     return f"""You are a local validation agent for task **{task_id}**, CI attempt #{attempt}, local iteration #{local_iteration}.
 
-{nix_note}## Your job
+{nix_note}
+{_required}
+
+The workflow file is the source of truth for what commands CI runs. You will follow it step-by-step. The nix-ci reference covers `nix flake check` background-mode and the FTL/FAIL/error log patterns to grep for.
+
+{_ref_index}
+
+## Your job
 
 Run the SAME commands that CI runs and report the results. You do NOT fix anything.
-{nix_commands_note}
+
 ### Step 1: Discover CI commands
 
 Read `.github/workflows/ci.yml` (or scan `.github/workflows/` for the CI workflow). For each
@@ -7328,19 +7775,25 @@ class Runner:
                     str(self.skills_dir), review_cycle=cycle
                 )
 
-                # Prepend prior hang diagnoses so this retry knows exactly what
-                # not to run. The VR prompt body also tells agents to check
-                # logs/*.hang.md, but an explicit prepend is load-bearing — the
-                # file-read instruction alone is unreliable.
+                # Append prior hang diagnoses to the variable tail so this
+                # retry knows exactly what not to run. The VR prompt body
+                # also tells agents to check logs/*.hang.md, but an explicit
+                # injection is load-bearing — the file-read instruction
+                # alone is unreliable.
+                #
+                # We APPEND (not prepend) because the prompt prefix carries
+                # the cached reference index + skill content; prepending
+                # variable per-attempt content would bust those cache hits.
                 diag_files = _find_prior_hang_diagnoses(
                     self.log_dir, vr_task_prefix, limit=2
                 )
                 diag_section = _format_hang_diagnoses_for_prompt(diag_files)
                 if diag_section:
-                    prompt = diag_section + prompt
+                    prompt = prompt + "\n\n" + diag_section
                     self.log(
-                        f"VR cycle {cycle} for {phase.name}: prepending "
-                        f"{len(diag_files)} prior hang diagnosis file(s)"
+                        f"VR cycle {cycle} for {phase.name}: appending "
+                        f"{len(diag_files)} prior hang diagnosis file(s) "
+                        f"to variable tail"
                     )
 
                 vr_task_id = f"VR-{phase.slug}-{cycle}"
@@ -7550,11 +8003,23 @@ class Runner:
 
                     all_passed = True
                     results = []
+                    # Source the E2E service env if it exists, same as the
+                    # pre-E2E gate — phase validation often runs integration
+                    # tests too and needs DATABASE_URL etc. from setup.sh.
+                    env_sh_rv = Path("test") / "e2e" / ".state" / "env.sh"
+                    wrap_env_rv = env_sh_rv.is_file()
                     for cmd, label in test_cmds:
                         self.log(f"  Running: {label}")
                         try:
+                            to_run = cmd
+                            if wrap_env_rv:
+                                esc = cmd.replace("'", "'\"'\"'")
+                                to_run = (
+                                    f"bash -c 'set -a; source {env_sh_rv} "
+                                    f"2>/dev/null; set +a; {esc}'"
+                                )
                             result = subprocess.run(
-                                cmd, shell=True, capture_output=True, text=True,
+                                to_run, shell=True, capture_output=True, text=True,
                                 timeout=600,
                             )
                             passed = result.returncode == 0
@@ -7578,9 +8043,43 @@ class Runner:
                             self.log(f"  TIMEOUT: {label}")
                             all_passed = False
 
+                    # Zero-skips enforcement: even if every command exited 0,
+                    # scan test summary files for skipped tests. Any skip is a
+                    # FAIL regardless of reporter exit code. See
+                    # reference/testing.md § "Zero-skips rule".
+                    skipped_records = _scan_for_skipped_tests()
+                    if skipped_records:
+                        all_passed = False
+                        for summary_path, count, names in skipped_records:
+                            self.log(
+                                f"  SKIPS DETECTED in {summary_path}: "
+                                f"{count} skipped test(s) — phase FAIL"
+                            )
+                            if names:
+                                for n in names[:5]:
+                                    self.log(f"    - {n}")
+                                if len(names) > 5:
+                                    self.log(f"    ... and {len(names) - 5} more")
+                        results.append({
+                            "command": "runner skip-scan",
+                            "label": "zero-skips enforcement",
+                            "exit_code": 1,
+                            "passed": False,
+                            "error": (
+                                "skipped tests detected — "
+                                "spec-kit forbids skips. Remove the skip guards and "
+                                "make tests run against live services, or exclude the "
+                                "tests at list-building time (not at runtime)."
+                            ),
+                            "skipped_summaries": [
+                                {"path": p, "count": c, "names": n}
+                                for (p, c, n) in skipped_records
+                            ],
+                        })
+
                     rv_file.write_text(json.dumps({
                         "passed": all_passed,
-                        "reason": "all commands passed" if all_passed else "some commands failed",
+                        "reason": "all commands passed" if all_passed else "some commands failed or skips detected",
                         "commands": results,
                     }, indent=2))
                     runner_verified_any = True
@@ -8528,17 +9027,889 @@ class Runner:
             f"## Context\n\nAll diagnosis and log files are in `{debug_dir}/`.\n"
         )
 
+    # ── Pre-E2E integration test gate ────────────────────────────────────
+
+    # Progress-based escalation ladder for the pre-E2E fix loop.
+    #
+    # Model, mirroring the platform-init loop:
+    #   1. Regular fix agent runs on each failing round.
+    #   2. If N consecutive rounds show no progress (same failure shape),
+    #      escalate to a META-FIX agent with broader scope — full gate log,
+    #      setup.sh source, prior claims, instructed to attack the
+    #      structural cause rather than chase the symptom.
+    #   3. If M meta-fix attempts still don't resolve it, BLOCKED.md.
+    #
+    # Critical: state is session-scoped. Prior-session attempt counts on
+    # bugs that never resolved are NOT carried forward — each session
+    # starts fresh so stale quarantines can't pre-empt a fresh fix agent.
+    _PRE_E2E_GATE_UNPRODUCTIVE_STREAK_MAX = 3   # rounds before meta-fix
+    _PRE_E2E_GATE_META_FIX_MAX = 2              # meta-fix attempts before BLOCKED
+    _PRE_E2E_GATE_ROUND_HARD_CAP = 50           # absolute safety net
+
+    def _pre_e2e_integration_gate(
+        self,
+        task: "Task",
+        spec_dir: str,
+        e2e_dir: Path,
+        project_dir: Path,
+        e2e_log,
+        learnings_file: str,
+        mcp_caps: set[str],
+    ) -> bool:
+        """Run integration tests against live services before the E2E crawl.
+
+        Loops `test → fix → retest`. Keeps going as long as each round
+        reduces the open-bug count. On stall, escalates to a meta-fix agent
+        (broader scope, attacks structural cause). On meta-fix exhaustion,
+        writes BLOCKED.md.
+
+        Returns True on pass, False on terminal escalation. Caller writes
+        BLOCKED.md on False.
+
+        Cached via `e2e_dir/.pre-e2e-gate.json`; re-runs automatically if
+        any source file under the project is newer than the cache.
+        """
+        gate_log = e2e_dir / "pre-e2e-gate.log"
+        cache_file = e2e_dir / ".pre-e2e-gate.json"
+
+        test_cmds = _discover_test_commands()
+        test_cmds = [(c, l) for c, l in test_cmds if " run test" in c or l.endswith(" test")]
+        if not test_cmds:
+            e2e_log("Pre-E2E gate: no integration test commands discovered — skipping")
+            return True
+
+        # Cache check: if cache exists and no source file is newer, skip.
+        if cache_file.exists():
+            try:
+                cached = json.loads(cache_file.read_text())
+                if cached.get("passed"):
+                    cache_mtime = cache_file.stat().st_mtime
+                    newer = self._any_source_newer_than(project_dir, cache_mtime)
+                    if not newer:
+                        e2e_log(f"Pre-E2E gate: PASS (cached, {cached.get('duration', '?')}s)")
+                        return True
+                    e2e_log(f"Pre-E2E gate: cache invalidated by newer source: {newer}")
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        findings_file = e2e_dir / "findings.json"
+        prev_open_count: Optional[int] = None
+        prev_failure_digest: Optional[str] = None
+        unproductive_streak = 0
+        meta_fix_attempts = 0
+
+        for round_num in range(1, self._PRE_E2E_GATE_ROUND_HARD_CAP + 1):
+            e2e_log(f"Pre-E2E gate: round {round_num} — running integration tests...")
+            self._write_event(
+                "pre_e2e_gate_test_run", spec_dir,
+                task_id=task.id, round=round_num,
+            )
+            passed, failures, skips = self._run_pre_e2e_tests(
+                test_cmds, gate_log, e2e_log, project_dir
+            )
+            if passed:
+                duration = 0
+                try:
+                    duration = int(gate_log.stat().st_mtime - gate_log.stat().st_ctime)
+                except OSError:
+                    pass
+                cache_file.write_text(json.dumps({
+                    "passed": True,
+                    "duration": duration,
+                    "rounds": round_num,
+                    "commands": [l for _, l in test_cmds],
+                }, indent=2))
+                self._write_event(
+                    "pre_e2e_gate_pass", spec_dir,
+                    task_id=task.id, rounds=round_num,
+                )
+                e2e_log(f"Pre-E2E gate: PASS (round {round_num})")
+                return True
+
+            # Synthesize one INFRA finding per distinct failure so the fix
+            # agent can see granular work, even if many share a root cause.
+            blockers = self._pre_e2e_failures_to_blockers(failures, skips, gate_log)
+            _synthesize_infra_findings(e2e_dir, blockers, iteration=0, spawn_num=round_num)
+
+            try:
+                findings = json.loads(findings_file.read_text())
+                open_bugs_all = [
+                    f for f in findings.get("findings", [])
+                    if f.get("status") in ("new", "verified_broken")
+                ]
+            except (OSError, json.JSONDecodeError):
+                open_bugs_all = []
+
+            if not open_bugs_all:
+                e2e_log("Pre-E2E gate: tests failed but no open bugs synthesized — aborting")
+                return False
+
+            total_open = len(open_bugs_all)
+
+            # Progress measurement: use BOTH open-bug count AND failure-shape
+            # digest. A round that keeps the same count but changes the
+            # failure shape (different assertions, different test files) is
+            # progress; a round that changes nothing is a stall signal.
+            current_digest = self._failures_digest(failures, skips)
+            if prev_open_count is None:
+                # First round this session — no progress delta yet, just
+                # record and move on.
+                e2e_log(
+                    f"Pre-E2E gate: first round — {total_open} open bug(s)"
+                )
+            elif total_open < prev_open_count or current_digest != prev_failure_digest:
+                unproductive_streak = 0
+                e2e_log(
+                    f"Pre-E2E gate: progress — {prev_open_count} → {total_open} "
+                    f"open bug(s) (failure shape {'changed' if current_digest != prev_failure_digest else 'same'})"
+                )
+            else:
+                unproductive_streak += 1
+                e2e_log(
+                    f"Pre-E2E gate: NO PROGRESS — {total_open} open, identical "
+                    f"failure shape (unproductive streak {unproductive_streak}/"
+                    f"{self._PRE_E2E_GATE_UNPRODUCTIVE_STREAK_MAX})"
+                )
+            prev_open_count = total_open
+            prev_failure_digest = current_digest
+
+            # Decide: regular fix, meta-fix, or give up.
+            use_meta = unproductive_streak >= self._PRE_E2E_GATE_UNPRODUCTIVE_STREAK_MAX
+            if use_meta:
+                if meta_fix_attempts >= self._PRE_E2E_GATE_META_FIX_MAX:
+                    e2e_log(
+                        f"Pre-E2E gate: exhausted {meta_fix_attempts} meta-fix "
+                        f"attempts — escalating to BLOCKED.md"
+                    )
+                    self._write_event(
+                        "pre_e2e_gate_blocked", spec_dir,
+                        task_id=task.id, round=round_num,
+                        meta_fix_attempts=meta_fix_attempts,
+                        open_bugs=total_open,
+                    )
+                    return False
+                meta_fix_attempts += 1
+                e2e_log(
+                    f"Pre-E2E gate: regular fix loop stalled "
+                    f"({unproductive_streak} no-progress rounds) — "
+                    f"spawning meta-fix #{meta_fix_attempts}/"
+                    f"{self._PRE_E2E_GATE_META_FIX_MAX}"
+                )
+                self._write_event(
+                    "pre_e2e_gate_meta_fix_spawn", spec_dir,
+                    task_id=task.id, round=round_num,
+                    meta_attempt=meta_fix_attempts,
+                    unproductive_streak=unproductive_streak,
+                )
+                fix_prompt = self._build_pre_e2e_meta_fix_prompt(
+                    task=task, spec_dir=spec_dir, e2e_dir=e2e_dir,
+                    project_dir=project_dir, gate_log=gate_log,
+                    open_bugs=open_bugs_all,
+                    meta_attempt=meta_fix_attempts,
+                    unproductive_streak=unproductive_streak,
+                )
+                fix_id = f"E2E-pre-gate-meta-fix-{meta_fix_attempts}"
+                # Reset streak so the next round gets a fresh shot at progress.
+                unproductive_streak = 0
+            else:
+                e2e_log(
+                    f"Pre-E2E gate: spawning fix agent for {total_open} open bug(s)"
+                )
+                self._write_event(
+                    "pre_e2e_gate_fix_spawn", spec_dir,
+                    task_id=task.id, round=round_num,
+                    open_bugs=total_open,
+                )
+                fix_prompt = self._build_e2e_fix_prompt(
+                    spec_dir, findings_file, open_bugs_all, learnings_file,
+                    e2e_dir=e2e_dir,
+                    mcp_caps=mcp_caps,
+                )
+                fix_id = f"E2E-pre-gate-fix-{round_num}"
+
+            fix_task = Task(
+                id=fix_id,
+                description=(
+                    f"Pre-E2E gate {'meta-fix' if use_meta else 'fix'} "
+                    f"round {round_num} ({total_open} bugs)"
+                ),
+                phase=task.phase, parallel=False,
+                status=TaskStatus.RUNNING, line_num=0,
+            )
+            try:
+                _wait_for_subagent(fix_task, fix_prompt, fix_id)
+            except Exception as exc:
+                e2e_log(f"Pre-E2E gate: fix agent crashed: {exc}")
+                # Don't terminate — give the next round a chance to re-run
+                # tests in case the crash was transient. Only give up at
+                # hard cap or meta-exhaustion.
+            # Loop back; next round re-runs tests and measures progress.
+
+        # Hard wall-clock cap — something is probably very wrong.
+        e2e_log(
+            f"Pre-E2E gate: hit hard round cap "
+            f"({self._PRE_E2E_GATE_ROUND_HARD_CAP}) — stopping"
+        )
+        self._write_event(
+            "pre_e2e_gate_blocked", spec_dir,
+            task_id=task.id, reason="hard_round_cap",
+            hard_cap=self._PRE_E2E_GATE_ROUND_HARD_CAP,
+        )
+        return False
+
+    @staticmethod
+    def _failures_digest(failures: list[dict], skips: list[dict]) -> str:
+        """Build a stable digest of the current failure shape.
+
+        Used to detect "same failures round after round" (stall) vs
+        "different failures each round" (progress even if count unchanged).
+        Keyed on the set of failing commands + summary skip counts, not
+        on verbose stderr text (which has timestamps / PIDs that change).
+        """
+        import hashlib
+        parts: list[str] = []
+        for f in failures:
+            # Label identifies the command; first line of stderr_tail
+            # identifies the error class. Ignore trailing bytes (PIDs, paths).
+            label = f.get("label", "")
+            stderr = (f.get("stderr_tail") or "").splitlines()
+            head = next((l.strip() for l in stderr if l.strip()), "")
+            parts.append(f"{label}::{head[:200]}")
+        for s in skips:
+            parts.append(f"skip::{s.get('summary_path', '')}::{s.get('count', 0)}")
+        joined = "\n".join(sorted(parts))
+        return hashlib.sha256(joined.encode()).hexdigest()[:16]
+
+    def _build_pre_e2e_meta_fix_prompt(
+        self,
+        *,
+        task: "Task",
+        spec_dir: str,
+        e2e_dir: Path,
+        project_dir: Path,
+        gate_log: Path,
+        open_bugs: list[dict],
+        meta_attempt: int,
+        unproductive_streak: int,
+    ) -> str:
+        """Build the meta-fix prompt for a stalled integration-test gate.
+
+        Charter: the regular fix agent has tried {unproductive_streak}
+        times with no progress. Don't chase the next symptom — find the
+        structural cause. Typical structural causes: env var propagation
+        gaps between setup.sh and the test subprocess, wrong service
+        version/config, test-helpers reading from the wrong source, a
+        library whose behavior shifted between versions, etc.
+        """
+        # Best-effort: include setup.sh and env-state file so the meta-agent
+        # can spot misalignment without having to Glob for them.
+        setup_sh = project_dir / "test" / "e2e" / "setup.sh"
+        state_env = project_dir / "test" / "e2e" / ".state" / "env"
+        state_env_sh = project_dir / "test" / "e2e" / ".state" / "env.sh"
+
+        def _read(p: Path, limit: int = 8000) -> str:
+            try:
+                return p.read_text()[:limit]
+            except OSError:
+                return ""
+
+        setup_src = _read(setup_sh, 12000)
+        state_env_src = _read(state_env)
+        state_env_sh_src = _read(state_env_sh)
+        gate_tail = _read(gate_log, 8000)
+
+        bugs_listing = "\n".join(
+            f"- `{b.get('id','')}` — {b.get('summary','')}"
+            for b in open_bugs
+        ) or "(none synthesized yet)"
+
+        _required = _required_reads_block(
+            "pre-e2e-meta-fix",
+            [
+                str(_REF_DIR / "fix-agent-playbook.md"),
+                str(_REF_DIR / "e2e-failure-patterns.md"),
+                str(_REF_DIR / "testing.md"),
+            ],
+        )
+        _ref_index = _reference_index_pointer()
+
+        return f"""# Meta-fix: pre-E2E integration test gate is stuck
+
+You are a **structural-redesign agent** for the pre-E2E integration test gate on task {task.id}. The regular fix-agent loop has tried **{unproductive_streak}** rounds in a row with no progress — the failure shape didn't change. This is meta-attempt **{meta_attempt}/{self._PRE_E2E_GATE_META_FIX_MAX}**; after that, the runner writes BLOCKED.md.
+
+Because symptom-chasing has demonstrably failed, your charter is different from a typical fix attempt: **find the structural cause.** The regular fix agent keeps trying to edit the same files in the same ways. That approach isn't working. Look one layer up.
+
+{_required}
+
+The playbook's § Core principle (reproduce before hypothesizing) and § Verify by cold re-run, not guarded re-run apply directly to meta-fix work. Falsify the obvious hypothesis before forming your fix.
+
+{_ref_index}
+
+## Checklist: structural causes to consider FIRST
+
+1. **Env propagation between setup.sh and test subprocess.** setup.sh may `export` vars in its own shell; those vars are gone by the time the runner calls `subprocess.run(cmd, ...)`. If tests fail with "X is required / X not set", check whether setup.sh writes an env file, and whether the test invocation sources it.
+2. **Service version vs library version mismatch.** The API library expects protocol version N+1; the running service serves N. Fix the version pin in `scripts/setup-supertokens.sh`, `flake.nix`, or the package manifest.
+3. **Wrong tier placement.** A test marked `*.integration.test.ts` but actually requires UI / emulator / external SaaS. Fix the file name / vitest include config.
+4. **Test helpers reading from the wrong source.** `requireDatabaseUrl()` reads `process.env["DATABASE_URL"]` but the runner passes it via a different mechanism (a `.env` file, a config object, etc.). Align the two sides.
+5. **Stale cached state.** A prior run persisted state (bug_attempts, runner-verified.json, APK build, DB migration state) that biases this round. Clearing the cache is a valid fix if you can justify it.
+6. **Schema drift.** Liquibase / Prisma migration history doesn't match the DB the service is using. Reset `.dev/pgdata/` or add the missing changelog.
+
+## Full gate log (last 8KB)
+
+```
+{gate_tail or '(empty)'}
+```
+
+## Currently open bugs
+
+{bugs_listing}
+
+## test/e2e/setup.sh
+
+```bash
+{setup_src or '(unreadable)'}
+```
+
+## test/e2e/.state/env (what setup.sh wrote)
+
+```
+{state_env_src or '(not present)'}
+```
+
+## test/e2e/.state/env.sh (sourceable exports)
+
+```
+{state_env_sh_src or '(not present)'}
+```
+
+## Your job
+
+1. **Read the gate log + setup.sh + state/env* together.** The answer is almost always in the gap between what setup.sh configured and what the test subprocess actually saw.
+2. **State a single structural hypothesis.** Write it in one sentence. If you can't state it in one sentence, you don't have it yet.
+3. **Apply ONE fix that addresses that hypothesis.** Don't fix five things hoping one sticks — that's exactly what the regular loop was doing.
+4. **Verify locally.** Run the failing test command yourself (e.g. `DATABASE_URL=... pnpm --dir api test`) and confirm exit 0. If you can't get exit 0, your hypothesis is wrong — iterate.
+
+## Constraints
+
+- **You may edit runner-side files** — `test/e2e/setup.sh`, spec-kit `parallel_runner.py`, config files — not just app code. The structural cause often lives in the glue, not the feature code.
+- **No skip guards.** The whole point of this loop is that tests run.
+- **No widening the scope.** Fix the specific stall. Don't add unrelated improvements.
+
+## Done when
+
+- Running the gate's test command(s) against the live services (or with the env sourced) exits 0 with zero skipped tests.
+- You committed the fix with a message explaining the structural cause, not just the symptom.
+
+End your final message with a structured claim:
+
+```
+<claim>{{"structural_cause": "...", "files_changed": ["..."], "verified": true, "evidence": "ran $cmd and saw exit 0"}}</claim>
+```
+"""
+
+    # ── Services-fix loop (distinct from integration-test fix loop) ──
+    #
+    # Bringing up backend services (Postgres, auth server, API) is a
+    # different problem class than "integration tests fail": the failure
+    # mode is "setup.sh exited non-zero", the fix touches infra files
+    # (flake.nix, setup.sh, docker-compose.yml, env vars), and the
+    # diagnostic data is in setup-failure.log — not in test output.
+    # Separate streak budget keeps the two loops from cannibalizing each
+    # other's attempts.
+    _PRE_E2E_SERVICES_FIX_MAX_ATTEMPTS = 5
+    _PRE_E2E_SERVICES_FIX_UNPRODUCTIVE_STREAK_MAX = 3
+
+    def _ensure_services_with_fix_loop(
+        self,
+        task: "Task",
+        spec_dir: str,
+        e2e_dir: Path,
+        project_dir: Path,
+        e2e_log,
+    ) -> bool:
+        """Bring up the service stack; on failure, spawn a fix agent and retry.
+
+        Returns True when services are up, False when the fix loop stalls.
+        Uses its own attempt/streak budget separate from the test-fix loop
+        and the platform-init (emulator) loop, because service bringup is
+        its own problem class (setup.sh, infra config, env vars, ports).
+        """
+        prev_failure_digest: Optional[str] = None
+        unproductive_streak = 0
+
+        for attempt in range(1, self._PRE_E2E_SERVICES_FIX_MAX_ATTEMPTS + 1):
+            e2e_log(
+                f"Pre-E2E services: bringup attempt {attempt}/"
+                f"{self._PRE_E2E_SERVICES_FIX_MAX_ATTEMPTS}..."
+            )
+            ok = self._platform_manager.ensure_services_only(project_dir)
+            if ok:
+                e2e_log("Pre-E2E services: backend stack up")
+                return True
+
+            # Read the structured failure that _start_e2e_services left.
+            setup_log = project_dir / "test" / "e2e" / ".state" / "setup-failure.log"
+            failure_text = ""
+            try:
+                if setup_log.exists():
+                    failure_text = setup_log.read_text()
+            except OSError:
+                pass
+            # Digest for streak tracking — identical failure twice in a row
+            # means the fix agent isn't making progress.
+            digest = (failure_text[:500] or "").strip()
+            if prev_failure_digest is not None and digest == prev_failure_digest:
+                unproductive_streak += 1
+                e2e_log(
+                    f"Pre-E2E services: identical setup failure vs last "
+                    f"attempt (unproductive streak {unproductive_streak}/"
+                    f"{self._PRE_E2E_SERVICES_FIX_UNPRODUCTIVE_STREAK_MAX})"
+                )
+                if unproductive_streak >= self._PRE_E2E_SERVICES_FIX_UNPRODUCTIVE_STREAK_MAX:
+                    e2e_log(
+                        f"Pre-E2E services: fix agent has stalled — "
+                        f"{unproductive_streak} consecutive no-progress attempts"
+                    )
+                    return False
+            else:
+                unproductive_streak = 0
+            prev_failure_digest = digest
+
+            # Force a full reset before the fix agent runs so any ghost
+            # processes don't confuse it about what's wrong.
+            try:
+                self._platform_manager.reset_e2e_services(project_dir)
+            except Exception as exc:
+                e2e_log(f"Pre-E2E services: reset raised {exc!r} — continuing")
+
+            # Spawn a dedicated fix agent for service bringup. Prompt is
+            # scoped to infra/setup only — don't let it wander into app code.
+            fix_prompt = self._build_services_fix_prompt(
+                cap_label=f"backend-services (attempt {attempt})",
+                project_dir=project_dir,
+                setup_log=setup_log,
+                failure_text=failure_text,
+            )
+            fix_task = Task(
+                id=f"{task.id}-services-fix-{attempt}",
+                description=f"Fix backend services bringup (attempt {attempt})",
+                phase=task.phase, parallel=False,
+                status=TaskStatus.RUNNING, line_num=0,
+                capabilities=task.capabilities,
+            )
+            try:
+                _wait_for_subagent(
+                    fix_task, fix_prompt,
+                    f"services-fix ({attempt})",
+                    caps=task.capabilities,
+                )
+            except AgentAuthError:
+                raise
+            except Exception as exc:
+                e2e_log(f"Pre-E2E services: fix agent raised {exc!r} — continuing")
+
+        e2e_log(
+            f"Pre-E2E services: hit max attempts "
+            f"({self._PRE_E2E_SERVICES_FIX_MAX_ATTEMPTS}) without success"
+        )
+        return False
+
+    @staticmethod
+    def _build_services_fix_prompt(
+        cap_label: str,
+        project_dir: Path,
+        setup_log: Path,
+        failure_text: str,
+    ) -> str:
+        _required = _required_reads_block(
+            "services-fix",
+            [
+                str(_REF_DIR / "fix-agent-playbook.md"),
+                str(_REF_DIR / "e2e-runtime.md"),
+                str(_REF_DIR / "health.md"),
+            ],
+        )
+        _ref_index = _reference_index_pointer()
+        return f"""# Fix backend services bringup — {cap_label}
+
+The E2E service setup script (`test/e2e/setup.sh`) failed to bring up the backend service stack. This happens BEFORE any integration or E2E tests run — nothing downstream works until services are healthy.
+
+{_required}
+
+{_ref_index}
+
+## Your task
+
+Diagnose and fix the setup failure so that running `bash test/e2e/setup.sh` from a clean state exits 0 and leaves the expected services healthy. Services typically include Postgres, an auth server (e.g. SuperTokens), and the project's API.
+
+## Constraints
+
+- **Edit infra/setup files only.** Legitimate fix surfaces: `test/e2e/setup.sh`, `test/e2e/teardown.sh`, `flake.nix`, `docker-compose.yml`, `process-compose.yml`, service config files (e.g. `.dev/supertokens/config.yaml`), environment templates (`.env.example`), scripts in `scripts/`, or version pins in `api/package.json` / equivalent.
+- **Do NOT** modify application source (`api/src/`, `site/src/`, `admin/lib/`, `customer/lib/`). If a service fails because the *app* won't boot against it (compile error, runtime crash), that's a bug for the integration-test fix agent — leave it alone, your job is only to get the service stack up.
+- **Do NOT** disable tests or add skip guards anywhere. Skips are banned project-wide.
+- **Verify locally** by running `bash test/e2e/setup.sh` before claiming done. Exit code 0 + no ERROR in the log = success. If you can't verify (network unavailable, missing credentials), write BLOCKED.md explaining what credential you need.
+
+## Common failure classes
+
+- **Port conflict** — a prior run left a process holding port 3000/3567/5432. `teardown.sh` should kill it; setup should retry.
+- **Version mismatch** — API library expects CDI 5.4 but core serves 5.3; downgrade or upgrade one side.
+- **Schema drift** — Liquibase migration fails because the DB state is ahead/behind the migration set. Reset the DB dir or add the missing changelog.
+- **Missing dependency** — a binary referenced by setup.sh isn't on PATH in the Nix devshell. Add it to `flake.nix`.
+- **Config syntax error** — a config file was edited with a typo and the service won't start.
+
+## Done when
+
+- `bash test/e2e/setup.sh` from a clean state exits 0.
+- `setup-failure.log` shows no ERROR.
+- The services that the script was supposed to start are reachable on their expected ports.
+
+End your final message with a structured claim:
+
+```
+<claim>{{"root_cause": "...", "files_changed": ["..."], "verified": true, "evidence": "ran setup.sh and observed exit 0"}}</claim>
+```
+
+## Failure output (variable, per attempt)
+
+Full log: `{setup_log.relative_to(project_dir) if setup_log.is_absolute() else setup_log}`
+
+```
+{failure_text[-4000:] if failure_text else '(no setup-failure.log produced)'}
+```
+"""
+
+    def _write_pre_e2e_services_blocked(
+        self, task: "Task", e2e_dir: Path, project_dir: Path,
+    ) -> None:
+        """Write BLOCKED.md when the services-fix loop stalls."""
+        setup_log = project_dir / "test" / "e2e" / ".state" / "setup-failure.log"
+        failure_tail = ""
+        try:
+            if setup_log.exists():
+                failure_tail = setup_log.read_text()[-2000:]
+        except OSError:
+            pass
+        self.blocked_file.write_text(
+            f"# BLOCKED: {task.id} — backend services won't start\n\n"
+            f"The E2E service stack (`test/e2e/setup.sh`) failed to come up "
+            f"after {self._PRE_E2E_SERVICES_FIX_MAX_ATTEMPTS} fix attempts, "
+            f"or the fix agent stalled (same failure {self._PRE_E2E_SERVICES_FIX_UNPRODUCTIVE_STREAK_MAX} "
+            f"attempts in a row). Integration tests and E2E both require "
+            f"the services to be live, so nothing downstream can run.\n\n"
+            f"## Last failure output\n\n"
+            f"```\n{failure_tail or '(no setup-failure.log)'}\n```\n\n"
+            f"## To unblock\n\n"
+            f"1. Try running `bash test/e2e/setup.sh` locally in the Nix "
+            f"devshell. The failure output above will point at which service "
+            f"is unhealthy.\n"
+            f"2. Fix the root cause — usually one of: port conflict, library "
+            f"version mismatch, missing env var, Nix devshell missing a "
+            f"binary, DB schema drift.\n"
+            f"3. Delete this file and re-run. The services-fix loop will "
+            f"restart from attempt 1.\n"
+        )
+
+    def _write_pre_e2e_gate_blocked(self, task: "Task", e2e_dir: Path) -> None:
+        """Write BLOCKED.md when the pre-E2E gate exhausts meta-fix attempts.
+
+        Only fires after the regular fix loop stalled AND the meta-fix
+        structural-redesign agent also couldn't resolve it. At that point
+        the problem genuinely needs human eyes.
+        """
+        findings_file = e2e_dir / "findings.json"
+        stuck_summary = ""
+        try:
+            findings = json.loads(findings_file.read_text()) if findings_file.exists() else {}
+            open_bugs = [
+                f for f in findings.get("findings", [])
+                if f.get("status") in ("new", "verified_broken")
+            ]
+            if open_bugs:
+                lines = [f"\n## Open bugs ({len(open_bugs)})\n"]
+                for b in open_bugs:
+                    bid = b.get("id", "?")
+                    lines.append(f"- `{bid}` — {b.get('summary', '')}")
+                stuck_summary = "\n".join(lines) + "\n"
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        self.blocked_file.write_text(
+            f"# BLOCKED: {task.id} — integration tests failing before E2E\n\n"
+            f"The integration test suite must pass (0 failures, 0 skips) "
+            f"before any `[needs: e2e-loop]` task runs. Services came up "
+            f"successfully, but the integration tests failed and the full "
+            f"escalation ladder — regular fix agent → meta-fix "
+            f"structural-redesign agent — couldn't reach a green state. "
+            f"At this point the problem likely needs human eyes on the "
+            f"structural cause.\n"
+            f"{stuck_summary}"
+            f"\n## Full test output\n\n"
+            f"See `{e2e_dir / 'pre-e2e-gate.log'}`.\n\n"
+            f"## To unblock\n\n"
+            f"1. Read the log and the bugs above. Look at the meta-fix "
+            f"claim JSON (if present) for the structural hypothesis it "
+            f"tried.\n"
+            f"2. The structural cause is usually in the glue: env var "
+            f"propagation between setup.sh and the test subprocess, "
+            f"service/library version mismatch, wrong test tier placement, "
+            f"cached state.\n"
+            f"3. Fix the root cause and commit. Delete this file to retry; "
+            f"the gate will re-run from scratch.\n"
+        )
+
+    @staticmethod
+    def _any_source_newer_than(project_dir: Path, mtime: float) -> Optional[str]:
+        """Return path of the first source file newer than mtime, or None."""
+        # Walk a bounded set of common source dirs to keep this fast.
+        source_dirs = [
+            project_dir / "api" / "src",
+            project_dir / "site" / "src",
+            project_dir / "src",
+            project_dir / "admin" / "lib",
+            project_dir / "customer" / "lib",
+        ]
+        for d in source_dirs:
+            if not d.is_dir():
+                continue
+            try:
+                for p in d.rglob("*"):
+                    if not p.is_file():
+                        continue
+                    if p.suffix not in (".ts", ".tsx", ".js", ".jsx", ".py",
+                                        ".go", ".kt", ".java", ".dart", ".rs"):
+                        continue
+                    try:
+                        if p.stat().st_mtime > mtime:
+                            return str(p.relative_to(project_dir))
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+        return None
+
+    def _run_pre_e2e_tests(
+        self,
+        test_cmds: list[tuple[str, str]],
+        gate_log: Path,
+        e2e_log,
+        project_dir: Path,
+    ) -> tuple[bool, list[dict], list[dict]]:
+        """Run all configured test commands; return (passed, failures, skips).
+
+        failures: list of {command, label, exit_code, stderr_tail}
+        skips: list of {summary_path, count, names}
+
+        If `test/e2e/.state/env.sh` exists, each test command is wrapped in
+        `bash -c 'source <env.sh>; exec <cmd>'` so the subprocess inherits
+        the env vars setup.sh configured (DATABASE_URL, SUPERTOKENS_*, etc.).
+        Without this wrap, tests that require live-service env vars fail
+        because the runner's environment doesn't have them.
+        """
+        all_passed = True
+        failures: list[dict] = []
+        skip_summaries: list[dict] = []
+
+        # Drain prior log so agents always see the current run.
+        try:
+            gate_log.write_text("")
+        except OSError:
+            pass
+
+        env_sh = project_dir / "test" / "e2e" / ".state" / "env.sh"
+        wrap_env = env_sh.is_file()
+        if wrap_env:
+            e2e_log(f"  (sourcing {env_sh.relative_to(project_dir)} for test env)")
+
+        def _wrap(cmd: str) -> str:
+            if wrap_env:
+                # Single-quote the command, escape embedded single quotes,
+                # and source env.sh before exec. The `set -a` makes sourced
+                # vars export to child processes.
+                escaped = cmd.replace("'", "'\"'\"'")
+                return (
+                    f"bash -c 'set -a; source {env_sh} 2>/dev/null; "
+                    f"set +a; {escaped}'"
+                )
+            return cmd
+
+        for cmd, label in test_cmds:
+            e2e_log(f"  → {label}")
+            try:
+                result = subprocess.run(
+                    _wrap(cmd), shell=True, capture_output=True, text=True,
+                    timeout=600, cwd=str(project_dir),
+                )
+            except subprocess.TimeoutExpired as exc:
+                all_passed = False
+                stderr_tail = (exc.stderr or b"").decode("utf-8", errors="replace")[-2000:] if isinstance(exc.stderr, bytes) else (exc.stderr or "")[-2000:]
+                failures.append({
+                    "command": cmd, "label": label,
+                    "exit_code": -1, "stderr_tail": stderr_tail,
+                    "error": "timeout after 600s",
+                })
+                e2e_log(f"    TIMEOUT")
+                try:
+                    with gate_log.open("a") as fh:
+                        fh.write(f"\n=== {label} — TIMEOUT ===\n{stderr_tail}\n")
+                except OSError:
+                    pass
+                continue
+
+            # Always append output to the gate log for the fix agent to read.
+            try:
+                with gate_log.open("a") as fh:
+                    fh.write(f"\n=== {label} — exit {result.returncode} ===\n")
+                    fh.write("--- stdout ---\n")
+                    fh.write(result.stdout[-8000:])
+                    fh.write("\n--- stderr ---\n")
+                    fh.write(result.stderr[-4000:])
+                    fh.write("\n")
+            except OSError:
+                pass
+
+            if result.returncode != 0:
+                all_passed = False
+                failures.append({
+                    "command": cmd, "label": label,
+                    "exit_code": result.returncode,
+                    "stderr_tail": result.stderr[-2000:],
+                    "stdout_tail": result.stdout[-2000:],
+                })
+                e2e_log(f"    FAIL (exit {result.returncode})")
+            else:
+                e2e_log(f"    PASS")
+
+        # Independent skip scan — even if every command exited 0, a reporter
+        # may have lied. See reference/testing.md § "Zero-skips rule".
+        skips = _scan_for_skipped_tests()
+        for summary_path, count, names in skips:
+            all_passed = False
+            skip_summaries.append({
+                "summary_path": summary_path,
+                "count": count,
+                "names": names,
+            })
+            e2e_log(f"    SKIPS: {count} in {summary_path}")
+
+        return all_passed, failures, skip_summaries
+
+    @staticmethod
+    def _pre_e2e_failures_to_blockers(
+        failures: list[dict], skips: list[dict], gate_log: Path,
+    ) -> list[dict]:
+        """Map test failures/skips to INFRA blocker dicts for _synthesize_infra_findings."""
+        blockers: list[dict] = []
+        for f in failures:
+            # Stable slug derived from the command label so re-runs update the
+            # same finding instead of creating duplicates.
+            slug_src = f.get("label", f.get("command", "test-fail"))
+            slug = "".join(
+                c.lower() if c.isalnum() or c in "-_" else "-"
+                for c in slug_src
+            )[:48] or "test-fail"
+            body_lines = [
+                f"**Command**: `{f.get('command', '?')}`",
+                f"**Label**: {f.get('label', '?')}",
+                f"**Exit code**: {f.get('exit_code', '?')}",
+                "",
+                "**stderr (tail)**:",
+                "```",
+                (f.get('stderr_tail') or '').strip(),
+                "```",
+                "",
+                "**stdout (tail)**:",
+                "```",
+                (f.get('stdout_tail') or '').strip()[:2000],
+                "```",
+                "",
+                f"Full output logged to `{gate_log}`.",
+                "",
+                "**How a fix agent should verify**: re-run the exact command "
+                "above and confirm it exits 0 with zero skipped tests. "
+                "Run it the way the gate does — source "
+                "`test/e2e/.state/env.sh` first if the test needs live-service "
+                "env vars (DATABASE_URL, SUPERTOKENS_*, etc).",
+                "",
+                "**Before touching test code, rule out these structural causes** "
+                "(agents have repeatedly wasted rounds symptom-chasing past them):",
+                "",
+                "1. **Env propagation**: `test/e2e/setup.sh` exports vars in its "
+                "own shell; if it doesn't ALSO write `test/e2e/.state/env.sh` "
+                "with those exports, the test subprocess won't see them. "
+                "Symptom: every test fails with 'X is required'.",
+                "2. **Service vs library version mismatch**: library expects "
+                "protocol N+1, service serves N. Fix version pin in "
+                "`scripts/setup-<svc>.sh` / `flake.nix`, not the library call.",
+                "3. **Test helper reading wrong source**: `requireDatabaseUrl()` "
+                "reads `process.env`, but setup passes the var via a config "
+                "object or `.env` file. Align the two sides.",
+                "4. **Wrong tier**: test in `*.integration.test.ts` but actually "
+                "needs UI/emulator/paid API. Rename to `*.e2e.test.ts` / "
+                "`*.external.test.ts` and exclude from default run config.",
+                "",
+                "See `reference/testing.md` § \"Structural causes to investigate "
+                "when the integration-test fix loop stalls\" for the full list.",
+            ]
+            blockers.append({"slug": f"pre-e2e-{slug}", "body": "\n".join(body_lines)})
+
+        if skips:
+            # Collapse all skip summaries into one blocker — the rule is uniform.
+            body_lines = [
+                "**Zero-skips rule violated**: one or more test reporters "
+                "recorded skipped tests. Skips are not allowed — every test "
+                "must execute against live services. See spec-kit "
+                "`reference/testing.md` § \"Zero-skips rule\".",
+                "",
+                "**Summaries with skips:**",
+            ]
+            for s in skips:
+                body_lines.append(
+                    f"- `{s['summary_path']}`: {s['count']} skipped"
+                )
+                for n in s.get("names", [])[:10]:
+                    body_lines.append(f"    - {n}")
+            body_lines.extend([
+                "",
+                "**How a fix agent should resolve**: remove the skip guard "
+                "(`describe.skip`, `t.Skip`, conditional `canRun`, try/catch "
+                "swallowing setup errors) and replace it with fail-fast "
+                "assertions in `beforeAll`. If the test physically cannot "
+                "run in this environment, exclude it at list-building time "
+                "(separate file pattern, separate script, CI matrix) — not "
+                "at runtime.",
+            ])
+            blockers.append({
+                "slug": "pre-e2e-skipped-tests",
+                "body": "\n".join(body_lines),
+            })
+        return blockers
+
     # ── E2E Explore-Fix-Verify loop ──────────────────────────────────────
 
     def _run_e2e_loop(self, task: Task, spec_dir: str, task_file: Path,
                       learnings_file: str):
-        """Run the E2E explore-fix-verify loop, catching auth failures."""
+        """Run the E2E explore-fix-verify loop.
+
+        Catches every exception from the inner function so the thread
+        exits cleanly; a crashed thread would be silently re-launched by
+        the outer scheduler and the re-launch would wipe evidence via
+        clean-stale.
+
+        Crash classification:
+          - Deepest frame is in spec-kit skill dir (the runner itself) →
+            BLOCKED.md, escalate to human. Agents should not be patching
+            the harness they run under.
+          - Deepest frame anywhere else (project code, subprocess helpers,
+            platform driver shims) → synthesize an infrastructure finding
+            so the next iteration's fix agent picks it up. Same routing as
+            executor-reported infrastructure blockers.
+        """
         e2e_dir = Path(spec_dir) / "validate" / "e2e"
         e2e_dir.mkdir(parents=True, exist_ok=True)
 
         try:
             return self._run_e2e_loop_inner(task, spec_dir, task_file, learnings_file)
-        except AgentAuthError as e:
+        except AgentAuthError:
             self.log(f"FATAL: Auth error in E2E loop for {task.id}")
             self._shutdown.set()
             self.blocked_file.write_text(
@@ -8546,6 +9917,100 @@ class Runner:
                 f"Re-authenticate Claude Code and restart.\n\n"
                 f"## Context\n\nE2E findings and logs are in `{e2e_dir}/`.\n"
             )
+            return
+        except Exception:
+            import traceback as _tb_mod
+            import sys as _sys
+            exc_type, exc_val, exc_tb = _sys.exc_info()
+            tb = _tb_mod.format_exc()
+
+            # Persist full traceback for post-mortem, keyed by timestamp so
+            # repeat crashes accumulate rather than overwrite.
+            crash_log = e2e_dir / "inner-crash.log"
+            with crash_log.open("a") as f:
+                f.write(
+                    f"\n=== {datetime.now().isoformat()} crash in _run_e2e_loop_inner ===\n"
+                    f"task: {task.id}\n"
+                    f"{tb}\n"
+                )
+            self.log(f"E2E inner loop for {task.id} crashed — see {crash_log}")
+
+            # Walk to the deepest frame to classify where the real bug lives.
+            skill_dir = Path(__file__).resolve().parent
+            deepest = exc_tb
+            while deepest is not None and deepest.tb_next is not None:
+                deepest = deepest.tb_next
+            deepest_file = Path(
+                deepest.tb_frame.f_code.co_filename
+            ).resolve() if deepest else None
+            in_runner = deepest_file is not None and (
+                deepest_file == Path(__file__).resolve()
+                or skill_dir in deepest_file.parents
+            )
+
+            if in_runner:
+                # Bug in the spec-kit harness itself — agents should not be
+                # patching the runner they run under. Halt and page a human.
+                self.blocked_file.write_text(
+                    f"# BLOCKED: {task.id} — spec-kit runner crashed\n\n"
+                    f"An uncaught exception in the spec-kit runner killed the "
+                    f"E2E inner loop. The bug is in the harness itself "
+                    f"(deepest frame: `{deepest_file}`), not in the project "
+                    f"under test — automated fix is out of scope.\n\n"
+                    f"Full traceback:\n\n```\n{tb}\n```\n\n"
+                    f"State preserved in `{e2e_dir}/` (findings.json, "
+                    f"progress.md, state.json). Fix the runner, delete this "
+                    f"file, then re-run.\n"
+                )
+                return
+
+            # Bug is downstream of the runner (project code, subprocess
+            # helper, driver shim). Synthesize an infrastructure finding so
+            # the next iteration's fix agent picks it up — same path as an
+            # executor-reported infrastructure blocker.
+            deepest_loc = (
+                f"{deepest_file}:{deepest.tb_lineno} "
+                f"in {deepest.tb_frame.f_code.co_name}"
+                if deepest else "unknown frame"
+            )
+            slug = "".join(
+                c if c.isalnum() or c in "-_" else "-"
+                for c in f"runner-crash-{exc_type.__name__ if exc_type else 'unknown'}"
+            ).lower()[:64]
+            body = (
+                f"- **Symptom** The E2E inner loop raised `"
+                f"{exc_type.__name__ if exc_type else 'Exception'}: {exc_val}` "
+                f"and died.\n"
+                f"- **Evidence** See {crash_log}. Deepest frame: {deepest_loc}.\n"
+                f"- **Suspected root cause** Downstream call from the runner "
+                f"(not the runner itself) raised. Inspect the deepest frame "
+                f"for the actual defect.\n"
+                f"- **Suggested fix location** `{deepest_file}` "
+                f"(line {deepest.tb_lineno if deepest else '?'})\n"
+                f"- **How a fix agent can verify** Re-run the T097 e2e loop; "
+                f"this crash should not recur.\n"
+                f"\n## Traceback\n\n```\n{tb}\n```\n"
+            )
+            try:
+                added = _synthesize_infra_findings(
+                    e2e_dir,
+                    [{"slug": slug, "body": body}],
+                    iteration=0,
+                    spawn_num=0,
+                )
+                self.log(
+                    f"E2E inner-loop crash classified as downstream — "
+                    f"synthesized finding {added[0] if added else '?'}; "
+                    f"next iteration will spawn a fix agent"
+                )
+            except Exception as synth_exc:
+                # If synthesis itself fails, fall back to escalation rather
+                # than crashing the crash handler.
+                self.blocked_file.write_text(
+                    f"# BLOCKED: {task.id} — crash handler could not synthesize finding\n\n"
+                    f"Original crash:\n\n```\n{tb}\n```\n\n"
+                    f"Synthesis failure: {synth_exc!r}\n"
+                )
 
     def _run_e2e_loop_inner(self, task: Task, spec_dir: str, task_file: Path,
                             learnings_file: str):
@@ -8572,19 +10037,25 @@ class Runner:
         project_dir = Path.cwd()
 
         # ── Clean stale state from prior runs ──
-        # Remove progress/findings files so the explore agent starts
-        # fresh instead of reading old data and skipping MCP exploration.
-        for stale in [
-            e2e_dir / "progress.md",
-            e2e_dir / "progress-full.md",
-            e2e_dir / "findings.json",
-            e2e_dir / "findings-full.json",
-            e2e_dir / "state.json",
-            e2e_dir / "guidance.md",
-            e2e_dir / "supervisor-decision.md",
-        ]:
-            if stale.exists():
-                stale.unlink()
+        # Only wipe on a fresh task — re-invocations within the same runner
+        # process (outer _e2e_loop_spawns retry) should preserve evidence,
+        # since the retry is always a response to an abnormal outcome. The
+        # existing resume block further down reads preserved findings.json
+        # and skips re-exploration. For truly fresh starts, the operator
+        # deletes the e2e_dir or triggers a new runner process.
+        is_first_invocation = getattr(self, "_e2e_loop_spawns", {}).get(task.id, 1) <= 1
+        if is_first_invocation:
+            for stale in [
+                e2e_dir / "progress.md",
+                e2e_dir / "progress-full.md",
+                e2e_dir / "findings.json",
+                e2e_dir / "findings-full.json",
+                e2e_dir / "state.json",
+                e2e_dir / "guidance.md",
+                e2e_dir / "supervisor-decision.md",
+            ]:
+                if stale.exists():
+                    stale.unlink()
 
         # Supervisor interval: every N iterations, assess progress
         SUPERVISOR_INTERVAL = 10
@@ -8890,16 +10361,40 @@ class Runner:
             self._platform_manager._log = platform_log
             self._platform_manager._event = platform_event
 
+        # ── Pre-E2E: bring up backend services with its own fix loop ──
+        # Integration tests only need the API/DB/auth layer, not the
+        # emulator/browser. Services bringup has its own dedicated fix loop
+        # (separate from the test-fix loop) because "setup.sh won't run"
+        # and "integration tests fail" are different classes of problem
+        # with different root causes and fix prompts.
+        if not self._ensure_services_with_fix_loop(
+            task=task, spec_dir=spec_dir, e2e_dir=e2e_dir,
+            project_dir=project_dir, e2e_log=e2e_log,
+        ):
+            e2e_log("Pre-E2E: services-fix loop exhausted — stopping")
+            self._write_pre_e2e_services_blocked(task, e2e_dir, project_dir)
+            return
+
+        # ── Pre-E2E integration test gate ──
+        # Run the project's integration test suite against live services
+        # before we burn minutes on emulator boot + APK build + MCP crawl.
+        # A failure at the API layer means the MCP crawl would discover
+        # the same bug ~100x more expensively.
+        if not self._pre_e2e_integration_gate(
+            task=task, spec_dir=spec_dir, e2e_dir=e2e_dir,
+            project_dir=project_dir, e2e_log=e2e_log,
+            learnings_file=learnings_file, mcp_caps=mcp_caps,
+        ):
+            e2e_log("Pre-E2E integration gate FAILED — stopping")
+            self._write_pre_e2e_gate_blocked(task, e2e_dir)
+            return
+
         PLATFORM_INIT_MAX_ATTEMPTS = 10
         fix_history_path = project_dir / "test" / "e2e" / ".state" / "fix-history.md"
-        playbook_path = self.script_dir / "reference" / "fix-agent-playbook.md"
-        patterns_path = self.script_dir / "reference" / "e2e-failure-patterns.md"
-
-        def _load_reference(path: Path) -> str:
-            try:
-                return path.read_text()
-            except OSError:
-                return ""
+        # Use the module-scope playbook + patterns library so the prompt
+        # bytes stay byte-identical across features within a single Python
+        # process (the cache key for Anthropic prompt caching).
+        # Local `_load_reference` is intentionally not redefined here.
 
         def _parse_setup_failure(setup_log: Path) -> dict:
             """Extract the failing service + port from setup-failure.log.
@@ -9062,26 +10557,6 @@ class Runner:
             # Stale process heuristic: if service log is older than ~2 minutes
             # but the current attempt is happening now, caller should inject this.
             return matched
-
-        def _extract_pattern_sections(names: list[str]) -> str:
-            """Pull just the matching `## Signature: <name>` sections from the
-            pattern library, so the fix-agent gets only relevant hints."""
-            if not names:
-                return ""
-            library = _load_reference(patterns_path)
-            if not library:
-                return ""
-            # Split on the `## Signature:` boundaries.
-            parts = re.split(r"(?m)^##\s+Signature:\s*", library)
-            sections: list[str] = []
-            for part in parts[1:]:  # parts[0] is the preamble
-                first_line, _, rest = part.partition("\n")
-                name = first_line.strip()
-                if name in names:
-                    sections.append(f"## Signature: {name}\n{rest.rstrip()}")
-            if not sections:
-                return ""
-            return "\n\n---\n\n".join(sections)
 
         def _prior_attempts_summary() -> str:
             """Read fix-history.md — a rolling log of prior fix-agent attempts."""
@@ -9359,6 +10834,68 @@ class Runner:
                 lines.append(f"- adb devices: error ({e})")
             lines.append(f"- _e2e_services_started: {self._platform_manager._e2e_services_started}")
             lines.append(f"- _booted runtimes: {list(self._platform_manager._runtimes.keys())}")
+
+            # Surface the most recent `mcp_build_fail` event for this
+            # (task, capability). The runner records `reason`, `error_line`,
+            # and `extra` (e.g. candidate build roots for ambiguous_build_root)
+            # on the event, but they're buried in run-log.jsonl — fix-agents
+            # were missing the one-line answer and re-deriving it by hand.
+            # When present, the error_line usually prescribes the fix.
+            latest_build_fail: Optional[dict] = None
+            try:
+                with open(Path(spec_dir) / "run-log.jsonl") as f:
+                    for raw in f:
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            rec = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        if rec.get("event") != "mcp_build_fail":
+                            continue
+                        if rec.get("task_id") != task.id or rec.get("capability") != cap:
+                            continue
+                        latest_build_fail = rec
+            except OSError:
+                pass
+
+            if latest_build_fail:
+                reason = latest_build_fail.get("reason") or "(no reason)"
+                phase = latest_build_fail.get("phase") or "(no phase)"
+                error_line = latest_build_fail.get("error_line") or ""
+                extra = {
+                    k: v for k, v in latest_build_fail.items()
+                    if k not in {
+                        "timestamp", "session", "event", "task_id",
+                        "platform", "capability", "build_result",
+                        "reason", "phase", "error_line",
+                    }
+                }
+                lines.append(
+                    f"\n## Build-detect failure (from `mcp_build_fail` event)\n"
+                )
+                lines.append(f"- **phase**: `{phase}`")
+                lines.append(f"- **reason**: `{reason}`")
+                if error_line:
+                    lines.append(f"- **error_line**: `{error_line}`")
+                if extra:
+                    lines.append("- **extra**:")
+                    for k, v in extra.items():
+                        lines.append(f"    - `{k}`: `{v}`")
+                lines.append(
+                    "\n*This event fires after MCP boot but before the runtime is "
+                    "registered as ready — the build-detect/install phase rejected "
+                    "the workspace. The `error_line` is the runner's own message; "
+                    "it often prescribes the fix (e.g. an env var to set, a file "
+                    "to create). Address this before chasing MCP probe output, "
+                    "service logs, or emulator state — those all run later in the "
+                    "pipeline.*\n"
+                    "\n*Note: env set only in `.mcp.json` reaches the MCP server "
+                    "process, not the runner's build-detect phase. If the fix is "
+                    "an env var, set it where the runner itself runs (devshell, "
+                    "flake.nix, or a marker file the detector reads from disk).*"
+                )
 
             # Probe the MCP server binary now, lazily. The Claude CLI spawns
             # MCP servers as subprocesses and their stderr is invisible to the
@@ -9664,14 +11201,14 @@ class Runner:
                 )
 
             matched = _match_patterns(failure, service_log_tail)
-            pattern_section = _extract_pattern_sections(matched)
-            if pattern_section:
+            if matched:
                 lines.append(
                     f"\n## Matching failure patterns\n\n"
                     f"The runner's pattern library matched **{', '.join(matched)}**. "
-                    f"Use the guidance below before exploring other hypotheses.\n"
+                    f"Open `{_REF_DIR / 'e2e-failure-patterns.md'}` (already in your "
+                    f"required reads) and find each `## Signature: <name>` section "
+                    f"for the names above before exploring other hypotheses.\n"
                 )
-                lines.append(pattern_section)
 
             prior = _prior_attempts_summary()
             if prior:
@@ -9702,8 +11239,6 @@ class Runner:
             # Stash for the caller so _record_attempt can use the same parse.
             self._last_platform_failure = {"failure": failure, "matched": matched}
             return "\n".join(lines)
-
-        _PLATFORM_FIX_PLAYBOOK = _load_reference(playbook_path)
 
         def _repeat_failure_section(attempt: int) -> str:
             """If this attempt's failure signature (service + matched patterns)
@@ -9788,13 +11323,18 @@ class Runner:
             and structural-categories list — only the framing and the
             urgency language differ. A single prompt avoids the drift that
             comes from maintaining two."""
-            playbook_section = ""
-            if _PLATFORM_FIX_PLAYBOOK:
-                playbook_section = (
-                    "\n## Fix-agent playbook (general debugging heuristics)\n\n"
-                    "These apply to every fix-agent. Read them before diving in.\n\n"
-                    + _PLATFORM_FIX_PLAYBOOK
-                )
+            # Required reads for the platform-fix role. Stable paths so
+            # subsequent attempts in the same loop hit the Read tool result
+            # cache (5-min TTL) — first attempt pays cache_create on these
+            # files, attempts 2..N pay cache_read.
+            required_reads = _required_reads_block(
+                "platform-fix" if not meta else "platform-fix-meta",
+                [
+                    str(_REF_DIR / "fix-agent-playbook.md"),
+                    str(_REF_DIR / "e2e-failure-patterns.md"),
+                ],
+            )
+            ref_index = _reference_index_pointer()
             repeat_section = _repeat_failure_section(attempt)
             cross_attempt = _build_cross_attempt_summary(cap)
 
@@ -9953,7 +11493,30 @@ class Runner:
                     f"shows an env var or filesystem state that contradicts "
                     f"what a prior claim assumed, that contradiction is the "
                     f"lever.\n"
-                    f"4. **Propose a structural fix** — the smallest "
+                    f"4. **Walk the boot sequence and audit preconditions.** "
+                    f"From cold start to the capability being registered and "
+                    f"ready, list each step (runner spawn → devshell entry → "
+                    f"sandbox setup → runtime start → readiness probe → build "
+                    f"root detect → build → MCP handshake, etc. — whatever the "
+                    f"actual sequence is for `{cap}`). For each step, answer "
+                    f"three questions: (a) what state does this step depend on "
+                    f"(env vars, files, pids, ports, sockets, processes)? "
+                    f"(b) who is responsible for putting that state there "
+                    f"before this step runs, and in what scope — shell, "
+                    f"devshell, sandbox, .mcp.json env, subprocess env? "
+                    f"(c) is that ownership *enforced* (asserted, failed-fast, "
+                    f"bind-mounted, baked into the derivation) or *assumed* "
+                    f"(expected to be present because an earlier step "
+                    f"happened to leave it there)? **Every 'assumed' "
+                    f"precondition is a candidate root cause.** Pay special "
+                    f"attention to seams where scope changes: host → sandbox, "
+                    f"runner-env → .mcp.json-env → subprocess-env, "
+                    f"interactive-shell → spawned-process. The T097 history "
+                    f"is a textbook example: ANDROID_BUILD_ROOT was set in "
+                    f".mcp.json but read from the runner's shell env — two "
+                    f"different scopes, nobody enforced the cross-scope "
+                    f"handoff.\n"
+                    f"5. **Propose a structural fix** — the smallest "
                     f"*architectural* change that makes the whole category of "
                     f"failure impossible. Examples: bake a known-good AVD "
                     f"path into the nix derivation; add an explicit "
@@ -9961,12 +11524,12 @@ class Runner:
                     f"state dir; collapse a wrapper + raw CLI into a single "
                     f"blessed entry point; move the runtime-boot check to "
                     f"after the state the runtime needs.\n"
-                    f"5. **Verify by cold re-run across the sandbox "
+                    f"6. **Verify by cold re-run across the sandbox "
                     f"boundary.** A meta-fix that holds in your shell but not "
                     f"under the runner's bwrap spawn is no fix at all. Prove "
                     f"the change sticks across (a) a fresh devshell "
                     f"re-entry, and (b) the runner's actual spawn path.\n"
-                    f"6. On your final message, follow the 'Finishing' "
+                    f"7. On your final message, follow the 'Finishing' "
                     f"section of the playbook and emit the `<claim>` trailer "
                     f"(required format below)."
                 )
@@ -10093,6 +11656,10 @@ class Runner:
 
             return rf"""{preamble}
 
+{required_reads}
+
+{ref_index}
+
 ## What "boot the runtime" means
 
 - `mcp-browser`: the runner runs `test/e2e/setup.sh` to start backend services
@@ -10113,7 +11680,6 @@ The run log is `{run_log_rel}` — grep for events tagged with
 {diag}
 {cross_attempt}
 {repeat_section}
-{playbook_section}
 {hypothesis_brief_section}
 {first_actions}
 
@@ -10804,11 +12370,15 @@ The crash log is also saved at `{crash_log_file}`.
                         project_dir=Path(spec_dir).parent if spec_dir else None)
                 return
 
-            # ── Resume check: skip explore if prior-run research is unfinished ──
-            # If findings.json already has open bugs and at least one lacks a
-            # research file, we were killed mid-cycle. Skip explore and let
-            # the existing research phase pick up only the un-researched bugs.
-            # This preserves research work already done for other bugs.
+            # ── Resume check: skip explore when findings are already actionable ──
+            # Two cases trigger resume:
+            #   1) mid-cycle kill — some open bugs lack research files; skip
+            #      explore so the research+fix phases pick up only those.
+            #   2) infrastructure findings — carry `category: "infrastructure"`
+            #      from an executor handoff or runner-crash synthesizer and are
+            #      ready-to-fix by construction (research-1.md already written).
+            #      Re-exploring would waste a planner+executor cycle proving
+            #      the app is still broken in the same way.
             skipped_explore_for_resume = False
             if findings_file.exists():
                 try:
@@ -10821,11 +12391,19 @@ The crash log is also saved at `{crash_log_file}`.
                         b for b in prior_open
                         if b.get("id") and _read_latest_research(e2e_dir, b["id"])[1] == 0
                     ]
-                    if prior_open and prior_missing_research:
+                    prior_infra = [
+                        b for b in prior_open
+                        if b.get("category") == "infrastructure"
+                    ]
+                    if prior_open and (prior_missing_research or prior_infra):
+                        reason = (
+                            f"{len(prior_missing_research)} lack research"
+                            if prior_missing_research else
+                            f"{len(prior_infra)} infrastructure finding(s)"
+                        )
                         e2e_log(
                             f"RESUME: {len(prior_open)} open bugs from prior run, "
-                            f"{len(prior_missing_research)} lack research — "
-                            f"skipping explore, resuming at research phase"
+                            f"{reason} — skipping explore, resuming at research/fix phase"
                         )
                         findings = prior_findings
                         skipped_explore_for_resume = True
@@ -10841,6 +12419,7 @@ The crash log is also saved at `{crash_log_file}`.
             else:
                 e2e_log(f"Phase 1: Explore (planner + executor loop)")
             explore_exit = 0
+            infra_blockers_this_iter: list[dict] = []
             if not skipped_explore_for_resume:
                 try:
                     task_block = _extract_task_block(str(task_file), task.id)
@@ -11016,6 +12595,30 @@ The crash log is also saved at `{crash_log_file}`.
                             if "Status: COMPLETE" in handoff_content:
                                 e2e_log(f"Executor {spawn_num} completed plan")
                                 break
+
+                            # Infrastructure-blocker short-circuit: if the
+                            # executor flagged repo-level defects that only
+                            # a source edit can fix, don't burn more
+                            # executor spawns — synthesize findings and
+                            # break into Phase 2 (fix agent).
+                            infra_blockers = _parse_infra_blockers(handoff_content)
+                            if infra_blockers:
+                                archive_p = exec_dir_p / f"handoff-spawn-{spawn_num}.md"
+                                archive_p.write_text(handoff_content)
+                                handoff_p.unlink()
+                                added = _synthesize_infra_findings(
+                                    e2e_dir, infra_blockers, iteration, spawn_num
+                                )
+                                infra_blockers_this_iter = infra_blockers
+                                e2e_log(
+                                    f"Executor {spawn_num} flagged "
+                                    f"{len(infra_blockers)} infrastructure "
+                                    f"blocker(s) — skipping remaining spawns, "
+                                    f"handing off to fix agent: "
+                                    f"{', '.join(added)}"
+                                )
+                                break
+
                             # PARTIAL — hand off to next spawn
                             # Archive so next spawn can reference path
                             archive_p = exec_dir_p / f"handoff-spawn-{spawn_num}.md"
@@ -11189,7 +12792,17 @@ The crash log is also saved at `{crash_log_file}`.
             # On resume, the current-iteration log doesn't exist, so live_evidence
             # will be 0 even for valid prior findings. The original run already
             # passed this check (otherwise no research files would exist), so skip.
-            if live_evidence == 0 and not skipped_explore_for_resume:
+            #
+            # Also skip when the executor flagged infrastructure blockers this
+            # iteration. Those are a legitimate no-live-evidence outcome: the
+            # executor couldn't interact because something upstream is broken,
+            # and it diagnosed the root cause. That *is* the evidence the fix
+            # phase needs — blocking here would clobber the handoff.
+            if (
+                live_evidence == 0
+                and not skipped_explore_for_resume
+                and not infra_blockers_this_iter
+            ):
                 cap_label = driver.capability if driver else "unknown"
                 mcp_status = driver.read_mcp_init_status(explore_log) if driver else None
                 status_note = (
@@ -11206,6 +12819,25 @@ The crash log is also saved at `{crash_log_file}`.
                     f"MCP server `{cap_label}` init status reported by agent: **{mcp_status}**.\n\n"
                     if mcp_status else ""
                 )
+                # If the executor wrote a handoff with diagnostic detail, surface
+                # it — the generic causes below are often wrong when the agent
+                # actually did reach a conclusion (e.g. a downstream API 500
+                # that platform-init can't detect). Pull the most recent
+                # handoff-spawn-*.md if present.
+                exec_dir_p = _executor_dir(e2e_dir)
+                latest_handoff_excerpt = ""
+                if exec_dir_p.exists():
+                    handoffs = sorted(exec_dir_p.glob("handoff-spawn-*.md"))
+                    if handoffs:
+                        try:
+                            latest = handoffs[-1].read_text()
+                            latest_handoff_excerpt = (
+                                f"## Latest executor diagnosis "
+                                f"(`{handoffs[-1].relative_to(Path.cwd()) if handoffs[-1].is_absolute() else handoffs[-1]}`)\n\n"
+                                f"```\n{latest[:4000]}\n```\n\n"
+                            )
+                        except OSError:
+                            pass
                 self.blocked_file.write_text(
                     f"# BLOCKED: {task.id} — explore agent produced no live evidence\n\n"
                     f"Platform: `{cap_label}`. {status_line}"
@@ -11216,16 +12848,20 @@ The crash log is also saved at `{crash_log_file}`.
                     f"This means the agent did not interact with the app via MCP "
                     f"(no screenshots taken, no UI elements tapped). "
                     f"Code review alone does not satisfy E2E validation.\n\n"
+                    f"{latest_handoff_excerpt}"
                     f"## Likely causes\n\n"
                     f"- MCP server for `{cap_label}` failed to connect (check the "
                     f"  agent log's `mcp_servers` init block for `status: failed`)\n"
                     f"- App/site crashed on startup (check platform-specific logs)\n"
+                    f"- Downstream service (API, auth, database) returning 5xx — "
+                    f"  platform-init doesn't probe app dependencies\n"
                     f"- Runtime not ready (emulator not booted / browser process "
                     f"  not launched / simulator not booted)\n"
                     f"- Agent ignored MCP tools and only read source code\n\n"
                     f"## To unblock\n\n"
-                    f"Check the explore agent's log in `logs/` to see what it "
-                    f"actually did. Fix the root cause, delete this file, then re-run.\n"
+                    f"Check the latest executor diagnosis above (if any), then the "
+                    f"explore agent's log in `logs/` to see what it actually did. "
+                    f"Fix the root cause, delete this file, then re-run.\n"
                 )
                 task.status = TaskStatus.FAILED
                 if hasattr(self, '_platform_manager'):
@@ -11878,7 +13514,20 @@ A previous agent completed this task, but the independent verifier rejected it. 
 
 """
 
+        _required = _required_reads_block(
+            "e2e-explore",
+            [
+                str(_REF_DIR / "mcp-e2e.md"),
+                str(_REF_DIR / "e2e-runtime.md"),
+            ],
+        )
+        _ref_index = _reference_index_pointer()
+
         return f"""You are an E2E exploration agent with access to MCP tools that let you interact with a running app.
+
+{_required}
+
+{_ref_index}
 
 ## Your mission
 
@@ -12035,7 +13684,19 @@ Plan ONLY the exploration needed to satisfy this task's "Done when" criteria. Do
 
         plan_file = e2e_dir / "plan.md"
 
+        _required = _required_reads_block(
+            "e2e-planner",
+            [str(_REF_DIR / "mcp-e2e.md")],
+        )
+        _ref_index = _reference_index_pointer()
+
         return f"""You are an E2E test planner. You produce an ordered step list for a Sonnet executor to walk through. You do NOT interact with the app — you only plan.
+
+{_required}
+
+Read the § Tool catalog rows so the steps you write reference real tool names. The executor will not make up tool names — if your plan calls a non-existent tool, the step blocks.
+
+{_ref_index}
 
 ## Your job
 
@@ -12171,7 +13832,19 @@ A previous attempt on the current step got stuck. A diagnostic agent analyzed it
 {unblock_context}
 </unblock>"""
 
+        _required = _required_reads_block(
+            "e2e-executor",
+            [str(_REF_DIR / "mcp-e2e.md")],
+        )
+        _ref_index = _reference_index_pointer()
+
         return f"""You are an E2E test executor. You follow a pre-written plan step-by-step and interact with the app via MCP tools. You do NOT improvise beyond the plan.
+
+{_required}
+
+The mcp-e2e § Findings format and § Context window management sections define the exact JSON shape and tool-budget rules you'll be evaluated against.
+
+{_ref_index}
 
 ## Your job
 
@@ -12218,6 +13891,38 @@ You have three ways to exit. Choose exactly ONE before you stop:
 ## Findings written
 [BUG-IDs added this spawn]
 ```
+
+**(B-infra) Partial with infrastructure blocker** — the app itself is up but every attempt to proceed hits a *repository-level* defect: wrong dependency version, service returning 500 on every call, missing env var, schema mismatch in a config file, emulator/host bridging not wired up by setup.sh, etc. Re-spawning another executor will not help — the blocker lives in the source tree, not on the screen. Use Status `PARTIAL` and include an `## Infrastructure blockers` section. When this section is present the runner skips the remaining executor spawns and hands straight to a fix agent that can edit source.
+
+```markdown
+# Executor handoff (spawn {spawn_num})
+
+## Status: PARTIAL
+
+## Steps completed this spawn
+- step-N: [short result]
+
+## Next step to resume at: step-M (after infrastructure fix)
+
+## Infrastructure blockers
+### BLOCKER-<slug>
+- **Symptom** [one line, concrete — e.g. "POST /auth/signin returns 500 for every credential"]
+- **Evidence** [log line, curl output, version numbers, file paths + line numbers]
+- **Suspected root cause** [one sentence]
+- **Suggested fix location** [file path(s) you think need editing]
+- **How a fix agent can verify** [one short check — e.g. "curl /apiversion and confirm max CDI ≥ 5.4"]
+
+### BLOCKER-<next-slug>
+...
+
+## State left behind
+[As in option B]
+
+## Findings written
+[As in option B]
+```
+
+Use BLOCKER-slug IDs (e.g. `BLOCKER-supertokens-cdi-mismatch`), not BUG-NNN — the runner uses the slug to key the synthesized finding. One block per distinct infrastructure defect. Do NOT put bugs in the app (wrong text on screen, broken navigation, flaky UI) here — those are findings.json entries. Infrastructure blockers are the ones a fix agent would solve by editing flake.nix, package.json, setup.sh, a service config file, or similar.
 
 **(C) Blocked — cannot proceed on current step** — you tried a step, it didn't produce the expected result, you tried ONE alternate approach (different selector / waited and retried), and it still didn't work, AND you cannot tell if the mismatch is a bug to file or a precondition you got wrong. Write `{blocker_file}`:
 ```markdown
@@ -12508,13 +14213,53 @@ For each bug above:
    depend on it.
 """
 
+        # Detect any infrastructure-category findings and give the agent
+        # explicit framing. These originate from executor handoffs with an
+        # `## Infrastructure blockers` section — see _parse_infra_blockers.
+        infra_ids = [
+            b.get("id", "")
+            for b in open_bugs
+            if b.get("category") == "infrastructure"
+        ]
+        infra_section = ""
+        if infra_ids:
+            infra_section = (
+                "## Infrastructure findings\n\n"
+                f"The following findings are repository-level defects rather than "
+                f"app-level bugs: {', '.join(infra_ids)}. For these, you should "
+                "edit config/build/dependency files (e.g. `flake.nix`, "
+                "`package.json`, lockfiles, service config, `setup.sh`, env "
+                "templates) — not UI code. They have no "
+                "steps-to-reproduce in the UI sense; the `research-1.md` file "
+                "in the bug directory contains the executor's full report. "
+                "Read that first. After fixing, verify your fix matches the "
+                "\"How a fix agent can verify\" check from the report.\n"
+            )
+
+        _required = _required_reads_block(
+            "e2e-fix",
+            [
+                str(_REF_DIR / "fix-agent-playbook.md"),
+                str(_REF_DIR / "e2e-failure-patterns.md"),
+            ],
+        )
+        _ref_index = _reference_index_pointer()
+
         return f"""You are an E2E fix agent. Your job is to fix ALL reported bugs in a single batch pass.
+
+{_required}
+
+The playbook's § Core principle (reproduce before hypothesizing) and § Default fix preference order tell you what shape a good fix takes. The patterns library covers known infrastructure failure signatures.
+
+{_ref_index}
 
 ## Bugs to fix ({len(open_bugs)} total)
 
 <findings>
 {bugs_summary}
 </findings>
+
+{infra_section}
 
 {research_sections}
 
@@ -12576,7 +14321,19 @@ For each bug above:
             observed_hint = ("[Snapshot / hierarchy / tree excerpt showing the relevant UI "
                              "element(s). Paste the exact output.]")
 
+        _required = _required_reads_block(
+            "e2e-verify",
+            [str(_REF_DIR / "mcp-e2e.md")],
+        )
+        _ref_index = _reference_index_pointer()
+
         return f"""You are an E2E verify agent with access to MCP tools. Your job is to verify bug fixes, produce structured evidence, and find new bugs.
+
+{_required}
+
+The mcp-e2e § Findings format defines the exact verify-evidence shape. The fix agent reads what you write — concrete deltas only.
+
+{_ref_index}
 
 ## CRITICAL: Context window management
 
@@ -12915,7 +14672,10 @@ Follow the supervisor's guidance on what to investigate.
 
 {summaries_text}"""
 
-        # Build fix attempt history summary
+        # Build fix attempt history summary.
+        # Verify evidence is the single most useful artifact for the
+        # research agent — it carries the structured "Delta:" line the
+        # verifier wrote. 300 chars truncates that line; bump to 2000.
         attempts_section = ""
         attempts = history.get("fix_attempts", [])
         if attempts:
@@ -12924,7 +14684,7 @@ Follow the supervisor's guidance on what to investigate.
                 lines.append(
                     f"- **Attempt {a['attempt']}**: {a['approach']}\n"
                     f"  Result: {a['verify_status']}\n"
-                    f"  Evidence: {a['verify_evidence'][:300]}"
+                    f"  Evidence: {a['verify_evidence'][:2000]}"
                 )
             attempts_section = f"""## Previous fix attempts (all failed)
 
@@ -12935,7 +14695,19 @@ These approaches have already been tried and failed. Do NOT recommend any of the
 
         next_idx = (prev_idx or 0) + 1
 
+        _required = _required_reads_block(
+            "e2e-research",
+            [str(_REF_DIR / "fix-agent-playbook.md")],
+        )
+        _ref_index = _reference_index_pointer()
+
         return f"""You are a research agent investigating a specific bug before a fix agent attempts to resolve it.
+
+{_required}
+
+The playbook tells you what a *good* fix looks like — research that doesn't lead to one of those is incomplete. Read § Default fix preference order and § What NOT to do before recommending an approach.
+
+{_ref_index}
 
 ## Bug details
 
@@ -13059,7 +14831,53 @@ were reached. Do NOT repeat strategies that previous supervisors already rejecte
 </research>
 """
 
+        # Pre-compute oscillation signature so the supervisor doesn't have
+        # to derive it from raw JSON. Oscillation = the same approach
+        # signature appearing more than once non-consecutively.
+        oscillation_note = ""
+        if attempts:
+            sigs = []
+            for a in attempts:
+                approach = (a.get("approach") or "").strip()
+                # Reduce to a stable signature: first 80 chars after
+                # lowercasing + stripping whitespace runs.
+                sig = re.sub(r"\s+", " ", approach.lower())[:80]
+                sigs.append(sig)
+            seen: dict[str, list[int]] = {}
+            for i, s in enumerate(sigs, 1):
+                seen.setdefault(s, []).append(i)
+            repeats = {s: idxs for s, idxs in seen.items() if len(idxs) > 1}
+            if repeats:
+                lines = [
+                    f"- Approach signature `{s[:60]}…` repeated at attempts "
+                    + ", ".join(str(i) for i in idxs)
+                    for s, idxs in repeats.items()
+                ]
+                oscillation_note = (
+                    "## Oscillation signal (pre-computed)\n\n"
+                    "The runner detected repeated approach signatures across "
+                    "attempts:\n\n"
+                    + "\n".join(lines)
+                    + "\n\nIf the repeats are non-consecutive, that is "
+                    "oscillation between two failing strategies — strong "
+                    "signal for REDIRECT_RESEARCH with new questions.\n"
+                )
+
+        _required = _required_reads_block(
+            "e2e-bug-supervisor",
+            [str(_REF_DIR / "fix-agent-playbook.md")],
+        )
+        _ref_index = _reference_index_pointer()
+
         return f"""You are a bug supervisor agent. A specific bug has failed to be fixed after multiple attempts. Review the history and decide the next action.
+
+{_required}
+
+The playbook's § Default fix preference order tells you which kinds of fix to favor over which — useful when comparing two viable strategies.
+
+{_ref_index}
+
+{oscillation_note}
 
 ## Bug details
 
@@ -13413,7 +15231,7 @@ def main():
             nix_cmd = ["nix", "develop", "--command"]
             probe = subprocess.run(
                 nix_cmd + ["true"],
-                capture_output=True, timeout=120,
+                capture_output=True,
             )
             if probe.returncode != 0 and b"unfree" in probe.stderr:
                 print(

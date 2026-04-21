@@ -2,6 +2,57 @@
 
 Every spec-kit project MUST include comprehensive integration tests that validate all user flows end-to-end. This is non-negotiable — without working tests, the autonomous fix-validate loop that powers implementation is blind.
 
+## Test tier taxonomy (READ THIS FIRST)
+
+Three tiers, strict boundaries. Writing a test at the wrong tier is a common failure that wastes validation cycles and hides bugs. Use this table when deciding where a new test goes.
+
+| Tier | What it tests | What it runs against | Infrastructure | File convention | Runs when |
+|---|---|---|---|---|---|
+| **Unit** | A single function, class, or module in isolation | In-process only — no network, no DB, no services. Pure logic. | None beyond the language runtime. | `*.test.ts` / `*_test.go` / etc. | Every build / pre-commit / CI |
+| **Integration** | A complete app-layer flow end-to-end *inside one process boundary* (e.g. HTTP request → handler → real DB → real auth → response) | Live services — real Postgres, real auth server, real API — brought up by the project's service harness (`test/e2e/setup.sh` or equivalent) | Service stack (DB, auth, API) — **NOT** the mobile emulator, browser, or UI runtime | `*.integration.test.ts` / `*_integration_test.go` / etc. | Every build, with service stack live. Gates the E2E tier. |
+| **E2E** | The *user-visible* behavior across runtime boundaries (mobile app → API → DB; browser → API → DB). Driven via MCP / Playwright / Patrol. | Full stack *plus* the platform runtime (Android emulator, iOS simulator, browser) | Everything integration needs **plus** the runtime | `*.e2e.test.ts` / `test/e2e/*.ts` / etc. | Only after integration tier is green (see "Pre-E2E gate" below) |
+
+### Key rules that follow from the taxonomy
+
+1. **Integration tests never touch the emulator / simulator / browser.** If a test needs to drive UI, it's E2E, not integration. Put it under `test/e2e/` or `*.e2e.test.ts`.
+2. **E2E tests never substitute for integration tests.** An MCP-driven test exercising the login flow through the app does not count as coverage for the `/auth/signin` endpoint — write the integration test too. E2E is ~100× slower to diagnose; integration catches the same bugs ~100× faster.
+3. **Unit tests never substitute for integration tests.** A unit test with a mock DB verifies that your code *calls* the DB correctly; it doesn't verify that the *query actually works* against real Postgres. Cross-boundary bugs (schema mismatch, transaction isolation, query plan errors) are invisible to unit tests.
+4. **No mocking inside a tier's boundary.** Integration tests don't mock the DB or the auth server — those are *inside* the integration tier boundary. Unit tests don't mock internal modules — those are *inside* the unit tier boundary. Mocks are only appropriate at the boundary of the tier itself (e.g. a unit test may mock a third-party HTTP client; an integration test may stub a third-party SaaS API that costs money per call).
+5. **File-name convention is load-bearing.** The runner uses it to decide which tier to run when. `*.integration.test.ts` runs in the pre-E2E gate (needs live services). Pure unit `*.test.ts` runs in the implement-phase validator. Miscategorizing files breaks the gate.
+6. **Tests that can't run in the standard environment go in their own tier.** If a test genuinely requires something the project can't auto-provision (paid third-party API, hardware security key), put it in a separate file pattern (`*.external.test.ts`) and exclude it from the default test run via `include`/`exclude` config — **not** via runtime skip guards. See "Zero-skips rule" below.
+7. **Every E2E flow has a user-flow integration-test mirror.** For every task in the E2E tier (`[needs: e2e-loop]` tasks), there MUST be a corresponding user-flow integration test under `src/flows/<flow-name>.integration.test.ts` (or equivalent) that walks the same multi-step business flow via direct API calls. Same flow the E2E drives through the UI, same steps, same assertions on final state — just without the emulator/browser. These mirror tests are faster (seconds vs minutes), they are the first place to look when the E2E fails (the mirror tells you whether the bug is in the API layer or past it), and they close the gap where an E2E passes but the underlying flow has a subtle bug only a multi-step integration test would catch. When generating the task list during the `tasks` phase, every E2E task description SHOULD be paired with a `flows/*` integration-test task that precedes it.
+8. **Integration-tier tasks run sequentially, never in parallel.** Integration tests share the same Postgres/SuperTokens/API instance (brought up by `test/e2e/setup.sh`); parallel tasks would interleave fixture data, step on each other's teardown, and fight over ports. Never mark an integration-test task with `[P]`. The `tasks` phase generator MUST keep integration-test tasks sequential. (True parallelism needs per-task DB schemas, ephemeral ports, and worktree isolation — infra scope beyond what spec-kit provides out of the box.)
+
+### Pre-E2E gate
+
+Before any `[needs: e2e-loop]` task's MCP crawl, the runner automatically:
+
+1. Brings up the backend service stack via `test/e2e/setup.sh`. Setup.sh MUST write `test/e2e/.state/env.sh` with `export` statements for every var the tests need (`DATABASE_URL`, `SUPERTOKENS_CONNECTION_URI`, etc.); the gate sources this file before running tests. See `reference/mcp-e2e.md` § "Backend service connection info" for the file format.
+2. If setup fails, spawns a dedicated **services-fix agent** (independent budget, scoped to infra files — `setup.sh`, `flake.nix`, config files, version pins; NOT app code) that retries until the stack is healthy.
+3. Runs the project's integration test command (discovered from `package.json`, `Makefile`, etc.) against the live services, with `env.sh` sourced into the test subprocess.
+4. On test failure or skip, synthesizes INFRA findings and spawns an **integration-test fix agent** that edits app code or test code to resolve them. The loop keeps going as long as each round makes progress (reduces open-bug count OR changes the failure shape).
+5. **Escalation ladder on stall:** `regular fix agent → meta-fix agent (structural redesign) → BLOCKED.md`. Same shape as the platform-init loop. The meta-fix agent gets the full gate log, `setup.sh` source, prior claims, and is told to attack the structural cause — not the surface symptom.
+6. Only after the gate is green does the emulator boot, the APK build, and the MCP crawl start.
+
+This means an agent whose tests pass at the integration tier gets fast feedback. An agent whose tests fail at the integration tier never burns emulator minutes discovering the same bug. An agent who wrote their integration test with a skip guard, or put it at the wrong tier, will trip the gate immediately rather than having it discovered by a downstream E2E.
+
+**Corollary: integration-tier coverage is how you get E2E to run.** If the integration tier doesn't exercise the feature, the E2E gate can't verify its preconditions, and the feature never gets to the crawl. Agents who try to skip straight to E2E will be blocked by the gate.
+
+### Structural causes to investigate when the integration-test fix loop stalls
+
+When the regular fix agent has tried multiple rounds without making the gate green, the meta-fix agent is invoked with a broader charter. The common structural causes — the ones the regular fix agent chronically misses because they're one layer up from the immediate error — are:
+
+1. **Env propagation gap between setup.sh and the test subprocess.** `setup.sh` exports `DATABASE_URL` into its own shell; that shell exits; the runner spawns `pnpm test` with an environment that doesn't have the var; every test fails with "X is required." Fix: write `test/e2e/.state/env.sh` and let the runner source it. This is the #1 cause of new-project stalls.
+2. **Service version vs client library version mismatch.** The library speaks protocol N+1; the service speaks N. Bump the service pin in `scripts/<service>-setup.sh` / `flake.nix` or downgrade the library in `package.json`.
+3. **Wrong tier placement.** A file under `*.integration.test.ts` actually requires a UI runtime / emulator / paid external API. Move it to `*.e2e.test.ts` / `*.external.test.ts` / a separate `include` pattern.
+4. **Test helper reading from the wrong source.** `requireDatabaseUrl()` reads `process.env["DATABASE_URL"]`, but the runner passes it as a config object or `.env` file. Align the two sides.
+5. **Stale cached state.** Liquibase migration history doesn't match the DB; `.dev/pgdata/` has schema from an older run; `runner-verified.json` carries false green; `findings.json` has entries for bugs that no longer exist. Clearing the specific cache is a valid fix when justified.
+6. **Schema drift between app version and DB state.** Fresh `api/src/db/schema/*.ts` adds a column that the migration in `api/migrations/*.xml` forgot. Add the missing changelog OR re-seed the DB.
+7. **Services running but the API they serve is broken.** Postgres + SuperTokens are both healthy, but the API fails to boot because of a TypeScript compile error, missing env var, or missing dependency. Symptom looks like "integration tests can't connect"; root cause is the API process, not the service stack. Check `test/e2e/.state/api.log` for the API startup error.
+8. **Port conflict from a prior run.** A ghost process holds port 3000 / 3567 / 5432; setup.sh's idempotent start thinks the port is "in use, probably mine" and skips, but the ghost is from a crashed prior session. Fix: `teardown.sh` must kill on port, not just on PID file.
+
+The meta-fix agent should state ONE structural hypothesis, apply ONE fix, and verify by running the failing test command manually. Chasing multiple hypotheses in parallel is exactly what the regular fix agent was doing — that approach is what the meta-fix is escalating *away* from.
+
 ## Philosophy: real servers, real processes, no mocks at system boundaries
 
 Tests MUST exercise the real system wherever possible. The hierarchy of preference:
@@ -39,6 +90,51 @@ The fix-validate loop depends on **structured, machine-readable test output**. W
 5. **Custom test reporter**: use the test runner's reporter API (Node.js native test runner custom reporter, JUnit RunListener, pytest plugin, etc.) to produce this format
 6. **Non-vacuous assertion**: after producing `summary.json`, the test harness or CI step MUST verify that `pass + fail > 0`. A summary reporting 0 passed / 0 failed means tests didn't run — this MUST be treated as a failure, not a pass. See `reference/cicd.md` § "Non-vacuous CI validation" for the CI-level enforcement pattern.
 7. **Skip-as-failure assertion**: a test run that contains any skipped tests MUST be treated as a failure, not a pass. Skipped tests mean the environment is broken or a dependency is missing — the test suite is giving false confidence. If a test genuinely cannot run on a platform (e.g., iOS tests on Linux), it should not be included in the test list for that platform at all — use conditional test registration, not runtime skips. The test harness MUST enforce this: if `skip > 0`, the run fails. See `reference/cicd.md` § "Skip-as-failure CI validation" for the CI-level enforcement pattern.
+
+### Zero-skips rule (MANDATORY — no exceptions, no opt-outs)
+
+**If a test did not run, it is a skip. Skips fail the build. There is no escape hatch.**
+
+The harness MUST have **one mode only**: skips fail. There is no "strict mode" flag, no `--allow-skips`, no env var that loosens the rule in dev. A reporter that only fails on skips when a flag is set is the same loophole as not having the rule — agents disable the flag and the silent-skip returns.
+
+**Banned patterns (non-exhaustive):**
+
+| Banned | Why it fails the rule |
+|---|---|
+| `describe.skip(...)` / `it.skip(...)` in source that ships | Test is unreachable at runtime — silent skip |
+| `const canRun = X; const d = canRun ? describe : describe.skip` | Conditional runtime skip — exactly what the rule forbids |
+| `async beforeAll() { if (!await svcUp()) return; }` | Setup bails silently; the `it()` blocks run against an uninitialized fixture and pass vacuously (or skip) |
+| `if (!flag) return;` at the top of every `it()` | Body never executes; test reports pass with no assertions |
+| `try { ...setup... } catch { /* log and return */ }` in beforeAll | Setup failure is swallowed; tests that follow pass vacuously |
+| `t.Skip("requires GPU")` in committed code | Runtime skip; see CI rule |
+| `@pytest.mark.skipif(cond, ...)` | Same class of loophole; remove the condition |
+| `STRICT_TEST_MODE`-style flags that gate skip enforcement | The permissive mode is the problem. Delete the flag, make strict the only mode. |
+
+**Correct pattern — fail-fast asserts in setup:**
+
+```ts
+beforeAll(async () => {
+  // Throw instead of skip. Loud failure. No silent pass.
+  const url = process.env.DATABASE_URL;
+  if (!url) throw new Error("DATABASE_URL required; start services with `process-compose up`");
+  if (!(await fetch("http://localhost:3567/hello")).ok) {
+    throw new Error("SuperTokens must be running on :3567");
+  }
+  // ... real setup ...
+});
+```
+
+If a test would have been skipped for a missing service, the fix is to **make the service available** (start it in the harness, add it to the dev environment, provision test credentials) — not to gate the test.
+
+**Platform gap, not runtime skip:** If a test physically cannot run in a given environment (iOS tests on Linux, emulator-only Android tests on PR runners), it must be excluded at test-list-building time, not skipped at runtime. Options:
+
+- Separate file pattern (e.g. `*.integration.test.ts` vs `*.ios.test.ts`) with different `vitest --include` / CI matrix
+- Separate test script (`pnpm test` vs `pnpm test:ios`)
+- Build-time feature flags that omit the test source entirely from the target environment's build
+
+The distinction: a test that's **absent from the test list** isn't a skip. A test that's **in the list but didn't execute** is a skip and fails the build.
+
+**Runner-enforced:** The spec-kit runner sets `skip > 0` to a phase-validation FAIL regardless of what the reporter says. Even if a project's harness gets a permissive mode smuggled back in, the runner refuses to accept skips. A test that depends on a live service must cause a loud failure when the service isn't reachable — not a silent pass.
 
 Example `summary.json`:
 ```json
