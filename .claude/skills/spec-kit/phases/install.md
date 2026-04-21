@@ -24,3 +24,89 @@
 - Check if `.specify/` exists in the current directory.
   - **If it exists** → this is an existing spec-kit project. Tell the user and proceed to phase detection.
   - **If not** → ask the user for a project name, then init.
+
+## Bootstrap code-review-graph (MANDATORY)
+
+**The knowledge graph must be wired up before anything else.** Every
+downstream phase consumes it — skipping this step leaves the rest of the
+workflow blind to the existing codebase.
+
+Full spec: `reference/code-review-graph.md`. Load that file now if you
+haven't already.
+
+1. **Locate the skill's flake**: it lives at
+   `.claude/skills/spec-kit/code-review-graph/flake.nix` inside the
+   agent-framework checkout (single source of truth, pinned to v2.3.2).
+
+2. **Add as an input to the project's `flake.nix`**:
+
+   ```nix
+   inputs = {
+     # ... existing inputs ...
+     code-review-graph.url = "path:/home/max/git/agent-framework/.claude/skills/spec-kit/code-review-graph";
+   };
+   ```
+
+   Add `code-review-graph` to the `outputs` function arguments.
+
+3. **Pull the package + shellHook** in the devShell:
+
+   ```nix
+   let
+     crg = code-review-graph.packages.${system}.code-review-graph;
+     crgHook = code-review-graph.lib.${system}.mkShellHook {
+       projectName = "<your-project-name>";
+       watch = true;      # keep graph fresh as files change
+       serveMcp = false;  # set true if the project wants an MCP server
+       # extend excludeDirs if the project has large generated dirs
+     };
+   in pkgs.mkShell {
+     packages = [ crg /* ... */ ];
+     shellHook = crgHook + ''
+       # existing shellHook content
+     '';
+   }
+   ```
+
+4. **Add `.code-review-graph/` to `.gitignore`** (SQLite db + logs + pid
+   files — must never be committed):
+
+   ```gitignore
+   # code-review-graph state
+   .code-review-graph/
+   ```
+
+5. **Install the CLAUDE.md stanza** so every agent spawned in this project
+   reads graph-usage guidance automatically (no prompt-builder edits
+   needed in parallel_runner.py):
+
+   - Read the template at
+     `.claude/skills/spec-kit/code-review-graph/CLAUDE-STANZA.md` (inside
+     the agent-framework checkout)
+   - Copy everything between the `---BEGIN-STANZA---` and
+     `---END-STANZA---` markers
+   - Append it to the project's `CLAUDE.md` (create one if it doesn't
+     exist). Place it after any existing project-specific sections.
+   - If the stanza is already present (idempotent re-runs), skip.
+
+6. **Verify the bootstrap**:
+
+   ```bash
+   nix develop --command bash -c 'code-review-graph --version && ls .code-review-graph/'
+   grep -q "code-review-graph — always use the knowledge graph" CLAUDE.md && echo "CLAUDE.md stanza installed"
+   ```
+
+   Expected: `code-review-graph 2.3.2`, plus `build.log`, `build.pid`,
+   `watch.log`, `watch.pid` files in `.code-review-graph/`, and the
+   CLAUDE.md grep match. The initial graph build runs **async** — don't
+   block on it; subsequent phases can poll for `.code-review-graph/graph.db`
+   (or `code_graph.db`) if they need a fully-built graph.
+
+7. **Record in interview-notes** (if/when the interview starts):
+   `code-review-graph: wired at phase 0, watcher active, CLAUDE.md stanza installed`.
+
+**If the project is not Nix-based** (no `flake.nix`, no `which nix`): the
+skill still expects code-review-graph to be available. Document the fallback
+install in `reference/code-review-graph.md` (`pipx install
+code-review-graph==2.3.2`) but prefer Nix whenever possible — the watcher
+lifecycle management in `mkShellHook` is nontrivial to replicate by hand.

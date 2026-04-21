@@ -2183,6 +2183,43 @@ def _detect_bwrap() -> Optional[str]:
     return None
 
 
+# ── code-review-graph integration ─────────────────────────────────────
+#
+# The graph is a first-class spec-kit dependency.  Agent-facing guidance
+# lives in the project's CLAUDE.md (installed by phases/install.md), so
+# every spawned agent auto-reads it.  The runner's only runtime job is
+# keeping the graph fresh at phase boundaries via `update`.
+
+_crg_available: Optional[bool] = None  # memoized — set on first call
+
+
+def _detect_code_review_graph() -> bool:
+    """True if `code-review-graph` is on PATH.  Memoized."""
+    global _crg_available
+    if _crg_available is None:
+        _crg_available = shutil.which("code-review-graph") is not None
+    return _crg_available
+
+
+def _code_review_graph_update(timeout: int = 120) -> None:
+    """Run `code-review-graph update` synchronously at phase boundaries.
+
+    Ensures the graph reflects the latest commits before the next
+    implementation/validation/review agent spawns.  No-op when the binary
+    isn't available.  Errors are swallowed — a stale graph is better than
+    a crashed runner.
+    """
+    if not _detect_code_review_graph():
+        return
+    try:
+        subprocess.run(
+            ["code-review-graph", "update"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
 # ── GitHub token acquisition ──────────────────────────────────────────
 
 _gh_token_cache: Optional[str] = None
@@ -7777,6 +7814,11 @@ class Runner:
                         f"not spawning (see {fail_file})"
                     )
                     continue
+
+                # Refresh the knowledge graph so the review sees post-phase
+                # commits.  Fast and idempotent; no-op when code-review-graph
+                # isn't installed.  See reference/code-review-graph.md.
+                _code_review_graph_update()
 
                 prompt = build_validate_review_prompt(
                     spec_dir, str(task_file), phase, str(learnings_file),

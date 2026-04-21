@@ -56,6 +56,7 @@ reference/           # Enterprise knowledge base — loaded on demand by phase f
   agent-file-schemas.md # IC-AGENT-* schemas for every cross-agent file (findings.json, plan.md, handoff.md, etc.) — the runner parses specific anchors
   verification.md    # Deterministic completion-claim verification rules
   stripe.md          # Stripe / payment integration: listener scripts, env pattern, webhook contract, RUNBOOK, live-key guardrails
+  code-review-graph.md # code-review-graph first-class integration: flake pinning, shellHook, per-phase usage, runner wiring, continuous refresh
   cost-reporting.md  # Post-hoc cost & effectiveness analysis via cost_report.py (reads run-log.jsonl, outputs per-model/per-phase dollar breakdown)
 presets/             # Quality presets — loaded once per project
   poc.md             # Proof of concept
@@ -152,6 +153,70 @@ Load `reference/stripe.md` — it is the full knowledge base. The generated bund
 ### Future-proofing
 
 The initial implementation is Stripe-specific. If a future project uses a different payment processor (Braintree, Adyen, Paddle), the **shape** transfers directly — webhook-listener lifecycle scripts, publishable-key dual delivery, env sync, live-key guardrails. Only the SDK names change. `reference/stripe.md` explicitly documents this so a future `reference/braintree.md` (or whatever) can follow the same pattern.
+
+## Code-review-graph — MANDATORY first-class dependency
+
+**code-review-graph** is as load-bearing as Nix itself. Set it up **first**,
+before any other project scaffolding, and keep it running for the entire
+lifetime of the project. The full knowledge base lives in
+`reference/code-review-graph.md` — load that whenever the current phase
+touches the graph. This section is the dispatcher: what to do, when, and why.
+
+### Why first-class
+
+The graph is the canonical answer to "what exists in this codebase and how
+does it connect". Every SDD phase benefits:
+
+- **Interview**: detect prior patterns so the spec doesn't duplicate them
+- **Plan**: topology-aware architecture (real modules, not invented names)
+- **Tasks**: file-overlap detection for parallel-safety
+- **Implement**: agents query the graph before adding new code
+- **Review**: impact analysis replaces raw `git diff` as the starting point
+
+The graph is **built once, kept fresh forever** via a background watcher
+(shellHook) plus explicit `update` calls at phase boundaries (runner).
+
+### Bootstrap (every project, every time, first)
+
+1. **Confirm the skill's flake is reachable**:
+   `.claude/skills/spec-kit/code-review-graph/flake.nix` must exist — it
+   owns the pinned v2.3.2 derivation.
+2. **Wire into the project's `flake.nix`** (see `reference/code-review-graph.md`
+   for the exact snippet). Required: add `code-review-graph` as an input,
+   pull `packages.<system>.code-review-graph` into the devShell, call
+   `lib.<system>.mkShellHook` and prepend the result to the devShell's
+   `shellHook`.
+3. **Add `.code-review-graph/` to `.gitignore`** — the SQLite graph db and
+   watcher logs live there and must not be committed.
+4. **Verify**: `nix develop --command code-review-graph --version` should
+   print `code-review-graph 2.3.2` and background the initial build.
+
+Do this before the constitution, spec, or any other phase.
+
+### Per-phase usage (summary — full detail in reference)
+
+| Phase | Graph use |
+|-------|-----------|
+| 0 install | Bootstrap (above) |
+| 2 specify | `code-review-graph wiki` → `specs/<feature>/existing-architecture.md` before interview |
+| 5 plan | Query graph for module topology; reference real high-fan-in nodes |
+| 6 tasks | Cross-check task file-overlap; mark conflicting tasks serial |
+| 7 implement | Agent prompt includes graph CLI cheat-sheet; "query before you add" |
+| review | Runner injects `detect-changes --since <base>` output into review prompt |
+
+### Continuous refresh — who owns what
+
+| Event | Refresh mechanism |
+|-------|-------------------|
+| File edit in devshell | `watch` picks it up live (shellHook) |
+| Task commit | runner runs `update` after commit |
+| Phase complete | runner runs `update` before review |
+| Branch switch / pull | developer re-enters devshell, watcher resyncs |
+
+Never bypass this — a stale graph is worse than no graph, because it
+confidently hands agents wrong information.
+
+---
 
 ## Agent sandboxing
 
@@ -268,7 +333,10 @@ dist/
 
 ### Step 1: Ensure spec-kit is installed and project exists
 
-Read and follow `phases/install.md`.
+Read and follow `phases/install.md`. The install phase **must** bootstrap
+code-review-graph (see "Code-review-graph — MANDATORY first-class dependency"
+above) before any other scaffolding. The graph is used by every subsequent
+phase, so it must exist before they start.
 
 ### Step 2: Detect current state and guide the user
 

@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+
+# Nix build output symlinks
+result
+result-*
