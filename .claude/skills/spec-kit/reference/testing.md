@@ -81,13 +81,29 @@ This is NOT the same as mocking — the stub runs as a real child process with r
 
 ## Structured test output for agent-readable failure logs
 
-The fix-validate loop depends on **structured, machine-readable test output**. Without it, the implementing agent can't diagnose failures efficiently. Every project MUST implement:
+The fix-validate loop depends on **structured, machine-readable test output**. Without it, the implementing agent can't diagnose failures efficiently.
 
-1. **Test log directory**: `test-logs/<type>/<timestamp>/` (gitignored)
-2. **`summary.json`** per run: `{ pass: number, fail: number, skip: number, duration: number, failures: string[] }`
-3. **`failures/<test-name>.log`** per failing test: assertion details (expected vs actual), full stack trace, and relevant context (server logs, captured stderr, request/response bodies)
+> **Canonical schema and reference reporters live in [`templates/`](templates/).**
+> Do NOT invent a new schema. Drop in the template that matches your test runner
+> and customise the `RUN_TYPE` — don't fork the schema.
+>
+> - **Schema contract (read first):** [`templates/EXAMPLE-OUTPUT.md`](templates/EXAMPLE-OUTPUT.md)
+> - **Vitest (Node/TS):** [`templates/test-reporter-vitest.ts`](templates/test-reporter-vitest.ts)
+> - **pytest (Python):** [`templates/test-reporter-pytest.py`](templates/test-reporter-pytest.py)
+> - **Go:** [`templates/test-reporter-go.go`](templates/test-reporter-go.go)
+>
+> Agents diagnosing failures read `test-logs/summary.json` (the schema) and
+> the pointed-to `failures/<name>.log` files. They do NOT parse raw stdout,
+> and they do NOT read reporter source to learn the schema — the example
+> output is the contract.
+
+Every project MUST implement:
+
+1. **Test log directory**: `test-logs/<type>/<timestamp>/` (gitignored), plus a latest pointer at `test-logs/summary.json`
+2. **`summary.json`** per run with the canonical schema (see [`templates/EXAMPLE-OUTPUT.md`](templates/EXAMPLE-OUTPUT.md)): `{ timestamp, duration_ms, type, pass, fail, skip, total, command, failures: string[], results: object[] }`
+3. **`failures/<test-name>.log`** per failing test: assertion details (expected vs actual), full stack trace, and relevant context (server logs, captured stderr, request/response bodies). Filename sanitization rules in EXAMPLE-OUTPUT.md.
 4. **Passing tests**: one-line summary only (name + duration) — don't clutter output
-5. **Custom test reporter**: use the test runner's reporter API (Node.js native test runner custom reporter, JUnit RunListener, pytest plugin, etc.) to produce this format
+5. **Custom test reporter**: use the drop-in template for your runner. If your runner isn't covered, follow the schema contract in EXAMPLE-OUTPUT.md exactly.
 6. **Non-vacuous assertion**: after producing `summary.json`, the test harness or CI step MUST verify that `pass + fail > 0`. A summary reporting 0 passed / 0 failed means tests didn't run — this MUST be treated as a failure, not a pass. See `reference/cicd.md` § "Non-vacuous CI validation" for the CI-level enforcement pattern.
 7. **Skip-as-failure assertion**: a test run that contains any skipped tests MUST be treated as a failure, not a pass. Skipped tests mean the environment is broken or a dependency is missing — the test suite is giving false confidence. If a test genuinely cannot run on a platform (e.g., iOS tests on Linux), it should not be included in the test list for that platform at all — use conditional test registration, not runtime skips. The test harness MUST enforce this: if `skip > 0`, the run fails. See `reference/cicd.md` § "Skip-as-failure CI validation" for the CI-level enforcement pattern.
 
@@ -136,17 +152,22 @@ The distinction: a test that's **absent from the test list** isn't a skip. A tes
 
 **Runner-enforced:** The spec-kit runner sets `skip > 0` to a phase-validation FAIL regardless of what the reporter says. Even if a project's harness gets a permissive mode smuggled back in, the runner refuses to accept skips. A test that depends on a live service must cause a loud failure when the service isn't reachable — not a silent pass.
 
-Example `summary.json`:
+Minimal `summary.json` (canonical schema — see [`templates/EXAMPLE-OUTPUT.md`](templates/EXAMPLE-OUTPUT.md) for the full schema with `results[]`):
 ```json
 {
+  "timestamp": "2026-04-20T14:03:17.412Z",
+  "duration_ms": 12340,
+  "type": "integration",
   "pass": 42,
   "fail": 2,
   "skip": 1,
-  "duration": 12340,
+  "total": 45,
+  "command": "pnpm test",
   "failures": [
     "session-lifecycle: start → blocked → resume",
     "ssh-bridge: sign request timeout"
-  ]
+  ],
+  "results": []
 }
 ```
 

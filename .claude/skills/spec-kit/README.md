@@ -155,7 +155,6 @@ presets/                ← Quality presets, loaded once per project
   extension.md          ← Browser / IDE extension
   public.md             ← Single-user public-facing
   enterprise.md         ← Multi-user production
-run-tasks.sh            ← Bash wrapper for parallel_runner.py
 parallel_runner.py      ← Task runner: parses task list, spawns parallel agents
 cost_report.py          ← Post-hoc cost analyzer for run-log.jsonl (see reference/cost-reporting.md)
 ```
@@ -197,6 +196,189 @@ For situations not covered above, consult /abs/path/reference/index.md.
 5. When you add a new reference file, add a row to `reference/index.md`. When a role's mandatory references change, update the role's `_required_reads_block` call.
 
 A determinism check (renders each builder twice with identical inputs and asserts byte-equality) lives in the audit trail; if you change a builder, run it locally with the same inputs twice and confirm the output is byte-identical.
+
+### Agent role inventory
+
+Every distinct agent the runner can spawn, what triggers it, and where its prompt is built. Line numbers refer to `parallel_runner.py`.
+
+| Role | Builder | Spawned when | Purpose | Scope constraint |
+|------|---------|--------------|---------|------------------|
+| `task-implementer` | `build_prompt` | Per incomplete `[ ]` task in `tasks.md` | Implement one task; mark `[x]` | Source files in phase; no ROUTER.md/Skill |
+| `vr-fix` | `build_vr_fix_prompt` | Validate-review report contains `VALIDATE-FAIL` | Diagnose & fix all distinct validation failures | Source in phase; cannot edit task list / validate dir |
+| `validate-review` | `build_validate_review_prompt` | Phase tasks all `[x]` and not yet validated | Build/test/lint/security + code review + fix | Source in phase; writes `review-{cycle}.md` only |
+| `retry` | `build_retry_prompt` | Prior attempts wrote code but crashed before completion | Verify compiles + mark task done | Read-only verify; tasks.md mark only |
+| `services-fix` | `_build_services_fix_prompt` | `bash test/e2e/setup.sh` exits non-zero | Bring up Postgres/auth/API | `setup.sh`, `flake.nix`, compose, scripts/, configs only |
+| `pre-e2e-meta-fix` | `_build_pre_e2e_meta_fix_prompt` | Integration-test fix loop has unproductive streak | Structural redesign of integration setup | Infra/setup only; app code off-limits |
+| `platform-fix` (normal) | `_build_platform_fix_prompt` (`meta=False`) | Platform runtime (emulator/SDK/services) failed to boot | Fix runtime bringup; iterate | E2E paths: `test/e2e/`, `.dev/e2e-state/`, configs |
+| `platform-fix` (meta) | same builder (`meta=True`) | Platform-fix unproductive streak threshold | Structural redesign of bringup | Broader: includes runner/wrapper, devshell, sandbox |
+| `e2e-explore` | `_build_e2e_explore_prompt` | First E2E iteration or regression sweep | Sweep app, file findings | Read-only on code; writes findings/screenshots |
+| `e2e-planner` | `_build_e2e_planner_prompt` | Once per iteration after explore | Order ~10–20 next-iteration steps | Writes `plan.md` only (Opus, no MCP) |
+| `e2e-executor` | `_build_e2e_executor_prompt` | Multiple per iteration; Sonnet | Follow `plan.md` step-by-step | MCP + plan/findings/progress writes |
+| `e2e-diagnostic` | `_build_e2e_diagnostic_prompt` | Executor wrote `blocker.md` | Decide FILE_AND_SKIP / RETRY_WITH / SKIP_SPEC_GAP | Read-only; writes `unblock-N.md` |
+| `e2e-fix` | `_build_e2e_fix_prompt` | `open_bugs` non-empty after executor | Fix all bugs in one batch | Code edits + test runs + commit |
+| `e2e-verify` | `_build_e2e_verify_prompt` | After fix agent | Re-test each bug; update `findings.json` status | Findings + verify-evidence only; no code |
+| `e2e-supervisor` (loop) | `_build_e2e_supervisor_prompt` | After explore in each iteration | CONTINUE / REDIRECT / STOP | Writes `guidance.md` / `supervisor-decision.md` |
+| `e2e-regression` | `_build_e2e_regression_prompt` | All E2E fixes committed, before declaring success | Run full project test suite | Bash + Edit (regression fixes only) |
+| `e2e-crash-supervisor` | `_build_e2e_crash_supervisor_prompt` | Explore exits non-zero | Classify crash → STOP/CONTINUE | Diagnostic only |
+| `e2e-research` (per-bug) | `_build_e2e_research_prompt` | Bug supervisor REDIRECT_RESEARCH | Investigate root cause; write `research-N.md` | Read-only; WebSearch enabled |
+| `e2e-bug-supervisor` | `_build_e2e_bug_supervisor_prompt` | Bug has ≥1 failed fix attempt | DIRECT_FIX / REDIRECT_RESEARCH / ESCALATE | Read-only; writes supervisor-N decision/summary |
+| `e2e-escalation` | `_build_e2e_escalation_prompt` | Bug supervisor ESCALATE | Synthesize `BLOCKED.md` for human | Synthesis only |
+| `ci-diagnose` | `build_ci_diagnose_prompt` | CI workflow run failed | Read CI logs, write diagnosis | Read-only |
+| `ci-fix` | `build_ci_fix_prompt` | After ci-diagnose | Apply fix, run fast checks, commit (no push) | Files identified by diagnosis |
+| `ci-local-validate` | `build_ci_local_validate_prompt` | After ci-fix commit | Run same commands CI runs | Read-only |
+| `ci-finalize` | `build_ci_finalize_prompt` | CI passes locally | Sanity check + open PR + mark done | Bash + gh + tasks.md mark |
+
+### Per-role context matrix
+
+What each role gets in its prompt. Tier-1 = mandatory file Reads (paths, cache cross-spawn). Tier-2 = pointer to `reference/index.md`. Inlined runtime state = per-spawn variable content embedded in the prompt body (not cached cross-spawn — keep small).
+
+| Role | Tier-1 mandatory reads | Inlined runtime state (variable tail) | Tools |
+|------|------------------------|---------------------------------------|-------|
+| `task-implementer` | `CLAUDE.md`, `testing.md` | phase-filtered tasks.md block; filtered learnings; rejection / blocked-answer if any; attempt history (last 3) | Bash, Edit, MCP per `[needs:]` |
+| `vr-fix` | `testing.md`, `fix-agent-playbook.md` | latest validation report; last 3 prior-failure headers | Bash, Edit |
+| `validate-review` | `CLAUDE.md`, `testing.md`, `pre-pr.md` | code-review skill (cycle 1) / compact checklist (cycle 2+); prior review-N.md content; base SHA + diff range; appended hang-diagnosis files (variable tail) | Bash, Edit, MCP |
+| `retry` | none | files written by prior agents; attempt # | Bash, Edit (tasks.md only) |
+| `services-fix` | `fix-agent-playbook.md`, `e2e-runtime.md`, `health.md` | failure log (last 4KB) at the variable tail | Bash, Edit (infra) |
+| `pre-e2e-meta-fix` | `fix-agent-playbook.md`, `e2e-failure-patterns.md`, `testing.md` | full setup.sh; env files; gate-log tail (8KB); open bugs list | Bash, Edit (infra) |
+| `platform-fix` (normal/meta) | `fix-agent-playbook.md`, `e2e-failure-patterns.md` | matched signature names list; diagnostic snapshot (PATH/probes/process tree/PID/git log/setup-failure tail); fix-history repeat-section; claim files list; hypothesis brief frame | Bash, Edit (no MCP) |
+| `e2e-explore` | `mcp-e2e.md`, `e2e-runtime.md` | task block; UI_FLOW.md; spec.md; guidance.md; backend env; rejection context; findings (filtered, 20KB cap, overflow → file); progress (8KB cap) | MCP (per driver), Bash (10s), Read |
+| `e2e-planner` | `mcp-e2e.md` | task block; UI_FLOW.md; spec.md; findings (20KB); progress (8KB) | Read, Write (`plan.md`) |
+| `e2e-executor` | `mcp-e2e.md` | UI_FLOW.md; backend env; prior handoff; unblock context | MCP (per driver), Bash, Read, Edit |
+| `e2e-diagnostic` | none | blocker content; plan step; lazy-load list of prior unblocks + executor summaries | Read |
+| `e2e-fix` | `fix-agent-playbook.md`, `e2e-failure-patterns.md` | per-bug research (inline if exists); supervisor decision; fix attempt history; latest verify evidence; bugs JSON; infrastructure-findings synthesis | Bash, Edit, Read, Grep, WebSearch |
+| `e2e-verify` | `mcp-e2e.md` | UI_FLOW.md; findings (40KB cap, higher than explore) | MCP (per driver), Bash, Read, Edit (findings only) |
+| `e2e-supervisor` (loop) | none | full state.json; findings; UI_FLOW.md | Edit |
+| `e2e-regression` | none | (reads CLAUDE.md on demand) | Bash, Edit |
+| `e2e-crash-supervisor` | none | full state.json; exit code; stderr; JSONL result/error | Edit |
+| `e2e-research` | `fix-agent-playbook.md` | bug record; UI_FLOW.md excerpt; prior research-N.md; supervisor summaries (if redirected); fix attempts (verify-evidence excerpts up to 2KB) | Bash, Read, WebSearch |
+| `e2e-bug-supervisor` | `fix-agent-playbook.md` | bug record; UI_FLOW.md; full bug history (fix_attempts); latest research; all prior supervisor summaries; pre-computed oscillation signature | Edit |
+| `e2e-escalation` | none | full bug history; all supervisor summaries; latest research; category | Edit |
+| `ci-diagnose` | `cicd.md`, `nix-ci.md` | CI result dict; prior diagnosis file list | Bash (read-only) |
+| `ci-fix` | `CLAUDE.md`, `cicd.md`, `nix-ci.md` | latest diagnosis (inlined); prior attempt logs (last 3KB) | Bash, Edit |
+| `ci-local-validate` | `.github/workflows/ci.yml`, `nix-ci.md` | prior validation tail (3KB) | Bash |
+| `ci-finalize` | none (reads README.md, ci.yml, learnings on demand) | none | Bash, gh, Edit (tasks.md) |
+
+### Cross-role handoff
+
+How outputs flow between roles within a feature run. Files written by one role and consumed by another are the de-facto interface contract — when you change a role's output, check what reads it. Each loop is shown separately so you can follow the data flow without an exploding rendered graph.
+
+#### Phase loop (per phase)
+
+```mermaid
+flowchart TD
+    tasks[tasks.md] --> impl[task-implementer]
+    impl --> claim["claims/completion-{TASK_ID}.json"]
+    impl -.on rejection.-> rej["claims/rejection-{TASK_ID}.md"]
+    rej -.feeds next.-> impl
+    claim --> done{all tasks [x]?}
+    done -- no --> impl
+    done -- yes --> vr[validate-review]
+    vr --> rep["validate/{N}.md"]
+    vr --> verdict{PASS or FAIL?}
+    verdict -- PASS --> next[next phase]
+    verdict -- FAIL --> vrfix[vr-fix]
+    vrfix --> vr
+```
+
+#### Pre-E2E gate (per E2E task)
+
+```mermaid
+flowchart TD
+    setup[bash test/e2e/setup.sh] --> services{services up?}
+    services -- no --> svcfix[services-fix]
+    svcfix --> setup
+    services -- yes --> intgate[Integration test gate]
+    intgate --> intfail{tests fail?}
+    intfail -- yes --> intfix[integration fix loop]
+    intfix --> streak{unproductive streak?}
+    streak -- yes --> meta[pre-e2e-meta-fix]
+    streak -- no --> intgate
+    meta --> intgate
+    intfail -- no --> platform[Platform runtime bringup]
+    platform --> pfix{boot ok?}
+    pfix -- no --> pfx[platform-fix]
+    pfx --> matched["matched signatures + fix-history.md"]
+    matched --> pstreak{unproductive streak?}
+    pstreak -- yes --> pmeta[platform-fix meta]
+    pstreak -- no --> platform
+    pmeta --> platform
+    pfix -- yes --> ready[E2E ready to run]
+```
+
+#### E2E iteration loop
+
+```mermaid
+flowchart TD
+    explore[e2e-explore] --> exit{exit code?}
+    exit -- crash --> crash[e2e-crash-supervisor]
+    crash -- STOP --> stop[stop loop]
+    crash -- CONTINUE --> explore
+    exit -- ok --> findings["findings.json + screenshots/ + progress.md"]
+    findings --> sup[e2e-supervisor]
+    sup --> dec{decision?}
+    dec -- STOP --> stop
+    dec -- REDIRECT --> guidance[guidance.md] --> explore
+    dec -- CONTINUE --> planner[e2e-planner]
+    planner --> plan[plan.md]
+    plan --> executor[e2e-executor]
+    executor --> outputs["findings.json + progress.md + handoff.md"]
+    executor -.stuck step.-> blocker[blocker.md]
+    blocker --> diag[e2e-diagnostic]
+    diag --> unblock["unblock-N.md"]
+    unblock --> executor
+    outputs -.infra blockers in handoff.-> fix[e2e-fix]
+    outputs --> bugs{open_bugs non-empty?}
+    bugs -- no --> regression[e2e-regression]
+    bugs -- yes --> fix
+    fix --> research["research-N.md (inline if missing)"]
+    research --> edits[code edits + commits]
+    edits --> verify[e2e-verify]
+    verify --> evidence["verify-evidence-{iter}.md + findings status"]
+    evidence --> resolved{all fixed?}
+    resolved -- yes --> regression
+    resolved -- no --> bugsup[e2e-bug-supervisor per bug]
+    bugsup --> bdec{decision?}
+    bdec -- DIRECT_FIX --> fix
+    bdec -- REDIRECT_RESEARCH --> research2[e2e-research]
+    research2 --> nextiter[next iteration → planner]
+    bdec -- ESCALATE --> escal[e2e-escalation]
+    escal --> blocked["BLOCKED.md (human)"]
+    regression --> rpass{PASS?}
+    rpass -- yes --> markdone[mark task done]
+    rpass -- no --> fix
+    nextiter --> planner
+```
+
+#### CI loop (per task)
+
+```mermaid
+flowchart TD
+    cifail[gh run failed] --> diagnose[ci-diagnose]
+    diagnose --> diag["attempt-N-diagnosis.md"]
+    diag --> cifix[ci-fix]
+    cifix --> commit[commit; no push]
+    commit --> localval[ci-local-validate]
+    localval --> result["attempt-N-local-{iter}.md"]
+    result --> verdict{PASS?}
+    verdict -- no --> cifix
+    verdict -- yes --> finalize[ci-finalize]
+    finalize --> pr[gh pr create + tasks.md mark]
+```
+
+**Key contracts (file → consumer):**
+
+- `findings.json` (filtered) → e2e-explore / e2e-planner / e2e-fix / e2e-verify / e2e-supervisor
+- `progress.md` (filtered tail) → e2e-explore / e2e-planner
+- `plan.md` → e2e-executor (read verbatim, no improvisation)
+- `handoff.md` → next e2e-executor spawn (resume from `Next step`); `## Infrastructure blockers` section → e2e-fix
+- `blocker.md` → e2e-diagnostic
+- `unblock-N.md` → next e2e-executor spawn for that step
+- `research-N.md` → e2e-fix; e2e-bug-supervisor; e2e-escalation
+- `verify-evidence-{iter}.md` → e2e-fix (next attempt); e2e-bug-supervisor; e2e-research (when redirected)
+- `supervisor-N-decision.md` + `supervisor-N-summary.md` → e2e-fix; future e2e-bug-supervisor runs; e2e-escalation
+- `attempt-N-diagnosis.md` → ci-fix (inlined into prompt)
+- `attempt-N-local-{iter}.md` → ci-fix (next iteration)
+- `claims/completion-{TASK_ID}.json` → runner verifier; `claims/rejection-{TASK_ID}.md` → next task-implementer / e2e-explore spawn
 
 ## parallel_runner.py state machine
 

@@ -7,6 +7,8 @@ Paths are relative to `.claude/skills/spec-kit/reference/`.
 | If you are... | Read | Why |
 |---|---|---|
 | Writing or fixing tests, or unsure what test tier something belongs in | `testing.md` § Test tier taxonomy, § Zero-skips rule, § Stub detection | Validators reject for these rules; agents who skip them lose the next VR cycle |
+| Setting up structured test output for a project (any language) | `testing.md` § Structured test output + `templates/EXAMPLE-OUTPUT.md` + `templates/test-reporter-<runner>` | Drop-in reporter templates; EXAMPLE-OUTPUT.md is the canonical schema |
+| Diagnosing failing tests in a phase-fix task | `test-logs/summary.json` + `failures/<name>.log` (in the project) + `templates/EXAMPLE-OUTPUT.md` for schema | Structured output is the primary signal; read the schema once to know the shape |
 | Adding a new test command or coverage tooling | `testing.md` § Code coverage collection | Coverage is mandatory; missing tools must be installed, not skipped |
 | Diagnosing a platform-runtime / service-bringup failure | `e2e-failure-patterns.md` (find the matching `## Signature: <name>`) | Library of known failure shapes with proven root causes |
 | Doing any fix-agent work (platform, services, integration, E2E bug) | `fix-agent-playbook.md` § Core principle, § Default fix preference order, § What NOT to do | Falsification rule, anti-patterns, claim format |

@@ -1,10 +1,10 @@
 # Spec-Kit Implementation Phase
 
-## Autonomous implementation with run-tasks.sh
+## Autonomous implementation with parallel_runner.py
 
-Once `tasks.md` exists, the user can run implementation autonomously using the task runner bundled with the spec-kit skill at `.claude/skills/spec-kit/run-tasks.sh`. The runner is a Python script (`parallel_runner.py`) that parses the task list, respects `[P]` parallel markers and phase dependency graphs, and spawns multiple claude agents concurrently where safe.
+Once `tasks.md` exists, the user can run implementation autonomously using the task runner bundled with the spec-kit skill at `.claude/skills/spec-kit/parallel_runner.py`. The runner parses the task list, respects `[P]` parallel markers and phase dependency graphs, and spawns multiple claude agents concurrently where safe.
 
-**How to launch it:** Determine the absolute path to `run-tasks.sh` within the skill directory (it lives alongside `SKILL.md`). Then run it from the target project root:
+**How to launch it:** Determine the absolute path to `parallel_runner.py` within the skill directory (it lives alongside `SKILL.md`). Then run it from the target project root:
 
 ```bash
 cd <project-root>
@@ -18,9 +18,6 @@ python3 /path/to/agent-framework/.claude/skills/spec-kit/parallel_runner.py --ma
 # Headless mode — no stdin/stdout, all output to log files
 python3 /path/to/agent-framework/.claude/skills/spec-kit/parallel_runner.py --headless                        # all features
 python3 /path/to/agent-framework/.claude/skills/spec-kit/parallel_runner.py --headless --max-parallel 5       # 5 agents
-
-# Or via the bash wrapper (validates python version, then exec's the above):
-/path/to/agent-framework/.claude/skills/spec-kit/run-tasks.sh [same args]
 ```
 
 The script requires **Python 3.9+** (stdlib only, no pip dependencies) and the `claude` CLI. Must be run from the project root (where `.specify/` and `specs/` live). Run it in tmux/screen so it survives terminal disconnects.
