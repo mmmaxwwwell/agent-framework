@@ -53,6 +53,7 @@ reference/           # Enterprise knowledge base — loaded on demand by phase f
   mcp-e2e.md         # MCP-driven E2E exploration loop (explore/plan/execute/verify), findings.json shape, per-platform tool semantics
   fix-agent-playbook.md # General debugging heuristics for any spawned fix-agent: falsification rule, anti-patterns, claim format
   e2e-failure-patterns.md # Library of known platform-runtime failure signatures, matched per-attempt by the runner
+  agent-file-schemas.md # IC-AGENT-* schemas for every cross-agent file (findings.json, plan.md, handoff.md, etc.) — the runner parses specific anchors
   verification.md    # Deterministic completion-claim verification rules
   stripe.md          # Stripe / payment integration: listener scripts, env pattern, webhook contract, RUNBOOK, live-key guardrails
   cost-reporting.md  # Post-hoc cost & effectiveness analysis via cost_report.py (reads run-log.jsonl, outputs per-model/per-phase dollar breakdown)

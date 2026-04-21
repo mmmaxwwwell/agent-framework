@@ -145,6 +145,7 @@ reference/              ← Knowledge base, loaded on demand by phase files
   mcp-e2e.md            ← MCP-driven E2E exploration
   fix-agent-playbook.md ← General debugging heuristics for any spawned fix-agent (falsification rule, anti-patterns, claim format)
   e2e-failure-patterns.md ← Library of known platform-runtime failure signatures, matched per-attempt
+  agent-file-schemas.md ← IC-AGENT-* schemas for every cross-agent file (findings.json, plan.md, handoff.md, etc.)
   verification.md       ← Completion-claim verification rules
   stripe.md             ← Stripe / payment integration reference
   cost-reporting.md     ← Cost & cache analysis for cost_report.py
@@ -365,20 +366,32 @@ flowchart TD
     finalize --> pr["gh pr create + tasks.md mark"]
 ```
 
-**Key contracts (file → consumer):**
+**Key contracts (file → consumer → schema):**
 
-- `findings.json` (filtered) → e2e-explore / e2e-planner / e2e-fix / e2e-verify / e2e-supervisor
-- `progress.md` (filtered tail) → e2e-explore / e2e-planner
-- `plan.md` → e2e-executor (read verbatim, no improvisation)
-- `handoff.md` → next e2e-executor spawn (resume from `Next step`); `## Infrastructure blockers` section → e2e-fix
-- `blocker.md` → e2e-diagnostic
-- `unblock-N.md` → next e2e-executor spawn for that step
-- `research-N.md` → e2e-fix; e2e-bug-supervisor; e2e-escalation
-- `verify-evidence-{iter}.md` → e2e-fix (next attempt); e2e-bug-supervisor; e2e-research (when redirected)
-- `supervisor-N-decision.md` + `supervisor-N-summary.md` → e2e-fix; future e2e-bug-supervisor runs; e2e-escalation
-- `attempt-N-diagnosis.md` → ci-fix (inlined into prompt)
-- `attempt-N-local-{iter}.md` → ci-fix (next iteration)
-- `claims/completion-{TASK_ID}.json` → runner verifier; `claims/rejection-{TASK_ID}.md` → next task-implementer / e2e-explore spawn
+Every cross-agent file has a documented schema in [`reference/agent-file-schemas.md`](reference/agent-file-schemas.md). When you change a writer's output format, update the matching `IC-AGENT-*` entry in the same commit — consumers parse specific fields and anchor headings.
+
+| File | Producer → Consumer(s) | Schema |
+|------|------------------------|--------|
+| `findings.json` | e2e-explore / e2e-executor / e2e-verify / e2e-fix → e2e-planner, e2e-supervisor, all E2E roles | [IC-AGENT-001](reference/agent-file-schemas.md#ic-agent-001-findingsjson) |
+| `progress.md` | e2e-explore / e2e-executor → e2e-planner, e2e-supervisor | [IC-AGENT-002](reference/agent-file-schemas.md#ic-agent-002-progressmd) |
+| `plan.md` | e2e-planner → e2e-executor (verbatim), e2e-diagnostic | [IC-AGENT-003](reference/agent-file-schemas.md#ic-agent-003-planmd) |
+| `handoff.md` | e2e-executor → next e2e-executor; `## Infrastructure blockers` → e2e-fix | [IC-AGENT-004](reference/agent-file-schemas.md#ic-agent-004-handoffmd) |
+| `blocker.md` | e2e-executor → e2e-diagnostic | [IC-AGENT-005](reference/agent-file-schemas.md#ic-agent-005-blockermd) |
+| `unblock-N.md` | e2e-diagnostic → next e2e-executor spawn for that step | [IC-AGENT-006](reference/agent-file-schemas.md#ic-agent-006-unblock-nmd) |
+| `research-N.md` | e2e-research / e2e-fix (inline) → e2e-fix, e2e-bug-supervisor, e2e-escalation | [IC-AGENT-007](reference/agent-file-schemas.md#ic-agent-007-research-nmd) |
+| `verify-evidence-{iter}.md` | e2e-verify → e2e-fix (next attempt), e2e-bug-supervisor, e2e-research (when redirected) | [IC-AGENT-008](reference/agent-file-schemas.md#ic-agent-008-verify-evidence-itermd) |
+| `supervisor-{N}-decision.md` | e2e-bug-supervisor → e2e-fix, e2e-research, future supervisor runs, e2e-escalation | [IC-AGENT-009](reference/agent-file-schemas.md#ic-agent-009-supervisor-n-decisionmd) |
+| `supervisor-{N}-summary.md` | e2e-bug-supervisor → future supervisor runs, e2e-research | [IC-AGENT-010](reference/agent-file-schemas.md#ic-agent-010-supervisor-n-summarymd) |
+| `guidance.md` + `supervisor-decision.md` | e2e-supervisor (loop) → e2e-explore (next iter); runner decision logic | [IC-AGENT-011](reference/agent-file-schemas.md#ic-agent-011-guidancemd--supervisor-decisionmd-loop-level) |
+| `bug_history.json` | runner internal → e2e-fix, e2e-bug-supervisor, e2e-research, e2e-escalation | [IC-AGENT-012](reference/agent-file-schemas.md#ic-agent-012-bug_historyjson) |
+| `fix-history.md` | runner internal → platform-fix (repeat-failure detection) | [IC-AGENT-013](reference/agent-file-schemas.md#ic-agent-013-fix-historymd) |
+| `claims/completion-{TASK_ID}.json` | task-implementer / e2e-executor → runner verifier | [IC-AGENT-014](reference/agent-file-schemas.md#ic-agent-014-claimscompletion-task_idjson) |
+| `claims/rejection-{TASK_ID}.md` | runner verifier → next task-implementer / e2e-explore spawn | [IC-AGENT-015](reference/agent-file-schemas.md#ic-agent-015-claimsrejection-task_idmd) |
+| `claims/platform-fix-*.json` + `platform-meta-fix-*.json` | platform-fix / platform-fix-meta → runner (cross-attempt summary) | [IC-AGENT-016](reference/agent-file-schemas.md#ic-agent-016-claimsplatform-fix-json-and-claimsplatform-meta-fix-json) |
+| `attempt-N-diagnosis.md` | ci-diagnose → ci-fix (inlined into prompt) | [IC-AGENT-017](reference/agent-file-schemas.md#ic-agent-017-attempt-n-diagnosismd) |
+| `attempt-N-local-{iter}.md` | ci-local-validate → ci-fix (next iteration), runner (PASS/FAIL routing) | [IC-AGENT-018](reference/agent-file-schemas.md#ic-agent-018-attempt-n-local-itermd) |
+| `validate/{N}.md` | validate-review → vr-fix (next cycle), runner (PASS/FAIL state) | [IC-AGENT-019](reference/agent-file-schemas.md#ic-agent-019-validatenmd-validation-report) |
+| `review-{cycle}.md` | validate-review → next validate-review cycle, vr-fix (indirectly) | [IC-AGENT-020](reference/agent-file-schemas.md#ic-agent-020-review-cyclemd) |
 
 ## parallel_runner.py state machine
 
