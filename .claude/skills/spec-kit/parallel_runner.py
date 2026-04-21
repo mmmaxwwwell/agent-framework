@@ -108,13 +108,21 @@ def _reference_index_pointer() -> str:
     unique path per spawn, defeating the cache).
     """
     return (
-        "## Reference index (read on demand)\n"
+        "## Reference index (classify, then read on demand)\n"
         "\n"
-        f"For situations not covered by the required reads above, consult `{_REF_INDEX_PATH}` "
-        "— it's a decision-tree table mapping situations to reference files. "
-        "Read it once, then Read any specific reference files it points you to. "
-        "Both reads cache across spawns within 5 minutes, so erring on the side "
-        "of reading is cheap.\n"
+        f"After your Tier-1 reads, **Read `{_REF_INDEX_PATH}` once** and follow "
+        "its two-step protocol:\n"
+        "\n"
+        "1. **Classify** the task and the files you're about to touch using the "
+        "tag taxonomy in the index (one `task:*` tag + all applicable `domain:*` "
+        "tags). State the classification explicitly before reading further.\n"
+        "2. **Look up** every row in the index whose Tags column intersects your "
+        "active tags. Read each cited file (cited section if specified, full file "
+        "otherwise).\n"
+        "\n"
+        "All of these reads cache across spawns within 5 minutes, so err on the "
+        "side of reading. Skipping classification is the most common failure "
+        "mode — it leads to reading the wrong references or none at all.\n"
     )
 
 
