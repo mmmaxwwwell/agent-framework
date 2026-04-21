@@ -2487,6 +2487,21 @@ def _build_sandbox_cmd(project_dir: Path, inner_cmd: list[str]) -> list[str]:
     # Project directory: the ONLY writable surface.
     cmd += ["--bind", project, project]
 
+    # Spec-kit reference directory: mount read-only so required-reads
+    # (CLAUDE.md stanza, testing.md, fix-agent-playbook.md, etc.) are
+    # actually accessible to the agent.  Without this, every prompt's
+    # "Required reading" block points at paths that don't exist inside
+    # the sandbox and the agent silently skips them.  Resolved at
+    # import time via _REF_DIR; mount its parent (the skill root) so
+    # any sibling references (CLAUDE-STANZA.md, etc.) also resolve.
+    skill_root = str(_REF_DIR.parent.resolve())
+    if Path(skill_root).is_dir() and skill_root != project:
+        # Only mount if it's not already under project (tmpfs/home handling
+        # covers the under-home case).  Mount the parent of skill_root so
+        # `Path(__file__).parent / "reference"` resolution works — the
+        # agent only ever Reads files, so read-only is sufficient.
+        cmd += ["--ro-bind", skill_root, skill_root]
+
     # Device and process filesystems.
     cmd += ["--dev", "/dev"]
     cmd += ["--proc", "/proc"]
@@ -2556,6 +2571,12 @@ def _build_sandbox_cmd(project_dir: Path, inner_cmd: list[str]) -> list[str]:
     # Re-mount project dir if it's under home (tmpfs shadows it).
     if project.startswith(str(home)):
         cmd += ["--bind", project, project]
+    # Re-mount spec-kit skill root if it's under home (tmpfs shadows it).
+    # Required so that CLAUDE.md references to reference/testing.md etc.
+    # resolve inside the sandbox — the earlier bind above would have been
+    # shadowed by the tmpfs mount of $HOME.
+    if Path(skill_root).is_dir() and skill_root.startswith(str(home)) and skill_root != project:
+        cmd += ["--ro-bind", skill_root, skill_root]
 
     # Android emulator console auth token — needed for `adb emu finger touch`
     # (fingerprint simulation) and other console commands.
