@@ -73,6 +73,8 @@
           , buildOnEnter ? true      # run `update` on shell entry (fast, incremental)
           , watch ? true             # keep a watcher running for the shell lifetime
           , serveMcp ? false         # start `code-review-graph serve` as an MCP server
+          , autoInstall ? true       # run `code-review-graph install` once per project
+                                     # (merges MCP config, drops skills, installs hooks)
           , mcpPort ? 7333
           , stateDir ? ".code-review-graph"
           , excludeDirs ? [ "node_modules" ".direnv" "result" "dist" ".venv" "__pycache__" "build" ".dart_tool" ]
@@ -95,6 +97,29 @@
               local pidfile="$1"
               [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null
             }
+
+            ${pkgs.lib.optionalString autoInstall ''
+            # Auto-install: merges `code-review-graph` into .mcp.json (preserving
+            # other servers), drops skill files into .claude/skills/, installs
+            # PostToolUse + SessionStart hooks into .claude/settings.json, and a
+            # git pre-commit hook.  Idempotent — skipped when the marker file
+            # records the current tool version.  `--no-instructions` means the
+            # upstream CLAUDE.md injection is skipped; spec-kit manages that
+            # stanza itself (see reference/code-review-graph.md).
+            _crg_install_marker="$CODE_REVIEW_GRAPH_STATE_DIR/installed-v${version}"
+            if [ ! -f "$_crg_install_marker" ]; then
+              if code-review-graph install \
+                   --repo "$PWD" \
+                   --platform claude-code \
+                   --no-instructions \
+                   -y >"$CODE_REVIEW_GRAPH_STATE_DIR/install.log" 2>&1; then
+                touch "$_crg_install_marker"
+                echo "[code-review-graph] installed hooks + skills + MCP config (v${version})"
+              else
+                echo "[code-review-graph] auto-install failed — see $CODE_REVIEW_GRAPH_STATE_DIR/install.log" >&2
+              fi
+            fi
+            ''}
 
             # First build: async if the graph database doesn't exist yet.
             # Subsequent entries: quick `update` in the background.

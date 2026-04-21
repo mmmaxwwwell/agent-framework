@@ -78,9 +78,24 @@ it as a flake input and pull both the binary and a shellHook helper.
 | `projectName` | `"project"` | Label for logs; sets `$CODE_REVIEW_GRAPH_PROJECT` |
 | `buildOnEnter` | `true` | Run `code-review-graph update` in background on shell entry |
 | `watch` | `true` | Start a watcher (`code-review-graph watch`) with PID-file idempotency |
-| `serveMcp` | `false` | Start an MCP server (`code-review-graph serve`) with PID-file idempotency |
+| `serveMcp` | `false` | Start an MCP server (`code-review-graph serve`) as a long-running background process. **Usually leave `false`** — Claude Code starts the MCP server on demand via `.mcp.json` (stdio), which is more reliable than a dangling daemon |
+| `autoInstall` | `true` | Run `code-review-graph install --repo $PWD --platform claude-code --no-instructions -y` once per tool version. Merges the MCP server into `.mcp.json` (preserving other entries), drops upstream skills into `.claude/skills/`, installs `PostToolUse` + `SessionStart` hooks into `.claude/settings.json`, and a git pre-commit hook. Gated by `.code-review-graph/installed-v<version>` marker — bumping the pinned version re-triggers. Idempotent. Pass `autoInstall = false` if you manage `.mcp.json` / `.claude/settings.json` from another source and want the skill to stay hands-off |
 | `stateDir` | `".code-review-graph"` | Where the SQLite graph db + logs + PID files live |
 | `excludeDirs` | `[node_modules .direnv result dist .venv __pycache__ build .dart_tool]` | Dirs ignored by build/update/watch |
+
+### What `autoInstall` does (and why `--no-instructions`)
+
+The upstream `code-review-graph install` command wants to append its own
+stanza to `CLAUDE.md`. Spec-kit manages that stanza itself (from
+`code-review-graph/CLAUDE-STANZA.md`) because the spec-kit version is
+tuned for runner-driven workflows (MCP-first, token-budget rules, runner
+update-at-phase-boundary context). We pass `--no-instructions` so the
+upstream doesn't duplicate or conflict with the spec-kit stanza.
+
+Everything else the installer does is kept: MCP server registration,
+skill file generation (`.claude/skills/{review-changes,explore-codebase,
+refactor-safely,debug-issue}.md`), PostToolUse + SessionStart hook
+registration in `.claude/settings.json`, and the git pre-commit hook.
 
 A `crg-stop` shell function is defined automatically — it kills the watcher
 and MCP server and clears PID files.
