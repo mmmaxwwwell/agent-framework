@@ -145,7 +145,7 @@ ${ignoreBlock}CRG_IGNORE_EOF
                 [ -n "$before" ] && printf '%s\n' "$before"
                 if [ -n "$_crg_desired_block" ]; then
                   printf '%s\n' "$_crg_marker_begin"
-                  printf '%s' "$_crg_desired_block"
+                  printf '%s\n' "$_crg_desired_block"
                   printf '%s\n' "$_crg_marker_end"
                 fi
                 [ -n "$after" ] && printf '%s\n' "$after"
