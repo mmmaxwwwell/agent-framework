@@ -64,8 +64,53 @@ _REF_DIR = Path(__file__).parent / "reference"
 _REF_INDEX_PATH = str(_REF_DIR / "index.md")
 
 
+_GRAPH_USAGE_STANZA = """## code-review-graph — use the knowledge graph FIRST
+
+This project has `code-review-graph` wired into its dev environment.  An
+MCP server is connected to your session — look for tools named
+`mcp__code-review-graph__*` in your tool list.  **Before you Read source
+files, Grep, or Glob your way around**, query the graph.  It is faster
+and far more token-efficient than raw file exploration.
+
+**Mandatory first-turn protocol** (applies to every task that touches
+code — implement, validate, review, fix, diagnose):
+
+1. Call `mcp__code-review-graph__get_minimal_context_tool(task="<one sentence describing your task>")`
+   BEFORE any Read/Grep/Glob on source code.  It returns ~100 tokens
+   summarizing risk, relevant flows, communities, and which other graph
+   tools are best for your situation.
+2. Follow its `next_tools` suggestions.  Default to
+   `detail_level="minimal"` on subsequent graph calls — the tools
+   default to verbose, and verbose blows your context budget.
+3. **Query before you create.**  Before adding a new function, route,
+   or module, call `mcp__code-review-graph__semantic_search_nodes_tool(query="…")`
+   or `mcp__code-review-graph__query_graph_tool(pattern="…")` to check
+   whether something similar already exists.  Duplicates are the #1
+   source of rot.
+4. When reviewing a diff, call
+   `mcp__code-review-graph__detect_changes_tool(detail_level="minimal")`
+   for a risk-scored impact analysis.  When planning a refactor, call
+   `mcp__code-review-graph__get_impact_radius_tool` to see the blast
+   radius.
+
+**Never skip the graph to "save time".**  MCP queries are near-instant
+and return orders of magnitude fewer tokens than equivalent Read/Grep
+exploration.  An agent that reads 10 files to understand a function's
+callers has already burned more tokens than a single graph query would
+have cost.
+
+If a graph tool returns empty or stale results, fall back to Read/Grep
+— but note the discrepancy so it can be investigated later."""
+
+
 def _required_reads_block(role: str, abs_paths: list[str]) -> str:
     """Render the canonical Tier-1 required-reading block for a role.
+
+    CLAUDE.md is auto-prepended to every role's required list if not
+    already present — every agent must read it to pick up the project's
+    build/test commands, conventions, and the code-review-graph stanza.
+    The graph-usage stanza is appended inline so the agent sees it even
+    if it skips CLAUDE.md (which happens — model disobedience is real).
 
     The ``role`` string is stable per call site (e.g. always "e2e-fix"),
     and ``abs_paths`` is a literal list per role — keep them literal so
@@ -73,22 +118,54 @@ def _required_reads_block(role: str, abs_paths: list[str]) -> str:
     comes from the agent's subsequent Read tool calls hitting the Read
     result cache (path+content keyed) on spawn 2..N within 5 minutes.
     """
-    if not abs_paths:
-        return ""
+    # Auto-prepend CLAUDE.md unless already listed.  CLAUDE.md contains
+    # project-specific build/test commands and the code-review-graph
+    # CLAUDE stanza that tells agents how to use the graph tools.  Every
+    # role benefits from reading it; forgetting to include it (as
+    # happened in 13 of 17 call sites historically) means the agent
+    # never learns about project conventions or the graph.
+    paths = list(abs_paths)
+    if "CLAUDE.md" not in paths:
+        paths.insert(0, "CLAUDE.md")
+
     lines = [
-        "## Required reading (do these reads BEFORE planning your work)",
+        "## Required reading (MANDATORY — do these reads BEFORE anything else)",
         "",
-        f"You MUST Read the following files first as the {role} agent. "
-        "Do not skip — they encode rules and conventions you will be "
-        "evaluated against. These reads are cheap because the file paths "
-        "are stable and Claude Code caches Read results across spawns "
-        "within the 5-minute cache TTL.",
+        f"You are the **{role}** agent.  Before you write a single line "
+        "of code, call a single tool, or plan your approach, you MUST "
+        "Read every file listed below.  These files encode rules and "
+        "conventions you will be evaluated against.  An agent that "
+        "skips required reads and produces the wrong output is **FAIL** "
+        "— we do not grade on effort, we grade on whether you read the "
+        "rules and followed them.",
+        "",
+        "**Enforcement protocol** (do all five steps in this order):",
+        "",
+        "1. Read EVERY file in the list below, in order, using the Read tool.",
+        "2. After reading, state explicitly in your response: "
+        "`Read checklist: [✓] <file 1>, [✓] <file 2>, …` — name every file.",
+        "3. If any file read fails (not found, permission denied), STOP and "
+        "report the failure.  Do not proceed — missing required context "
+        "means your output will be wrong.",
+        "4. Only after the checklist is complete may you begin planning the "
+        "task.  Planning before reading is forbidden.",
+        "5. Do NOT assume the content of a required file from prior turns or "
+        "prior agents.  These files change; re-read them every spawn.",
+        "",
+        "These reads are **cheap** — the file paths are stable per role and "
+        "Claude Code caches Read results across spawns within the 5-minute "
+        "prompt-cache TTL.  Skipping them saves ~0 tokens and risks "
+        "producing output that violates project rules.",
+        "",
+        "**Files to read** (MANDATORY — every one, in order):",
         "",
     ]
-    lines.extend(f"- {p}" for p in abs_paths)
+    lines.extend(f"- {p}" for p in paths)
     lines.extend([
         "",
-        "After reading, proceed with the work described below.",
+        "After completing the Read checklist, proceed with the work described below.",
+        "",
+        _GRAPH_USAGE_STANZA,
     ])
     return "\n".join(lines)
 
