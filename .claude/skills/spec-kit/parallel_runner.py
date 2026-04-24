@@ -13926,6 +13926,31 @@ is the only signal and it's misleading. Example:
 "residual_risk": "{claim_example_residual}"}}
 </claim>
 
+### Out-of-scope variant (you identified the fix but cannot apply it)
+
+If `Edit`/`Write` fails with `read-only file system`, `EROFS`, or
+"permission denied" on a path you expected to be writable — or the file
+lives outside every writable mount in your sandbox (check `/proc/mounts`
+or `mount | grep <path>`) — **do not invent a workaround**. No patching
+via `verify.sh`, no self-modifying build step, no runtime shim. Emit
+this trailer instead and stop:
+
+<claim>
+{{"out_of_scope": true,
+"out_of_scope_reason": "one sentence naming the write barrier concretely (mount type, errno, path)",
+"target_path": "/absolute/path/to/file/that/needs/the/edit",
+"root_cause": "one-sentence concrete cause",
+"proposed_diff": "--- a/path\\n+++ b/path\\n@@ ... @@\\n ... unified diff with 2-3 lines of context ...",
+"files_changed": [],
+"verified": false,
+"evidence": "attempted Edit on target_path returned 'read-only file system'; /proc/mounts confirms --ro-bind at that path"}}
+</claim>
+
+The runner writes this diff into `BLOCKED.md` verbatim so a human (or
+host-side agent with write access) can apply it. Invent no workarounds —
+flag it, and stop. See `reference/fix-agent-playbook.md` § "When you
+cannot apply the fix" for the full contract.
+
 {verified_note}
 """
 
@@ -14134,6 +14159,7 @@ is the only signal and it's misleading. Example:
             runtime = None
             last_diag = ""
             aborted_reason: Optional[str] = None
+            out_of_scope_claim: Optional[dict] = None
             while attempt < PLATFORM_INIT_MAX_ATTEMPTS:
                 if self._shutdown.is_set() or self._draining.is_set():
                     aborted_reason = "shutdown" if self._shutdown.is_set() else "drain"
@@ -14265,6 +14291,20 @@ is the only signal and it's misleading. Example:
                 except Exception as exc:
                     e2e_log(f"Failed to capture fix-agent claim: {exc!r}")
 
+                # Out-of-scope escalation: the fix agent identified a fix
+                # but cannot apply it (e.g. target file on a read-only bind
+                # mount). Stop the retry loop now and let the post-loop
+                # block write a rich BLOCKED.md containing the proposed
+                # diff — no point burning more attempts on a fix surface
+                # the agent can't reach.
+                if claim and claim.get("out_of_scope") is True:
+                    e2e_log(
+                        f"Platform fix agent reported out_of_scope on "
+                        f"attempt {attempt} — halting retry loop"
+                    )
+                    out_of_scope_claim = claim
+                    break
+
                 # Reset backend services before the next retry so the upcoming
                 # ensure_runtime() call re-runs setup.sh from a clean slate.
                 # Without this, each failed attempt leaves another setup.sh +
@@ -14278,6 +14318,58 @@ is the only signal and it's misleading. Example:
 
             if not runtime:
                 platform_init_failed = True
+                # Out-of-scope path: the fix agent flagged a fix it cannot
+                # apply from inside its sandbox. Surface the proposed diff
+                # to the human verbatim and stop — no point in the generic
+                # budget-exhausted summary when we have a concrete patch.
+                if out_of_scope_claim is not None:
+                    reason_line = out_of_scope_claim.get("out_of_scope_reason") or (
+                        "Fix agent reported out_of_scope: true but did not "
+                        "supply a reason."
+                    )
+                    target_path = out_of_scope_claim.get("target_path") or "(not specified)"
+                    proposed_diff = out_of_scope_claim.get("proposed_diff") or (
+                        "(agent did not supply a proposed_diff)"
+                    )
+                    root_cause = out_of_scope_claim.get("root_cause") or "(not specified)"
+                    log_pointer = str(fix_log) if fix_log else "(no log file found)"
+                    blocked_body = (
+                        f"# BLOCKED: {task.id} — Platform fix escalated (needs human)\n\n"
+                        f"Platform runtime init for `{cap}` halted on attempt "
+                        f"{attempt}/{PLATFORM_INIT_MAX_ATTEMPTS} because the "
+                        f"fix-agent cannot land the fix from inside its "
+                        f"sandbox. A human (or a host-side agent with write "
+                        f"access to the target path) needs to apply the "
+                        f"proposed patch below, then delete this file to resume.\n\n"
+                        f"## Reason\n\n{reason_line}\n\n"
+                        f"## Root cause\n\n{root_cause}\n\n"
+                        f"## Target path\n\n`{target_path}`\n\n"
+                        f"## Proposed diff\n\n"
+                        f"```diff\n{proposed_diff}\n```\n\n"
+                        f"## Capability\n\n{cap}\n\n"
+                        f"## Agent log\n\n`{log_pointer}`\n\n"
+                        f"## How to resume\n\n"
+                        f"1. Apply the proposed diff to `{target_path}` from a "
+                        f"host shell (outside any agent bwrap sandbox).\n"
+                        f"2. Sanity-check the patched file still parses / passes "
+                        f"tests where relevant.\n"
+                        f"3. Commit the change to the appropriate repo if it "
+                        f"lives in one.\n"
+                        f"4. Delete `BLOCKED.md` (the runner will pick up on "
+                        f"the next launch and retry `{task.id}`).\n"
+                    )
+                    e2e_log(
+                        f"Platform runtime {cap} out-of-scope fix "
+                        f"on attempt {attempt} — writing BLOCKED.md and stopping"
+                    )
+                    self.blocked_file.write_text(blocked_body)
+                    self._write_event(
+                        "platform_fix_blocked", spec_dir,
+                        task_id=task.id, capability=cap, attempt=attempt,
+                        reason="out_of_scope",
+                        target_path=target_path,
+                    )
+                    break
                 # Distinguish the three possible exit reasons so the BLOCKED.md
                 # body and the log line tell the truth: (a) exhausted the
                 # attempt budget, (b) shutdown/drain cut us off early, or
@@ -15473,6 +15565,142 @@ The crash log is also saved at `{crash_log_file}`.
             _wait_for_subagent(fix_task, fix_prompt, f"E2E-fix-{iteration}",
                                model=_role_model("fix", spec_dir),
                                idle_timeout_s=_role_idle_s("fix", spec_dir))
+
+            # ── Capture the fix agent's structured claim ──
+            # The prompt tells the agent to end its final message with a
+            # `<claim>{...}</claim>` JSON trailer. Two signals here drive
+            # human-escalation (writing BLOCKED.md and breaking the loop):
+            #
+            #   1. Explicit: `out_of_scope: true` — the agent identified
+            #      the fix but cannot apply it because the target is outside
+            #      its writable scope (e.g. read-only bind mount). The
+            #      proposed_diff + target_path go into BLOCKED.md verbatim
+            #      so a human / host-side agent can apply the patch.
+            #
+            #   2. Implicit: same `root_cause` with `verified: false` on
+            #      two consecutive iterations for the same set of bugs —
+            #      the agent is spinning on a cause it cannot actually
+            #      repair (often the same out-of-scope situation, just
+            #      without an explicit flag). Catch this even when the
+            #      agent forgets to use out_of_scope.
+            fix_claim: Optional[dict] = None
+            try:
+                fix_logs = sorted(
+                    self.log_dir.glob(f"agent-*-E2E-fix-{iteration}-*.jsonl"),
+                    key=lambda p: p.stat().st_mtime,
+                )
+                fix_log = fix_logs[-1] if fix_logs else None
+                fix_claim = _extract_fix_agent_claim(fix_log) if fix_log else None
+                if fix_claim is not None:
+                    claims_dir = Path(spec_dir) / "claims"
+                    claims_dir.mkdir(parents=True, exist_ok=True)
+                    claim_record = {
+                        "task_id": task.id,
+                        "iteration": iteration,
+                        "bug_ids": [b.get("id") for b in open_bugs],
+                        "fix_task_id": f"E2E-fix-{iteration}",
+                        "log_file": str(fix_log) if fix_log else None,
+                        "claim": fix_claim,
+                    }
+                    claim_path = claims_dir / f"e2e-fix-{task.id}-iter{iteration}.json"
+                    claim_path.write_text(json.dumps(claim_record, indent=2))
+                    self._write_event(
+                        "e2e_fix_claim", spec_dir,
+                        task_id=task.id, iteration=iteration,
+                        out_of_scope=bool(fix_claim.get("out_of_scope")),
+                        root_cause=fix_claim.get("root_cause"),
+                        verified=fix_claim.get("verified"),
+                        claim_path=str(claim_path),
+                    )
+            except Exception as exc:
+                e2e_log(f"Failed to capture E2E fix-agent claim: {exc!r}")
+
+            # ── Escalation check: out_of_scope OR repeat-same-root-cause ──
+            should_escalate = False
+            escalation_reason = ""
+            if fix_claim and fix_claim.get("out_of_scope") is True:
+                should_escalate = True
+                escalation_reason = "out_of_scope"
+            elif fix_claim and fix_claim.get("verified") is False and fix_claim.get("root_cause"):
+                # Look back at the previous iteration's claim for these bugs.
+                prev_iter = iteration - 1
+                prev_claim_path = (
+                    Path(spec_dir) / "claims"
+                    / f"e2e-fix-{task.id}-iter{prev_iter}.json"
+                )
+                if prev_claim_path.exists():
+                    try:
+                        prev = json.loads(prev_claim_path.read_text())
+                        prev_inner = (prev or {}).get("claim") or {}
+                        if (
+                            prev_inner.get("verified") is False
+                            and prev_inner.get("root_cause")
+                            == fix_claim.get("root_cause")
+                        ):
+                            should_escalate = True
+                            escalation_reason = "repeat_same_root_cause"
+                    except (OSError, json.JSONDecodeError):
+                        pass
+
+            if should_escalate:
+                # Compose a rich BLOCKED.md so a human (or a host-side
+                # agent with write access) can act without digging
+                # through agent logs.
+                reason_line = fix_claim.get("out_of_scope_reason") or (
+                    "Two consecutive fix iterations reported the same "
+                    "root_cause with verified=false — the loop is spinning "
+                    "on a cause it cannot repair from inside the agent sandbox."
+                )
+                target_path = fix_claim.get("target_path") or "(not specified)"
+                proposed_diff = fix_claim.get("proposed_diff") or "(agent did not supply a proposed_diff)"
+                root_cause = fix_claim.get("root_cause") or "(not specified)"
+                bug_list = ", ".join(b.get("id", "?") for b in open_bugs) or "(none)"
+                log_pointer = str(fix_log) if fix_log else "(no log file found)"
+
+                blocked_body = (
+                    f"# BLOCKED: {task.id} — E2E fix escalated (needs human)\n\n"
+                    f"The E2E fix loop halted on iteration {iteration} because "
+                    f"the fix-agent ({escalation_reason}) cannot land the fix "
+                    f"from inside its sandbox. A human (or a host-side agent "
+                    f"with write access to the target path) needs to apply the "
+                    f"proposed patch below, then delete this file to resume.\n\n"
+                    f"## Reason\n\n{reason_line}\n\n"
+                    f"## Root cause\n\n{root_cause}\n\n"
+                    f"## Target path\n\n`{target_path}`\n\n"
+                    f"## Proposed diff\n\n"
+                    f"```diff\n{proposed_diff}\n```\n\n"
+                    f"## Affected bugs\n\n{bug_list}\n\n"
+                    f"## Agent log\n\n`{log_pointer}`\n\n"
+                    f"## How to resume\n\n"
+                    f"1. Apply the proposed diff to `{target_path}` from a "
+                    f"host shell (outside any agent bwrap sandbox).\n"
+                    f"2. Sanity-check the patched file still parses / passes "
+                    f"tests where relevant.\n"
+                    f"3. Commit the change to the appropriate repo if it "
+                    f"lives in one.\n"
+                    f"4. Delete `BLOCKED.md` (the runner will pick up on "
+                    f"the next launch and retry `{task.id}`).\n"
+                )
+                e2e_log(
+                    f"E2E fix escalated ({escalation_reason}) on iteration "
+                    f"{iteration} — writing BLOCKED.md and stopping loop"
+                )
+                self.blocked_file.write_text(blocked_body)
+                self._write_event(
+                    "e2e_fix_blocked", spec_dir,
+                    task_id=task.id, iteration=iteration,
+                    reason=escalation_reason,
+                    target_path=target_path,
+                    bug_ids=[b.get("id") for b in open_bugs],
+                )
+                state["history"].append({
+                    "iteration": iteration,
+                    "result": "blocked",
+                    "reason": escalation_reason,
+                    "target_path": target_path,
+                })
+                state_file.write_text(json.dumps(state, indent=2))
+                break
 
             # ── Check if fix agent actually changed anything ──
             # Compare current HEAD and working tree against the commit before fix ran
@@ -16893,6 +17121,62 @@ The playbook's § Core principle (reproduce before hypothesizing) and § Default
 - **Do NOT skip tests** — if you can't find a test command, look harder (CLAUDE.md, Makefile, package.json, build.gradle)
 - Record any non-obvious learnings to `{learnings_file}`
 - {regression_hint}
+
+## Final-message claim trailer (MANDATORY)
+
+End your final message with a `<claim>{{...}}</claim>` JSON trailer. The
+runner parses this to decide whether to re-spawn, escalate, or close out
+the bug. If you skip it, the runner has no structured signal and will
+keep respawning fix agents blindly.
+
+**Normal (in-scope) fix:**
+
+```
+<claim>
+{{
+  "root_cause": "one-sentence concrete cause",
+  "files_changed": ["path/to/file1.ts", "path/to/file2.dart"],
+  "verified": true,
+  "evidence": "ran `cmd` and observed exit 0 / saw expected state"
+}}
+</claim>
+```
+
+**Out-of-scope fix (you identified the fix but cannot apply it):**
+
+If `Edit` / `Write` fails with `read-only file system`, `EROFS`, or
+"permission denied" on a path you expected to be writable, OR if the
+file lives outside every writable mount in your sandbox (check
+`/proc/mounts` or `mount | grep <path>`), **do not invent a workaround**
+(no patching via `verify.sh`, no self-modifying build step, no runtime
+shim). Emit this trailer instead and stop:
+
+```
+<claim>
+{{
+  "out_of_scope": true,
+  "out_of_scope_reason": "one sentence naming the write barrier concretely (mount type, errno, path)",
+  "target_path": "/absolute/path/to/file/that/needs/the/edit",
+  "root_cause": "one-sentence concrete cause",
+  "proposed_diff": "--- a/path\\n+++ b/path\\n@@ ... @@\\n ... unified diff with 2-3 lines of context ...",
+  "files_changed": [],
+  "verified": false,
+  "evidence": "attempted Edit on target_path returned 'read-only file system'; /proc/mounts confirms --ro-bind at that path"
+}}
+</claim>
+```
+
+The runner writes this diff into `BLOCKED.md` verbatim so a human (or
+host-side agent with write access) can apply it. See
+`reference/fix-agent-playbook.md` § "When you cannot apply the fix"
+and `reference/agent-file-schemas.md` IC-AGENT-016 "Out-of-scope variant"
+for the full contract.
+
+**Two consecutive iterations with the same `root_cause` and
+`verified: false` will also trigger BLOCKED.md** — so if you're spinning
+on a cause you can't actually repair, flag it explicitly with
+`out_of_scope: true` the first time rather than letting the loop discover
+it the slow way.
 """
 
     def _build_e2e_verify_prompt(self, spec_dir: str, findings_file: Path,

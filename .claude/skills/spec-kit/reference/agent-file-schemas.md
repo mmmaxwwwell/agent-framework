@@ -481,6 +481,38 @@ Emitted by the agent inside a final-message trailer (parsed by the runner, then 
 **`verified` semantics:** `true` only if the agent ran a cold-start reproduction and observed success. The runner treats `verified: false` as "fix proposed but not proven" and keeps the attempt open for the next agent.
 **Meta-fix extension:** `platform-meta-fix-*.json` adds `"structural_cause": "..."` (the one-layer-up observation) and may include `"hypothesis_falsified": "<what was ruled out>"`.
 
+### Out-of-scope variant (`out_of_scope: true`)
+
+When the fix-agent identifies a correct fix but cannot apply it because the target file is **outside its writable scope** (read-only bind mount, path in another repo the sandbox didn't grant write access to, `/nix/store` artifact, etc.), it emits the same `<claim>{...}</claim>` trailer with these additional / overridden fields:
+
+```markdown
+<claim>
+{
+  "out_of_scope": true,
+  "out_of_scope_reason": "parallel_runner.py is on a read-only bind mount inside the agent sandbox (EROFS on Edit); fix must be applied from the host",
+  "target_path": "/home/max/git/agent-framework/.claude/skills/spec-kit/parallel_runner.py",
+  "root_cause": "proc.stdin was manually close()d but proc.stdin was not nulled before proc.communicate(timeout=2), causing ValueError on the implicit flush inside communicate()",
+  "proposed_diff": "--- a/.claude/skills/spec-kit/parallel_runner.py\n+++ b/.claude/skills/spec-kit/parallel_runner.py\n@@ -5811,6 +5811,7 @@\n                     proc.stdin.close()\n                 except OSError:\n                     pass\n+                proc.stdin = None\n                 try:\n                     leftover_out, leftover_err = proc.communicate(timeout=2)",
+  "files_changed": [],
+  "verified": false,
+  "evidence": "attempted Edit on target path returned 'read-only file system'; /proc/mounts confirms target is bound with --ro-bind"
+}
+</claim>
+```
+
+**Fields specific to the out-of-scope variant:**
+
+- `out_of_scope` — boolean, `true`. The runner triggers escalation on this field alone; when absent or `false`, the claim is treated as a normal fix attempt.
+- `out_of_scope_reason` — one sentence naming the write barrier concretely (mount type, errno, path).
+- `target_path` — absolute path of the file the diff should be applied to. Required so a human or host-side agent knows where the patch lands.
+- `proposed_diff` — a real unified diff, applyable with `patch -p1` at the repo root containing `target_path`. Include 2–3 lines of context on either side. Not pseudo-code, not prose.
+- `files_changed` — `[]` (the agent did not change anything on disk).
+- `verified` — `false` (nothing was applied, nothing can be verified).
+
+**Runner behavior on `out_of_scope: true`:** the runner writes `BLOCKED.md` embedding the `proposed_diff`, `target_path`, `root_cause`, and `out_of_scope_reason` verbatim, then stops spawning fix-agents for this bug. A human or host-side agent applies the patch and removes `BLOCKED.md` to resume. See [fix-agent-playbook.md](fix-agent-playbook.md) § "When you cannot apply the fix" for authoring guidance.
+
+**Repeat-same-root-cause detection:** even if the fix-agent does not set `out_of_scope: true`, the runner will also escalate to `BLOCKED.md` if two consecutive fix attempts on the same bug emit the same `root_cause` with `verified: false`. This catches the case where the agent keeps attempting workarounds instead of flagging the scope problem explicitly.
+
 ## IC-AGENT-017: `attempt-N-diagnosis.md`
 
 - **Writer:** ci-diagnose

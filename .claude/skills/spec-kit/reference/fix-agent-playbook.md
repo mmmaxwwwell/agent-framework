@@ -237,6 +237,69 @@ COMMAND: <command(s) used to verify>
   distinguish "fix worked" from "author was lazy" — treat this as a
   correctness contract with future cycles.
 
+## When you cannot apply the fix (out-of-scope target)
+
+Sometimes the file that needs the change is **outside your writable scope**:
+the most common case is that your sandbox bind-mounts the target as
+read-only (e.g. you are a fix-agent running under bwrap and the bug is in
+`parallel_runner.py` itself, or in a `/nix/store` artifact, or in another
+repo mounted `--ro-bind`). Touching the file with `Edit` or `Write` fails
+with `EROFS` / "permission denied" / "read-only file system."
+
+**When this happens: STOP. Do not invent workarounds.** In particular do
+NOT try to patch the target via `verify.sh`, a generated build step, a
+runtime self-modification, an environment shim, or any other indirection.
+Those workarounds either fail silently or land a fragile hack that the
+next cycle has to unwind.
+
+Instead, emit an **out-of-scope claim** in your final-message trailer and
+end the turn. The runner reads this, writes a rich `BLOCKED.md` that
+includes your proposed diff verbatim, and stops spawning fix-agents for
+this bug. A human (or a host-side agent with write access to the target)
+applies the patch.
+
+```
+<claim>
+{
+  "out_of_scope": true,
+  "out_of_scope_reason": "parallel_runner.py is on a read-only bind mount inside the agent sandbox (EROFS on Edit); fix must be applied from the host",
+  "target_path": "/home/max/git/agent-framework/.claude/skills/spec-kit/parallel_runner.py",
+  "root_cause": "proc.stdin was manually close()d but proc.stdin was not nulled before proc.communicate(timeout=2), causing ValueError on the implicit flush inside communicate()",
+  "proposed_diff": "--- a/.claude/skills/spec-kit/parallel_runner.py\n+++ b/.claude/skills/spec-kit/parallel_runner.py\n@@ -5811,6 +5811,7 @@\n                     proc.stdin.close()\n                 except OSError:\n                     pass\n+                proc.stdin = None\n                 try:\n                     leftover_out, leftover_err = proc.communicate(timeout=2)",
+  "files_changed": [],
+  "verified": false,
+  "evidence": "attempted Edit on target path returned 'read-only file system'; /proc/mounts confirms target is bound with --ro-bind"
+}
+</claim>
+```
+
+**Rules for an out-of-scope claim:**
+
+- `out_of_scope: true` is the trigger — the runner uses this field alone.
+- `proposed_diff` MUST be a real unified diff that, applied with `patch -p1`
+  at the repo root containing `target_path`, produces the fix. Not pseudo-code,
+  not a prose description — a diff. Include 2–3 lines of context on either side.
+- `target_path` is the absolute path of the file to edit, so the human/host
+  agent knows where the diff lands even if they don't have the same cwd.
+- `out_of_scope_reason` is one sentence naming the write barrier concretely
+  (mount type, errno, path). "Cannot edit" is not enough — say *why*.
+- `files_changed` is `[]` because you did not change anything. `verified: false`.
+- Do NOT commit empty placeholder files, do NOT write a partial patch, do NOT
+  attempt a verify.sh workaround. The point of escalation is that the loop
+  stops trusting its own fix surface and asks for help.
+
+**Signals you are in this situation** (any one is sufficient):
+
+- `Edit` or `Write` returns an error mentioning `read-only`, `EROFS`, or
+  "permission denied" on a path you expected to be writable.
+- `/proc/mounts` (or `mount | grep <path>`) shows the target under `ro,` or
+  a `--ro-bind` entry.
+- The target is under `/nix/store/`, `/run/`, or any path that is a
+  read-only bind in the current sandbox config.
+- You just spent multiple turns writing a build step whose only purpose is
+  to mutate a file the runner itself owns. That is the workaround smell;
+  stop and emit the out-of-scope claim instead.
+
 ## Finishing
 
 Your final message should be short and structured:
@@ -255,5 +318,8 @@ How you confirmed it works (command you ran + the exit 0 evidence).
 Anything that might still fail, or that you couldn't verify.
 ```
 
-The runner reads this to decide whether to re-attempt and to seed the
-next fix-agent if you didn't fully solve it.
+End with a `<claim>{...}</claim>` JSON trailer (see
+`agent-file-schemas.md` IC-AGENT-016 for the normal-fix schema and the
+out-of-scope variant documented above). The runner reads this to decide
+whether to re-attempt, seed the next fix-agent, or escalate to a human
+via `BLOCKED.md`.
