@@ -12380,9 +12380,13 @@ Full log: `{setup_log.relative_to(project_dir) if setup_log.is_absolute() else s
                     kill_reason = (
                         f"idle for {int(idle_s)}s (no log output, budget {effective_idle}s) — killing"
                     )
-                elif wall_s > effective_wall:
+                elif wall_s > effective_wall and idle_s >= 60:
+                    # Wall cap only applies when the agent has ALSO gone
+                    # quiet for at least one watchdog tick. Actively-logging
+                    # MCP-heavy executors legitimately run long; killing
+                    # them mid-tool-call throws away work.
                     kill_reason = (
-                        f"exceeded {effective_wall}s wall-clock cap — killing"
+                        f"exceeded {effective_wall}s wall-clock cap and idle {int(idle_s)}s — killing"
                     )
                 if kill_reason:
                     e2e_log(
