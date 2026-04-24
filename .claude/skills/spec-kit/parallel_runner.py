@@ -5811,6 +5811,7 @@ class PlatformRuntime:
                     proc.stdin.close()
                 except OSError:
                     pass
+                proc.stdin = None
                 try:
                     leftover_out, leftover_err = proc.communicate(timeout=2)
                 except subprocess.TimeoutExpired:
