@@ -12071,6 +12071,33 @@ Full log: `{setup_log.relative_to(project_dir) if setup_log.is_absolute() else s
             return False
         return driver.run_regression(task, project_dir, log_fn)
 
+    def _enforce_regression_spec(self, task: Task, spec_dir: str, log_fn) -> bool:
+        """Gate: MCP-driven browser/android tasks must have a committed
+        regression spec before being marked done. Returns True if the task
+        should be blocked. iOS is excluded — no fast-path exists yet, so
+        _has_regression would incorrectly trip.
+        """
+        enforced_caps = {"mcp-browser", "mcp-android"}
+        if not (task.capabilities & enforced_caps):
+            return False
+        project_dir = Path(spec_dir).parent
+        if self._has_regression(task, project_dir):
+            return False
+        driver = self._regression_driver(task)
+        expected = [str(p) for p in driver.regression_spec_candidates(task, project_dir)] if driver else []
+        log_fn(
+            f"No committed regression spec found for {task.id} — task NOT marked done. "
+            f"Expected at: {', '.join(expected)}"
+        )
+        missing_cap = next(iter(task.capabilities & enforced_caps))
+        self._write_event(
+            "missing_regression_spec", spec_dir,
+            task_id=task.id,
+            capability=missing_cap,
+            expected_paths=expected,
+        )
+        return True
+
     # ── E2E Explore-Fix-Verify loop ──────────────────────────────────────
 
     def _run_e2e_loop(self, task: Task, spec_dir: str, task_file: Path,
@@ -16011,6 +16038,11 @@ This is build-fix attempt {attempt} of {BUILD_FIX_MAX_ATTEMPTS}.
         # Clean exploration passes (0 bugs) don't need regression checks.
         if not fix_agent_ran:
             e2e_log("No fixes applied — skipping regression check")
+            if self._enforce_regression_spec(task, spec_dir, e2e_log):
+                task.status = TaskStatus.FAILED
+                if hasattr(self, '_platform_manager'):
+                    self._platform_manager.teardown_all(project_dir=Path(spec_dir).parent if spec_dir else None)
+                return
             # Read latest findings for the completion claim
             final_findings = None
             if findings_file.exists():
@@ -16065,24 +16097,7 @@ This is build-fix attempt {attempt} of {BUILD_FIX_MAX_ATTEMPTS}.
             else:
                 e2e_log("Regression check: no report produced — task NOT marked done")
 
-        # Enforce committed regression spec for MCP-driven browser/android tasks.
-        # iOS is excluded because IOSDriver.regression_spec_candidates returns []
-        # and has no fast-path yet — _has_regression would incorrectly trip.
-        enforced_caps = {"mcp-browser", "mcp-android"}
-        if (task.capabilities & enforced_caps) and not self._has_regression(task, Path(spec_dir).parent):
-            driver = self._regression_driver(task)
-            expected = [str(p) for p in driver.regression_spec_candidates(task, Path(spec_dir).parent)] if driver else []
-            e2e_log(
-                f"No committed regression spec found for {task.id} — task NOT marked done. "
-                f"Expected at: {', '.join(expected)}"
-            )
-            missing_cap = next(iter(task.capabilities & enforced_caps))
-            self._write_event(
-                "missing_regression_spec", spec_dir,
-                task_id=task.id,
-                capability=missing_cap,
-                expected_paths=expected,
-            )
+        if self._enforce_regression_spec(task, spec_dir, e2e_log):
             task.status = TaskStatus.FAILED
             if hasattr(self, '_platform_manager'):
                 self._platform_manager.teardown_all(project_dir=Path(spec_dir).parent if spec_dir else None)
