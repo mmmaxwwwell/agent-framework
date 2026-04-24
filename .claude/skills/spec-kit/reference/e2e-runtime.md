@@ -429,6 +429,29 @@ echo "$$" > "$STATE_DIR/setup.pid"
 echo "All E2E backend services ready"
 ```
 
+### Android emulator: host-port bridging via `adb reverse`
+
+If the platform capability is `mcp-android` (or any Android E2E), the app running on the emulator sees `localhost` as the *emulator's* loopback, not the host's. Backend services started on the host are unreachable unless setup.sh wires `adb reverse` after the emulator is up.
+
+The runner sets `E2E_WANT_EMULATOR=1` for `[needs: mcp-android]` tasks. Gate the `adb reverse` block on the same flag, and run it **after** `start-emulator` / emulator boot completes — before that, adb can't see the device. `adb reverse` rules don't persist across emulator restarts, so re-apply on every setup run.
+
+Canonical block to paste into setup.sh (adjust the port list to match the services you started):
+
+```bash
+# adb reverse: device localhost:N → host 127.0.0.1:N.
+# Required for apps on the emulator to reach host services.
+# adb reverse rules don't survive emulator restarts — re-apply every run.
+if [ "${E2E_WANT_EMULATOR:-0}" = "1" ] && command -v adb >/dev/null 2>&1; then
+  adb -s emulator-5554 reverse --remove-all 2>/dev/null || true
+  for p in "$PORT_API" "$PORT_AUTH"; do
+    adb -s emulator-5554 reverse "tcp:${p}" "tcp:${p}" \
+      || echo "WARNING: adb reverse tcp:${p} failed"
+  done
+fi
+```
+
+Omitting `adb reverse` is a silent failure mode: setup.sh exits 0, the emulator boots, the app opens, and every network call to a host service returns a connection error that looks like an app bug. The executor agent's first instinct is to file a finding about "broken network path," not to suspect the runtime wiring. Wire this into setup.sh on day one.
+
 ### Task generation
 
 When the spec/plan indicates the app communicates with backend services (server, daemon, database, mesh network, etc.), task generation MUST include a setup script task **before** the MCP E2E exploration task:

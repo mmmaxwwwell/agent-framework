@@ -22,6 +22,7 @@ import json
 import math
 import os
 import re
+import selectors
 import shutil
 import signal
 import subprocess
@@ -62,6 +63,77 @@ from typing import Optional
 
 _REF_DIR = Path(__file__).parent / "reference"
 _REF_INDEX_PATH = str(_REF_DIR / "index.md")
+
+
+# ANSI escape sequences (color codes, cursor moves, etc.) and Unicode
+# box-drawing characters add no information when they reach a log line
+# tail. Worse: when a tool prints a banner like Playwright's "please run
+# install" inside a box, the *only* thing that fits in a 800-byte tail is
+# the box edge — leaving the runner reporting `stdout tail: ║` with no
+# clue what actually went wrong. Strip both before truncating.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
+_BOX_CHARS = (
+    "═║╔╗╚╝╠╣╦╩╬"   # double
+    "─│┌┐└┘├┤┬┴┼"   # single
+    "━┃┏┓┗┛┣┫┳┻╋"   # heavy
+    "▀▄█▌▐░▒▓"      # blocks/shading
+)
+_BOX_RE = re.compile(f"[{re.escape(_BOX_CHARS)}]+")
+
+
+def _decoration_stripped(text: str) -> str:
+    """Strip ANSI escapes and unicode box-drawing from `text`.
+
+    Preserves line structure: a line that becomes empty after stripping
+    is dropped entirely (so a 5-line box around 1 line of message
+    collapses to that one line). Surrounding whitespace is also
+    trimmed per-line — many tools pad the inside of a box with spaces.
+    """
+    cleaned = _ANSI_RE.sub("", text)
+    out_lines = []
+    for line in cleaned.splitlines():
+        stripped = _BOX_RE.sub("", line).strip()
+        if stripped:
+            out_lines.append(stripped)
+    return "\n".join(out_lines)
+
+
+def _useful_tail(data, n: int = 800) -> str:
+    """Return the last `n` chars of `data` with decoration stripped.
+
+    `data` may be bytes or str. Empty / all-decoration input returns
+    empty string. The strip happens *before* truncation so we don't
+    waste the budget on box edges.
+    """
+    if not data:
+        return ""
+    if isinstance(data, bytes):
+        text = data.decode(errors="replace")
+    else:
+        text = data
+    return _decoration_stripped(text)[-n:].strip()
+
+
+def _mcp_e2e_refs_for_caps(mcp_caps: set[str] | None) -> list[str]:
+    """Return the list of mcp-e2e reference files an E2E sub-agent needs.
+
+    The legacy ``mcp-e2e.md`` was a 600-line single file covering web,
+    Android, and iOS. It's now a stub that redirects to the split
+    files. The runner injects platform-neutral ``mcp-e2e-core.md``
+    plus one platform-specific companion, based on ``mcp_caps``. An
+    agent on a web task never sees Android emulator content and vice
+    versa. See ``reference/cost-guardrails.md`` § "Reference
+    injection".
+    """
+    refs = [str(_REF_DIR / "mcp-e2e-core.md")]
+    caps = mcp_caps or set()
+    if "mcp-browser" in caps:
+        refs.append(str(_REF_DIR / "mcp-e2e-web.md"))
+    if "mcp-android" in caps:
+        refs.append(str(_REF_DIR / "mcp-e2e-android.md"))
+    if "mcp-ios" in caps:
+        refs.append(str(_REF_DIR / "mcp-e2e-ios.md"))
+    return refs
 
 
 _GRAPH_USAGE_STANZA = """## code-review-graph — use the knowledge graph FIRST
@@ -106,11 +178,18 @@ If a graph tool returns empty or stale results, fall back to Read/Grep
 def _required_reads_block(role: str, abs_paths: list[str]) -> str:
     """Render the canonical Tier-1 required-reading block for a role.
 
-    CLAUDE.md is auto-prepended to every role's required list if not
-    already present — every agent must read it to pick up the project's
-    build/test commands, conventions, and the code-review-graph stanza.
-    The graph-usage stanza is appended inline so the agent sees it even
-    if it skips CLAUDE.md (which happens — model disobedience is real).
+    CLAUDE.md is auto-prepended for roles that legitimately need
+    project-wide conventions (validate, review, fix-build, crash-fix,
+    generic implementation). E2E sub-agents (``e2e-*``) do NOT get
+    CLAUDE.md auto-prepended — the parent agent has already read it
+    and the runner injects the task-specific bits directly. Sticking
+    13.9k chars of project-wide context into every E2E sub-agent's
+    sticky context costs ~$0.35/agent at typical turn counts for no
+    benefit. See ``reference/cost-guardrails.md`` § "Reference
+    injection".
+
+    The graph-usage stanza is still appended inline for every role so
+    the agent sees it even without CLAUDE.md.
 
     The ``role`` string is stable per call site (e.g. always "e2e-fix"),
     and ``abs_paths`` is a literal list per role — keep them literal so
@@ -118,14 +197,10 @@ def _required_reads_block(role: str, abs_paths: list[str]) -> str:
     comes from the agent's subsequent Read tool calls hitting the Read
     result cache (path+content keyed) on spawn 2..N within 5 minutes.
     """
-    # Auto-prepend CLAUDE.md unless already listed.  CLAUDE.md contains
-    # project-specific build/test commands and the code-review-graph
-    # CLAUDE stanza that tells agents how to use the graph tools.  Every
-    # role benefits from reading it; forgetting to include it (as
-    # happened in 13 of 17 call sites historically) means the agent
-    # never learns about project conventions or the graph.
+    # E2E sub-agents get task-specific context from the runner; they
+    # don't need the full CLAUDE.md. Everything else auto-prepends it.
     paths = list(abs_paths)
-    if "CLAUDE.md" not in paths:
+    if not role.startswith("e2e-") and "CLAUDE.md" not in paths:
         paths.insert(0, "CLAUDE.md")
 
     lines = [
@@ -170,7 +245,7 @@ def _required_reads_block(role: str, abs_paths: list[str]) -> str:
     return "\n".join(lines)
 
 
-def _reference_index_pointer() -> str:
+def _reference_index_pointer(role: str | None = None) -> str:
     """Render the canonical Tier-2 reference-index pointer.
 
     Tells the agent the path to ``reference/index.md`` so it can Read
@@ -183,7 +258,17 @@ def _reference_index_pointer() -> str:
     We pass the path, not the content — inlining the content would
     duplicate ~5KB into every per-agent prompt file (which has a
     unique path per spawn, defeating the cache).
+
+    **Not injected for E2E sub-agents** (``role`` starts with
+    ``e2e-``). The runner picks the right references for E2E roles
+    and injects them directly into the required-reads list; an E2E
+    agent never needs to classify-and-look-up because its task is
+    narrow and the reference set is known. Injecting the index adds
+    ~4k tokens of sticky context for no benefit. See
+    ``reference/cost-guardrails.md`` § "Reference injection".
     """
+    if role and role.startswith("e2e-"):
+        return ""
     return (
         "## Reference index (classify, then read on demand)\n"
         "\n"
@@ -1821,6 +1906,377 @@ ran tests/linting and found failures. Your job is to fix them.
 """
 
 
+def _detect_phase_diff_base(phase: "Phase") -> str:
+    """Find the diff base SHA for a completed phase.
+
+    Looks for commits tagged with any task id in the phase; falls back to
+    merge-base with main, then to HEAD~20 if nothing else works.
+    """
+    try:
+        task_id_list = [t.id for t in phase.tasks]
+        grep_pattern = "\\|".join(rf"\({tid}\)" for tid in task_id_list)
+        result = subprocess.run(
+            ["git", "log", "--all", "--oneline",
+             f"--grep={grep_pattern}",
+             "--reverse", "--format=%H"],
+            capture_output=True, text=True, timeout=10
+        )
+        commits = [c for c in result.stdout.strip().split("\n") if c]
+        if commits:
+            return commits[0] + "~1"
+    except Exception:
+        pass
+    try:
+        result = subprocess.run(
+            ["git", "merge-base", "HEAD", "main"],
+            capture_output=True, text=True, timeout=10
+        )
+        return result.stdout.strip() or "HEAD~20"
+    except Exception:
+        return "HEAD~20"
+
+
+# File extensions treated as "source code" for the trivial-diff check.
+# A phase that modifies ONLY files outside this set is eligible for the
+# auto-REVIEW-CLEAN fast-path — no review agent spawns.
+_SOURCE_FILE_EXTENSIONS = {
+    ".go", ".kt", ".java", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".py", ".rs", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".swift",
+    ".m", ".mm", ".dart", ".rb", ".php", ".cs", ".scala", ".clj", ".ex",
+    ".exs", ".elm", ".erl", ".hs", ".lua", ".sh", ".bash", ".zsh",
+    ".nix",  # nix modules are source — they produce runtime behavior
+}
+
+
+def _phase_diff_only_trivial(base_sha: str) -> tuple[bool, list[str]]:
+    """True when the phase's diff contains NO source-code files.
+
+    Used by the review scheduler to skip the review spawn entirely when
+    a phase only touched docs/configs/workflow files. Returns (is_trivial,
+    changed_files) — the file list is useful for the auto-written
+    REVIEW-CLEAN record.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "diff", f"{base_sha}...HEAD", "--name-only"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return (False, [])
+    if r.returncode != 0:
+        return (False, [])
+    files = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+    if not files:
+        # No diff at all — treat as trivial (nothing to review).
+        return (True, [])
+    for f in files:
+        ext = "." + f.rsplit(".", 1)[-1] if "." in f else ""
+        if ext.lower() in _SOURCE_FILE_EXTENSIONS:
+            return (False, files)
+    return (True, files)
+
+
+_TEST_FILE_PATTERNS = (
+    # Test-file naming conventions across ecosystems. Matched against
+    # lowercased basename and path. A match means "this phase touches
+    # test code" — used by VR model selection to route to a stronger
+    # model when the Test-depth audit (including shared-runtime checks)
+    # needs to run on potentially-complex test diffs.
+    ".integration.test.",      # TS/JS integration tier
+    "_integration_test.",      # Go/Python integration tier
+    ".e2e.test.",              # TS/JS E2E tier
+    "_e2e_test.",              # Go/Python E2E tier
+    ".spec.",                  # Jasmine/Karma/Scala/etc.
+    "test.ts", "test.tsx", "test.js", "test.jsx",
+    "test.py",
+    "_test.go",
+    "test.java", "tests.java",
+    "test.kt", "tests.kt",
+    "test.scala", "tests.scala",
+    "test.rs",
+    "test.rb",
+    "test.php",
+)
+
+_TEST_DIR_PATTERNS = (
+    "/test/", "/tests/", "/spec/", "/specs/", "/__tests__/",
+    "test/e2e/", "tests/e2e/",
+    "test/integration/", "tests/integration/",
+)
+
+
+def _phase_diff_touches_tests(base_sha: str) -> bool:
+    """True when the phase's diff adds or modifies any test file.
+
+    Language-agnostic detection by filename and directory fingerprint.
+    Used to decide whether VR validate needs Opus (complex concurrency
+    reasoning for the Test-depth audit) or Sonnet (default — faster and
+    cheaper). Errs on the side of True: false positives cost tokens,
+    false negatives ship shared-runtime hazards.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "diff", f"{base_sha}...HEAD", "--name-only"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        # Can't tell — upgrade to Opus to be safe.
+        return True
+    if r.returncode != 0:
+        return True
+    for ln in r.stdout.splitlines():
+        f = ln.strip().lower()
+        if not f:
+            continue
+        if any(pat in f for pat in _TEST_FILE_PATTERNS):
+            return True
+        if any(pat in f for pat in _TEST_DIR_PATTERNS):
+            return True
+    return False
+
+
+def _nix_devshell_note() -> str:
+    """Shared dev-shell note used by validate and review prompts."""
+    if not (Path.cwd() / "flake.nix").exists():
+        return ""
+    return """
+**Environment**: This project uses Nix (`flake.nix`). Your PATH already includes all tools from the nix devshell — run commands directly (e.g. `node`, `npm`, `python3`, `pytest`, `uv`). Do NOT prefix commands with `nix develop --command`. If tests fail due to missing native libraries (e.g. `libstdc++.so.6`, shared objects), that is a `flake.nix` issue — report it as an environment problem, not a code bug. Do NOT create fix tasks for environment-only failures.
+
+**Nix sandbox commands**: You are inside a sandbox. For nix commands:
+- Set `NIX_REMOTE=daemon` and pass `--extra-experimental-features 'nix-command flakes'`
+- Write output to a file: `NIX_REMOTE=daemon nix --extra-experimental-features 'nix-command flakes' flake check --print-build-logs > /tmp/nix-flake-check.log 2>&1; echo "EXIT_CODE=$?" >> /tmp/nix-flake-check.log`
+- Never pipe through `head`/`tail` — write to file and read what you need after
+- VM tests take 10-20 min — use timeout ≥1800s, run in background with TaskOutput
+- On failure, read the last 200 lines and grep for `FTL`, `FAIL`, `error:` to find root cause
+"""
+
+
+def build_validate_prompt(spec_dir: str, task_file: str, phase: "Phase",
+                          learnings_file: str) -> str:
+    """Build a validate-only prompt.
+
+    Part 1 of the split VR flow: runs build/test/lint/security/coverage,
+    writes <validate_dir>/<N>.md with PASS or FAIL. Does NOT review the
+    diff — the review agent is spawned separately only when PASS lands.
+
+    Uses Sonnet (cheaper than Opus) because Part 1 is mostly mechanical
+    — run these commands, read output, fill out a structured report.
+    """
+    phase_slug = phase.slug
+    task_ids = ", ".join(t.id for t in phase.tasks)
+    validate_dir = f"{spec_dir}/validate/{phase_slug}"
+
+    vdir = Path(validate_dir)
+    existing_attempts = sorted(
+        f for f in vdir.glob("*.md")
+        if not f.name.startswith("review-")
+    ) if vdir.exists() else []
+    attempt_num = len(existing_attempts) + 1
+
+    base_sha = _detect_phase_diff_base(phase)
+
+    _required = _required_reads_block(
+        "validate",
+        [
+            "CLAUDE.md",
+            str(_REF_DIR / "testing.md"),
+            str(_REF_DIR / "validate-review.md"),
+            str(_REF_DIR / "pre-pr.md"),
+        ],
+    )
+    _ref_index = _reference_index_pointer()
+
+    return f"""You are the **validate** agent for phase **{phase.name}** ({phase_slug}).
+
+Your job is ONLY Part 1 from `reference/validate-review.md` — run tests, build, lint, security scan; write a PASS or FAIL record. You are NOT doing code review; a separate review agent is spawned afterward when you write PASS.
+{_nix_devshell_note()}
+{_required}
+
+{_ref_index}
+
+## Context
+
+- **Phase**: {phase.name} ({phase_slug})
+- **Tasks completed in this phase**: {task_ids}
+- **Task file**: `{task_file}`
+- **Validation directory**: `{validate_dir}/`
+- **Validation attempt**: #{attempt_num}
+- **Diff base**: `{base_sha}` (use `git diff {base_sha}...HEAD` for coverage proof)
+
+## What to do
+
+Follow `reference/validate-review.md` § Part 1 through § Part 1.10. Write your outcome to `{validate_dir}/{attempt_num}.md` using the exact template in that reference file's "Part 1 output format" section.
+
+- On FAIL: exit immediately after writing the record. Do NOT spawn a review. The runner will dispatch a fix agent.
+- On PASS: write the record with the coverage proof block, then exit. The runner will spawn a review agent separately.
+
+## Rules
+
+- Do NOT touch `review-*.md` files — the review agent owns those
+- Do NOT run `git diff` for review purposes — you only need it for the coverage-proof file list
+- Do NOT read ROUTER.md or load any skills
+- Do NOT use the Skill tool
+"""
+
+
+def build_review_prompt(spec_dir: str, task_file: str, phase: "Phase",
+                        learnings_file: str, skills_dir: str,
+                        review_cycle: int = 1) -> str:
+    """Build a review-only prompt.
+
+    Part 2 of the split VR flow: reads the phase diff, runs spec-conformance,
+    test-depth audit, and bug scan; fixes issues and writes
+    <validate_dir>/review-<cycle>.md. Runs only after validate wrote PASS.
+
+    Uses Opus — review benefits from deeper reasoning.
+    """
+    phase_slug = phase.slug
+    task_ids = ", ".join(t.id for t in phase.tasks)
+    validate_dir = f"{spec_dir}/validate/{phase_slug}"
+    review_file = f"{validate_dir}/review-{review_cycle}.md"
+
+    base_sha = _detect_phase_diff_base(phase)
+
+    # Cycle 2+: find delta base from the prior review commit so we only
+    # audit what changed since last time.
+    full_base_sha = base_sha
+    delta_mode = False
+    if review_cycle > 1:
+        try:
+            prev_review = f"review #{review_cycle - 1} for {phase_slug}"
+            r = subprocess.run(
+                ["git", "log", "--all", "--oneline",
+                 f"--grep={prev_review}", "-1", "--format=%H"],
+                capture_output=True, text=True, timeout=10
+            )
+            prev_sha = r.stdout.strip()
+            if prev_sha:
+                base_sha = prev_sha
+                delta_mode = True
+        except Exception:
+            pass
+
+    if delta_mode:
+        diff_section = f"""**Delta** (changes since your last review — start here):
+```
+git diff {base_sha}...HEAD
+```
+
+**Full phase diff** (for context on how new changes interact with earlier code):
+```
+git diff {full_base_sha}...HEAD
+```
+
+Run the delta diff first. Only consult the full diff if you need to understand how a fix interacts with surrounding phase code."""
+    else:
+        diff_section = f"""```
+git diff {base_sha}...HEAD
+```
+
+Run that command to see the changes for this phase."""
+
+    # Pick the review-skill variant based on stack. We reference it by
+    # Read path (not inline) so every phase's prompt hits the same stable
+    # path → prompt cache hit on all spawns after the first.
+    review_skill = Path(skills_dir) / "code-review" / "SKILL.md"
+    pkg = Path("package.json")
+    if pkg.exists():
+        pkg_text = pkg.read_text()
+        if '"react"' in pkg_text:
+            review_skill = Path(skills_dir) / "code-review-react" / "SKILL.md"
+        elif Path("tsconfig.json").exists() or Path("src/index.ts").exists():
+            review_skill = Path(skills_dir) / "code-review-node" / "SKILL.md"
+
+    # Graph impact — pre-computed, spliced in once so the agent sees it
+    # in its first turn without a tool call.
+    graph_impact_section = ""
+    impact = _code_review_graph_detect_changes(full_base_sha)
+    if impact is not None:
+        formatted = _format_detect_changes_for_prompt(impact)
+        graph_impact_section = f"""
+### Graph impact analysis (pre-computed from `code-review-graph detect-changes`)
+
+This is a risk-scored blast radius of the phase diff, computed from the
+knowledge graph before you were spawned. Use it to prioritize: high-risk
+changes and test gaps first, low-risk isolated changes last. Cross-check
+any entry with the MCP tools (`get_impact_radius_tool`, `query_graph_tool`)
+if you need more detail on a specific symbol.
+
+{formatted}
+"""
+
+    # Prior-review context: read the files from a stable directory path.
+    # This is the Lever 4 optimization — we used to inline the review-*.md
+    # bodies into the prompt, which busted the cache on every cycle-2+
+    # spawn. Now the agent Reads them by path, cache-hit on subsequent
+    # reads.
+    prior_section = ""
+    if review_cycle > 1:
+        review_dir = Path(spec_dir) / "validate" / phase_slug
+        prior_names = [rf.name for rf in sorted(review_dir.glob("review-*.md"))]
+        if prior_names:
+            listing = "\n".join(f"- `{validate_dir}/{n}`" for n in prior_names)
+            prior_section = f"""
+## Prior review records (Read these before scanning the diff)
+
+Prior reviews for this phase. Read them so you don't re-report fixed
+issues and so you can verify that prior fixes landed:
+
+{listing}
+"""
+
+    _required = _required_reads_block(
+        "review",
+        [
+            "CLAUDE.md",
+            str(_REF_DIR / "validate-review.md"),
+            str(review_skill),
+        ],
+    )
+    _ref_index = _reference_index_pointer()
+
+    return f"""You are the **review** agent for phase **{phase.name}** ({phase_slug}). Review cycle #{review_cycle}.
+
+Part 1 (validate) already wrote PASS for this phase. Your job is ONLY Part 2 from `reference/validate-review.md`: spec-conformance audit + test-depth audit + bug scan + apply fixes + write `review-{review_cycle}.md`.
+{_nix_devshell_note()}
+{_required}
+
+{_ref_index}
+
+## Context
+
+- **Phase**: {phase.name} ({phase_slug})
+- **Tasks completed in this phase**: {task_ids}
+- **Task file**: `{task_file}`
+- **Review file to write**: `{review_file}`
+- **Review cycle**: #{review_cycle}
+
+## Diff scope
+
+{diff_section}
+{graph_impact_section}
+{prior_section}
+## What to do
+
+Follow `reference/validate-review.md` § Part 2 end-to-end:
+
+1. **Spec-conformance check** (MANDATORY before bug scan)
+2. **Test-depth audit** (MANDATORY before bug scan)
+3. **Bug scan** — exhaustive, single pass
+4. **Apply fixes** directly in code, commit with conventional messages
+5. **Re-run tests** if you made fixes, to verify you didn't break anything
+6. **Write `{review_file}`** with REVIEW-CLEAN or REVIEW-FIXES heading per the reference
+
+## Rules
+
+- Heading of `{review_file}` MUST contain either `REVIEW-CLEAN` or `REVIEW-FIXES` — the runner parses this
+- Do NOT modify validation records (`<N>.md`) — the validate agent owns those
+- Do NOT read ROUTER.md or load any skills
+- Do NOT use the Skill tool
+- Commit the review record: `docs: code review #{review_cycle} for {phase_slug}`
+"""
+
+
 def build_validate_review_prompt(spec_dir: str, task_file: str, phase: Phase,
                                   learnings_file: str, skills_dir: str,
                                   review_cycle: int = 1) -> str:
@@ -2203,6 +2659,7 @@ Read every test file in the diff. Each of the following is a violation; fix viol
 4. **No mocking inside tier boundaries.** Integration tests must not mock the database, the auth server, or internal service-to-service calls — those are *inside* the integration boundary and mocking them defeats the point. Unit tests must not mock internal modules from the same package. Mocks are only appropriate at the *outer* edge of the tier (e.g. a unit test may mock an external HTTP client; an integration test may stub a paid third-party SaaS).
 5. **Error-path coverage.** If the task adds a new endpoint, handler, or public function, the diff MUST include both a happy-path test AND at least one error-path test (invalid input, missing auth, not-found, conflict, timeout — whichever are reachable). A PR that adds a feature with only happy-path coverage is incomplete.
 6. **Behavior, not implementation.** A test that asserts "function X was called with args Y" is fragile and brittle. Prefer asserting the resulting state change or externally observable response. Spy-based tests are acceptable only when there's no externally observable signal (e.g. verifying a log line was emitted, or a side-effect-only listener fired).
+7. **Shared-runtime safety.** Read every integration/E2E test in the diff as if it were running concurrently alongside every sibling integration test in the repo. See `reference/testing.md` § "Shared-runtime review checks" for the full detection checklist. At minimum: flag hardcoded values that participate in uniqueness constraints (IDs, emails, slugs, topic/queue/bucket names, filesystem paths), position-based access on shared collections (`rows[0]` without a test-owned predicate), unscoped aggregates (`.length`/`COUNT(*)` without a filter on a test-owned ID), exact-equality deltas on non-owned metrics, cleanup that deletes by type/status/glob rather than by captured ID list, cross-case state dependencies within a file, literal names for shared external resources (filesystem/queue/cache), low-entropy uniqueness generators (`Date.now()` suffixes), and seed-data assumptions. These are the patterns that pass locally in isolation and fail the moment the test joins the shared-runtime suite — they cost multiple fix-validate cycles each, so fix them now, not after they blow up.
 
 Any test-depth violation is a bug. The test is wrong until it covers real behavior. Fix the test in this review pass — do not defer to a follow-up task.
 
@@ -2678,6 +3135,13 @@ def _build_sandbox_env(capabilities: set[str] | None = None) -> dict[str, str]:
         if token:
             env["GH_TOKEN"] = token
 
+    # Capability-gated Android emulator flag: test/e2e/setup.sh boots a
+    # qemu-system-x86 emulator (3+GB RSS, 25s cold start) only when this
+    # flag is set.  Tasks that don't need mcp-android (most integration
+    # tests) get a much lighter setup.sh run.
+    if "mcp-android" in capabilities:
+        env["E2E_WANT_EMULATOR"] = "1"
+
     return env
 
 
@@ -2792,6 +3256,12 @@ def spawn_agent(task: Task, prompt: str, log_path: Path,
             token = _acquire_gh_token()
             if token:
                 env["GH_TOKEN"] = token
+
+        # Gate Android emulator boot (see _build_sandbox_env for rationale).
+        if "mcp-android" in all_caps:
+            env["E2E_WANT_EMULATOR"] = "1"
+        else:
+            env.pop("E2E_WANT_EMULATOR", None)
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -3744,7 +4214,9 @@ def _write_e2e_completion_claim(spec_dir: str, task_id: str, e2e_dir: Path,
     claim_path.write_text(json.dumps(claim, indent=2))
 
 
-def _scan_for_skipped_tests() -> list[tuple[str, int, list[str]]]:
+def _scan_for_skipped_tests(
+    min_mtime: Optional[float] = None,
+) -> list[tuple[str, int, list[str]]]:
     """Scan known test-summary file locations for skipped-test counts.
 
     Returns a list of (summary_path, skip_count, skipped_test_names) tuples
@@ -3755,22 +4227,54 @@ def _scan_for_skipped_tests() -> list[tuple[str, int, list[str]]]:
     if a project's reporter lied about exit code, the runner refuses to
     accept a phase with skipped tests. See `reference/testing.md` §
     "Zero-skips rule".
+
+    Historical-archive handling: many harnesses (vitest, jest) write one
+    timestamped directory per run under `test-logs/<type>/<ts>/summary.json`.
+    Those archives are immutable history — a skip that existed in a run from
+    three days ago before the guard was removed is not a current failure.
+    The scanner collapses each `test-logs/<type>/` subtree to its single most
+    recent `summary.json` and ignores every older archive. Top-level summary
+    files (e.g. `test-logs/summary.json`) are always considered since they
+    are rewritten in place.
+
+    If `min_mtime` is provided, only summaries modified at or after that
+    timestamp are scanned. Callers running a fresh verification pass should
+    record `time.time()` before kicking off test commands and forward that
+    value here so summaries from previous runs cannot poison the result.
     """
     results: list[tuple[str, int, list[str]]] = []
 
-    # Common summary file locations across harnesses. Each entry may contain
-    # fields named differently (skip/skipped); tolerate both.
-    candidate_paths = [
+    # Top-level summaries — always considered (rewritten in place).
+    candidate_paths: list[Path] = [
         Path("test-logs/summary.json"),
         Path("test-logs/test-results.json"),
         Path("api/test-logs/summary.json"),
         Path("api/test-logs/test-results.json"),
     ]
-    # Also sweep any summary.json / test-results.json under test-logs/
+
+    # Timestamped archive subtrees: keep only the most recent summary per
+    # immediate child of each test-logs/<type>/ directory. Example structure:
+    #   test-logs/integration/2026-04-21T00-47-35-943Z/summary.json (old)
+    #   test-logs/integration/2026-04-22T18-02-55-846Z/summary.json (latest)
+    # We keep the latest and drop everything else.
     for root in (Path("test-logs"), Path("api/test-logs")):
-        if root.is_dir():
-            candidate_paths.extend(root.rglob("summary.json"))
-            candidate_paths.extend(root.rglob("test-results.json"))
+        if not root.is_dir():
+            continue
+        for type_dir in root.iterdir():
+            if not type_dir.is_dir():
+                continue
+            # Gather all summary.json / test-results.json under this type dir
+            archives: list[Path] = []
+            archives.extend(type_dir.rglob("summary.json"))
+            archives.extend(type_dir.rglob("test-results.json"))
+            if not archives:
+                continue
+            # Pick the single most recent file by mtime
+            try:
+                latest = max(archives, key=lambda p: p.stat().st_mtime)
+            except (OSError, ValueError):
+                continue
+            candidate_paths.append(latest)
 
     seen: set[Path] = set()
     for p in candidate_paths:
@@ -3781,6 +4285,12 @@ def _scan_for_skipped_tests() -> list[tuple[str, int, list[str]]]:
         if rp in seen or not p.is_file():
             continue
         seen.add(rp)
+        if min_mtime is not None:
+            try:
+                if p.stat().st_mtime < min_mtime:
+                    continue
+            except OSError:
+                continue
         try:
             data = json.loads(p.read_text())
         except (json.JSONDecodeError, OSError):
@@ -3965,6 +4475,14 @@ _MCP_CAPABILITIES = {"mcp-android", "mcp-browser", "mcp-ios"}
 
 # These are auto-grantable (no user intervention needed).
 _AUTO_GRANTABLE_CAPS |= _MCP_CAPABILITIES
+
+# Task-dep runtime capabilities (entries in .claude/task-deps.json).
+# TaskDepManager resolves these at runtime from the manifest, but we list
+# the common ones here so _parse_capability_request can recognize them
+# in BLOCKED.md auto-retries. The manifest is the source of truth for
+# start/stop scripts; this set just permits the literal token.
+_TASK_DEP_CAPABILITIES = {"stripe-listen"}
+_AUTO_GRANTABLE_CAPS |= _TASK_DEP_CAPABILITIES
 
 # Cross-session loop-detector threshold. If the same (task_id, capability)
 # has triggered this many *unproductive* `platform_init_fail` events within
@@ -4255,6 +4773,16 @@ class PlatformDriver:
             total += log_text.count(f'"{self.tool_prefix}{name}"')
         return total
 
+    # Overridden by platform drivers that distinguish cheap structured
+    # inspection (snapshot / accessibility tree) from expensive visual
+    # capture (screenshot). Returns (cheap_count, expensive_count).
+    #
+    # Not used to gate prompt content — the cost rule is hard and baked
+    # into every spawn's prompt up front. This method exists for
+    # post-hoc cost analysis / grading (see cost_report.py).
+    def cheap_vs_expensive_calls(self, log_text: str) -> tuple[int, int]:
+        return (0, 0)
+
     def has_live_evidence(self, findings: dict, log_path: Optional[Path]) -> int:
         """Count live-evidence signals across findings + agent log.
 
@@ -4335,6 +4863,51 @@ class PlatformDriver:
             "text renders on screen. Call real functions with real inputs and assert real state."
         )
 
+    # ── Regression fast-path ─────────────────────────────────────────
+    # When the explore agent finishes a task cleanly, it emits a
+    # platform-native regression test. On subsequent runs the runner
+    # executes that test instead of spawning the MCP agent, dropping
+    # per-run cost to ~zero agent tokens.
+    #
+    # Every driver overrides these three methods to describe its own
+    # spec path, signature detection, and run command. The base class
+    # returns "unsupported" so platforms without a regression story
+    # (today: iOS) always fall through to the MCP loop.
+
+    def regression_spec_candidates(self, task: "Task", project_dir: Path) -> list[Path]:
+        """Possible locations the agent may have emitted a regression test at.
+
+        Most drivers return a single canonical path; Android returns the
+        auto-detected Flutter project candidates. The signature check runs
+        against each candidate in order — first match wins.
+        """
+        return []
+
+    def find_regression_spec(self, task: "Task", project_dir: Path) -> Optional[Path]:
+        """Return the regression spec for ``task`` if one exists and is
+        signed (first line contains the task id and the word 'regression').
+        """
+        for cand in self.regression_spec_candidates(task, project_dir):
+            if not cand.exists():
+                continue
+            try:
+                if not cand.stat().st_size:
+                    continue
+                first = cand.read_text().splitlines()[0]
+            except OSError:
+                continue
+            if task.id.lower() in first.lower() and "regression" in first.lower():
+                return cand
+        return None
+
+    def run_regression(self, task: "Task", project_dir: Path, log_fn) -> bool:
+        """Execute the regression spec. Return True on pass, False on
+        fail/missing/unsupported. Drivers that don't support a regression
+        fast-path (base class, iOS) always return False so the runner
+        falls through to the MCP loop.
+        """
+        return False
+
 
 class AndroidDriver(PlatformDriver):
     capability = "mcp-android"
@@ -4344,12 +4917,23 @@ class AndroidDriver(PlatformDriver):
         "Type-Tool", "Drag-Tool", "Press-Tool", "Notification-Tool",
     )
 
+    def cheap_vs_expensive_calls(self, log_text: str) -> tuple[int, int]:
+        # State-Tool is cheap when called without `use_vision:true` (tree
+        # dump), expensive when called with it (includes a screenshot).
+        # Counting each as a separate bucket by scanning for the argument
+        # marker is a reasonable approximation — the exact JSON shape
+        # varies by CLI version but the substring is stable.
+        total_state = log_text.count(f'"{self.tool_prefix}State-Tool"')
+        expensive = log_text.count('"use_vision":true') + log_text.count('"use_vision": true')
+        cheap = max(total_state - expensive, 0)
+        return (cheap, expensive)
+
     def tools_prompt_section(self, e2e_dir: Path) -> str:
         return """## Available MCP tools
 
 Tools are namespaced as `mcp__mcp-android__<name>`. Call them directly — do NOT use ToolSearch to discover them.
 
-- **mcp__mcp-android__State-Tool**: Get device state. Pass `{"use_vision": true}` to include a screenshot image (**prefer this — cheaper than hierarchy dumps**). Without `use_vision`, returns the UI element tree as text.
+- **mcp__mcp-android__State-Tool**: Get device state. **Default to `{}` (no args) — returns the UI element tree as text.** Only pass `{"use_vision": true}` when you need visual evidence for a bug finding; the image it attaches costs ~10× the tree dump.
 - **mcp__mcp-android__Click-Tool**: Tap at coordinates `{"x": 540, "y": 1200}`
 - **mcp__mcp-android__Long-Click-Tool**: Long-press at coordinates `{"x": 540, "y": 1200}`
 - **mcp__mcp-android__Swipe-Tool**: Swipe from one point to another `{"x1": 540, "y1": 1600, "x2": 540, "y2": 400}` (for scrolling)
@@ -4387,6 +4971,64 @@ mkdir -p {e2e_dir}/screenshots/ && adb shell screencap -p /sdcard/nk_screen.png 
 Use a descriptive `<name>` like `T302-auth-screen`, `T302-error-invalid-key`, `T302-connected`. Then reference that path in findings.json `screenshot_path` field.
 
 Do this at least once per screen you validate and once per bug you find. Without screenshots on disk, the runner will reject your work.
+
+## MANDATORY: emit a Patrol regression test when you finish
+
+When your task's happy path is validated (all findings resolved, no open
+blockers), write a Patrol / Flutter integration test that replays the
+flow. The runner executes it on every subsequent run and skips the MCP
+agent entirely when it passes — your next pass of this task costs ~zero
+agent tokens.
+
+**Where to write it:**
+
+1. If the project has a Flutter app (a directory at the repo root with
+   `pubspec.yaml`), write to `<app-dir>/integration_test/<TASK_ID>_test.dart`.
+   Most projects have ONE Flutter app — use it. If there are multiple
+   (e.g. `customer/` + `admin/`) pick the one whose UI your task
+   actually exercises; the runner's `ANDROID_BUILD_ROOT` env var (if
+   set) names the default app.
+2. If the project is a pure Kotlin/Java Android app (no Flutter,
+   `app/build.gradle` at repo root), write to
+   `app/src/androidTest/java/<TASK_ID>Test.kt`.
+
+**Line 1 MUST be**: `// regression for <TASK_ID>` — the runner uses
+this signature to detect a valid regression on future runs.
+
+**Example (Flutter/Patrol):**
+
+```dart
+// regression for T097
+import 'package:flutter_test/flutter_test.dart';
+import 'package:integration_test/integration_test.dart';
+import 'package:patrol/patrol.dart';
+import 'package:my_app/main.dart' as app;
+
+void main() {{
+  IntegrationTestWidgetsFlutterBinding.ensureInitialized();
+  patrolTest('T097 authenticated checkout happy path', ($) async {{
+    app.main();
+    await $.pumpAndSettle();
+    await $(#emailField).enterText('user@example.com');
+    await $('Sign in').tap();
+    // ... replay the flow you just drove via MCP ...
+    // State assertion — call the same admin endpoint you curl'd earlier:
+    // (use package:http or dio + the $ADMIN_TOKEN from test/e2e/.state/env)
+  }});
+}}
+```
+
+**Rules:**
+
+- Use the element text / semanticsLabel you saw in State-Tool output —
+  those map directly to Patrol's `$('text')` and `$(#key)` selectors.
+- Assert backend state with HTTP calls to the admin API, not by
+  re-driving into admin screens (same rule as the "state-verification
+  shortcut" above).
+- If you cannot produce a regression (e.g. the flow genuinely requires
+  manual intervention), write `findings.json` with an entry
+  `{{"id":"REGRESSION-NEEDED","status":"new","summary":"..."}}` explaining
+  why — the runner treats this as a bug, not a success.
 """
 
     def verify_tools_section(self, e2e_dir: Path) -> str:
@@ -4420,6 +5062,141 @@ All namespaced as `mcp__mcp-android__<name>`.
             "persistence tests. See the task's \"Done when\" for specific behavioral assertions."
         )
 
+    # ── Regression fast-path (Patrol / Flutter integration_test) ─────
+    #
+    # Project layout is discovered dynamically — we do NOT hardcode
+    # `customer/` or `admin/`. The detection walks the project root for
+    # directories containing `pubspec.yaml` (Flutter projects) and uses
+    # `ANDROID_BUILD_ROOT` as the tiebreaker when multiple Flutter apps
+    # exist side by side. Non-Flutter Android projects (pure Gradle) are
+    # covered by the `app/src/androidTest/` fallback.
+
+    def _flutter_project_candidates(self, project_dir: Path) -> list[Path]:
+        """Find all Flutter project roots under project_dir.
+
+        A Flutter project has a `pubspec.yaml` at its root. We skip
+        hidden directories, node_modules, build outputs, and common nix
+        scratch dirs to keep detection fast.
+        """
+        override = os.environ.get("ANDROID_BUILD_ROOT")
+        if override:
+            cand = project_dir / override
+            if (cand / "pubspec.yaml").is_file():
+                return [cand]
+
+        found: list[Path] = []
+        skip_dirs = {"node_modules", "build", "dist", ".git", ".direnv",
+                     "result", ".code-review-graph", ".dev", "test-logs",
+                     "logs", "validate", "attempts", "ci-debug", ".next"}
+        # Shallow scan — Flutter projects are always within 2 levels of
+        # the repo root in practice.
+        try:
+            for sub in sorted(project_dir.iterdir()):
+                if not sub.is_dir() or sub.name.startswith("."):
+                    continue
+                if sub.name in skip_dirs:
+                    continue
+                if (sub / "pubspec.yaml").is_file():
+                    found.append(sub)
+        except OSError:
+            pass
+        return found
+
+    def regression_spec_candidates(self, task: "Task", project_dir: Path) -> list[Path]:
+        out: list[Path] = []
+        for app_dir in self._flutter_project_candidates(project_dir):
+            out.append(app_dir / "integration_test" / f"{task.id}_test.dart")
+        # Gradle fallback for pure Android projects (no Flutter).
+        # The explore agent is instructed to use this path when no Flutter
+        # app is present.
+        out.append(project_dir / "app" / "src" / "androidTest" / "java"
+                   / f"{task.id}Test.kt")
+        return out
+
+    def run_regression(self, task: "Task", project_dir: Path, log_fn) -> bool:
+        spec_p = self.find_regression_spec(task, project_dir)
+        if spec_p is None:
+            return False
+
+        # Flutter path: run `flutter test integration_test/<file>` inside
+        # the Flutter app directory. Patrol's own `patrol test` is a
+        # superset but requires extra setup; `flutter test` works for
+        # pure widget-level integration tests and for Patrol tests that
+        # don't need native interactions.
+        if spec_p.name.endswith("_test.dart"):
+            # Walk up from the spec to the Flutter app root (the
+            # directory containing `pubspec.yaml`).
+            app_dir = spec_p.parent.parent  # <app>/integration_test/<file>
+            if not (app_dir / "pubspec.yaml").is_file():
+                log_fn(f"Patrol regression: could not locate app root above {spec_p}")
+                return False
+            rel = spec_p.relative_to(app_dir)
+            log_fn(f"Patrol regression: running {rel} in {app_dir.name}/")
+            # Prefer `patrol test` if a patrol_cli binary is available
+            # (preserves native interactions). Fall back to flutter test
+            # integration_test which works for most cases.
+            cmd = self._patrol_run_cmd(app_dir, rel)
+            try:
+                r = subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    timeout=600, cwd=str(app_dir),
+                )
+            except subprocess.TimeoutExpired:
+                log_fn("Patrol regression timed out (>10 min)")
+                return False
+            except OSError as e:
+                log_fn(f"Patrol regression could not start: {e}")
+                return False
+            if r.returncode != 0:
+                log_fn(f"Patrol regression exit {r.returncode}")
+                log_fn(f"  stdout tail: {_useful_tail(r.stdout)}")
+                log_fn(f"  stderr tail: {_useful_tail(r.stderr)}")
+                return False
+            return True
+
+        # Gradle / androidTest path
+        if spec_p.suffix == ".kt":
+            log_fn(f"Gradle androidTest regression: running {spec_p.name}")
+            test_class = spec_p.stem
+            try:
+                r = subprocess.run(
+                    ["./gradlew", "connectedDebugAndroidTest",
+                     f"-Pandroid.testInstrumentationRunnerArguments.class=*.{test_class}"],
+                    capture_output=True, text=True, timeout=600,
+                    cwd=str(project_dir),
+                )
+            except (subprocess.TimeoutExpired, OSError) as e:
+                log_fn(f"Gradle regression failed to run: {e}")
+                return False
+            if r.returncode != 0:
+                log_fn(f"Gradle regression exit {r.returncode}")
+                log_fn(f"  stdout tail: {_useful_tail(r.stdout)}")
+                return False
+            return True
+
+        log_fn(f"Unknown regression spec format: {spec_p}")
+        return False
+
+    def _patrol_run_cmd(self, app_dir: Path, rel: Path) -> list[str]:
+        """Choose the best available runner for a Flutter/Patrol spec.
+
+        Preference order:
+          1. `patrol test` — full native-interaction support, needs
+             patrol_cli on PATH (installed via `dart pub global activate patrol_cli`
+             or via `flutter pub run patrol:patrol` in modern versions).
+          2. `flutter test integration_test/<file>` — widget-level
+             fallback that works in every Flutter setup.
+        """
+        # Check for patrol_cli
+        try:
+            which = subprocess.run(["which", "patrol"], capture_output=True,
+                                   text=True, timeout=5)
+            if which.returncode == 0 and which.stdout.strip():
+                return ["patrol", "test", "--target", str(rel)]
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return ["flutter", "test", str(rel)]
+
 
 class BrowserDriver(PlatformDriver):
     capability = "mcp-browser"
@@ -4434,6 +5211,11 @@ class BrowserDriver(PlatformDriver):
         "browser_wait_for", "browser_file_upload", "browser_handle_dialog",
     )
 
+    def cheap_vs_expensive_calls(self, log_text: str) -> tuple[int, int]:
+        cheap = log_text.count(f'"{self.tool_prefix}browser_snapshot"')
+        expensive = log_text.count(f'"{self.tool_prefix}browser_take_screenshot"')
+        return (cheap, expensive)
+
     def tools_prompt_section(self, e2e_dir: Path) -> str:
         return f"""## Available MCP tools
 
@@ -4442,23 +5224,24 @@ You have `mcp-browser` (Playwright). Tools are namespaced as
 to discover them.
 
 Common tools (the exact menu depends on server version — the runtime
-expose function schemas; read those, don't guess):
+exposes function schemas; read those, don't guess):
 
+- **browser_snapshot** — accessibility tree of the current page.
+  **This is your primary inspection tool.** Use it after every
+  navigate/click to see what's on screen and to get `ref` IDs for
+  subsequent clicks/types.
 - **browser_navigate** — go to a URL. `{{"url": "http://127.0.0.1:4321/kanix/"}}`.
-- **browser_snapshot** — return the accessibility tree of the current
-  page. **Prefer this over screenshots** — it's cheaper, and it gives
-  you the exact `ref` IDs you need for click/type.
 - **browser_click** — click an element by `ref` from the snapshot.
 - **browser_type** — type into an input (also by `ref`).
 - **browser_fill_form** — fill multiple fields at once (cheaper than
   one `browser_type` per field).
-- **browser_take_screenshot** — PNG snapshot. Use sparingly; screenshots
-  are expensive in context.
 - **browser_wait_for** — wait for text/selector. Prefer this over sleeps.
 - **browser_evaluate** — run JS in the page. Use for reading computed
   state that isn't in the accessibility tree.
 - **browser_network_requests** / **browser_console_messages** — capture
   requests or console output when debugging.
+- **browser_take_screenshot** — PNG capture. Only for bug evidence
+  attached to a finding. Don't call this during navigation.
 
 **Do NOT call `browser_install`.** The browser is pre-provisioned by
 Nix (`mcp-browser` wrapper points at Nix's chromium via
@@ -4467,7 +5250,7 @@ download that hangs forever inside the agent sandbox. If a tool error
 claims the browser is missing, that's a configuration bug — file it as
 a finding and stop; do NOT try to "fix" it by downloading.
 
-## Do NOT use curl / wget / fetch as a substitute
+## Do NOT use curl / wget / fetch as a substitute for UI navigation
 
 The whole point of an E2E run is to exercise the app through a real
 browser: JS executes, cookies persist across requests, Astro's client
@@ -4476,14 +5259,42 @@ iframe, etc.
 
 - `curl`, `wget`, `http`, `fetch`, `node -e "fetch(...)"` and similar
   **do not count as E2E validation** and must not be used to exercise
-  the app. If you catch yourself reaching for curl, switch to the
-  browser tools.
-- The **only** legitimate curl uses during an E2E run are: checking
-  that a backend service is up (`curl -sf http://127.0.0.1:3000/health`)
-  or reading a raw API response for cross-checking what the UI
-  displayed. Never as a replacement for a navigation flow.
+  the app (the user-visible flow). If you catch yourself reaching for
+  curl to replace a click or navigate, switch to the browser tools.
 - If the browser tools aren't working, record that as a finding and
   stop — do not fall back to curl to claim you validated the flow.
+
+## State-verification shortcuts (cheap API reads — ALLOWED)
+
+After the UI flow completes, **verify backend state via the admin API,
+not by re-driving the UI.** These reads are NOT a substitute for UI
+navigation — they are a cheaper proof of the side effect the UI just
+triggered. Using them is encouraged and massively reduces token cost.
+
+Canonical pattern: UI drives the user action, curl reads the result.
+
+```bash
+# Admin creds are written to test/e2e/.state/env by setup.sh.
+source test/e2e/.state/env
+
+# Order created by a checkout flow?
+curl -s "$API_URL/api/admin/orders/$ORDER_ID" \\
+  -H "cookie: $ADMIN_COOKIE" -H "authorization: Bearer $ADMIN_TOKEN" | jq .
+
+# Inventory reservation released?
+curl -s "$API_URL/api/admin/inventory/balances?variant_id=$V" \\
+  -H "cookie: $ADMIN_COOKIE" | jq .
+
+# Payment/webhook landed?
+curl -s "$API_URL/api/admin/payments/$PAYMENT_ID" \\
+  -H "cookie: $ADMIN_COOKIE" | jq .
+```
+
+Budget rule: one `browser_snapshot` per screen + one curl per DB-state
+assertion will beat opening the admin UI by ~20x in tokens. Prefer it.
+
+If the endpoint you need doesn't exist, file a finding — don't fall
+back to scraping the admin UI for state that should be API-readable.
 
 ## Saving screenshots to disk
 
@@ -4500,6 +5311,30 @@ browser_take_screenshot {{
 
 Use descriptive names like `T096-home`, `T096-cart`, `T096-checkout-error`.
 Reference the path in `findings.json` as `screenshot_path`.
+
+## MANDATORY: emit a Playwright regression spec when you finish
+
+Before you stop — and ONLY when your task's happy path is validated
+(all findings status `new|fixed` resolved, no open blockers) — write a
+Playwright regression test that replays the flow you just walked.
+Future runs execute `npx playwright test` instead of spawning this
+exploratory agent again, dropping repeat-run agent tokens to ~zero.
+
+- Target path: `site/tests/e2e/<task-id>.spec.ts` (create the dir if
+  missing). If the project doesn't have a Playwright project yet, create
+  a minimal `site/playwright.config.ts` alongside your spec — do NOT
+  invent a different location.
+- Use the exact locators you used via MCP (the `ref` from
+  `browser_snapshot` maps 1:1 to `getByRole`/`getByTestId`).
+- Assert the same DB state you asserted via curl — a Playwright test
+  that does an API read at the end is fine and preferred.
+- Mark the file with a `// regression for <TASK_ID>` comment on line 1
+  so the runner can detect it on future passes and skip the MCP loop.
+
+If you cannot produce a Playwright spec (e.g., the flow genuinely
+requires manual intervention), write `findings.json` with an entry
+`{{"id":"REGRESSION-NEEDED","status":"new","summary":"..."}}` explaining
+why — the runner treats this as a bug, not a success.
 """
 
     def verify_tools_section(self, e2e_dir: Path) -> str:
@@ -4530,6 +5365,40 @@ Same `mcp-browser` (Playwright) tools as the explore agent — call directly, no
             "stubbed inputs proves nothing. If the bug was in server/API logic, add an "
             "integration test that hits the real endpoint end-to-end."
         )
+
+    # ── Regression fast-path ─────────────────────────────────────────
+
+    def regression_spec_candidates(self, task: "Task", project_dir: Path) -> list[Path]:
+        return [project_dir / "site" / "tests" / "e2e" / f"{task.id}.spec.ts"]
+
+    def run_regression(self, task: "Task", project_dir: Path, log_fn) -> bool:
+        spec_p = self.find_regression_spec(task, project_dir)
+        if spec_p is None:
+            return False
+        site_dir = project_dir / "site"
+        if not site_dir.exists():
+            return False
+        rel = spec_p.relative_to(site_dir)
+        log_fn(f"Playwright regression: running {rel}")
+        try:
+            r = subprocess.run(
+                ["npx", "--no-install", "playwright", "test", str(rel),
+                 "--reporter=line"],
+                capture_output=True, text=True, timeout=600,
+                cwd=str(site_dir),
+            )
+        except subprocess.TimeoutExpired:
+            log_fn("Playwright regression timed out (>10 min)")
+            return False
+        except OSError as e:
+            log_fn(f"Playwright regression could not start: {e}")
+            return False
+        if r.returncode != 0:
+            log_fn(f"Playwright regression exit {r.returncode}")
+            log_fn(f"  stdout tail: {_useful_tail(r.stdout)}")
+            log_fn(f"  stderr tail: {_useful_tail(r.stderr)}")
+            return False
+        return True
 
 
 class IOSDriver(PlatformDriver):
@@ -4706,30 +5575,95 @@ class PlatformRuntime:
         Resolves the nix store path at config time so the Claude CLI can start
         the MCP server instantly without nix run's flake evaluation overhead.
         Falls back to nix run if resolution fails.
+
+        Token-efficiency env hints (see ``_default_mcp_env``) are injected
+        into every server entry so MCP server versions that respect them
+        default to structured (snapshot / no-vision) output. Servers that
+        ignore the hints are unaffected — the runner-side cost discipline
+        prompt block is the load-bearing enforcement.
         """
         _dir = project_dir or Path.cwd()
         server_name = f"mcp-{self.name}"
+        default_env = self._default_mcp_env()
+        default_args = self._default_mcp_args()
         if self.name in ("android", "browser", "ios"):
             # Try direct store path first (fast startup)
             binary = self._resolve_mcp_binary(server_name, _dir)
             if binary:
-                args = []
+                args = list(default_args)
                 if self.name == "android":
                     args.append("--emulator")
-                return {
-                    server_name: {
-                        "command": binary,
-                        "args": args,
-                    }
-                }
+                entry: dict = {"command": binary, "args": args}
+                if default_env:
+                    entry["env"] = default_env
+                return {server_name: entry}
             # Fall back to nix run (slow but always works)
-            return {
-                server_name: {
-                    "command": "nix",
-                    "args": self._mcp_run_args(server_name, _dir),
-                }
+            run_args = list(self._mcp_run_args(server_name, _dir))
+            # `nix run .#mcp-browser -- --snapshot-mode none` — `--` separates
+            # nix args from the binary's args. Append only if the binary
+            # has default args.
+            if default_args:
+                run_args.append("--")
+                run_args.extend(default_args)
+            entry = {
+                "command": "nix",
+                "args": run_args,
             }
+            if default_env:
+                entry["env"] = default_env
+            return {server_name: entry}
         return {}
+
+    def _default_mcp_env(self) -> dict[str, str]:
+        """Token-efficiency defaults for MCP server subprocesses.
+
+        These environment variables signal to nix-mcp-debugkit-wrapped MCP
+        servers (or any future upstream that respects them) that the agent
+        prefers structured state over screenshots. Known flags:
+
+          MCP_PREFER_SNAPSHOT=1
+              Advisory: when a tool can return either a snapshot or a
+              screenshot, prefer snapshot.
+          MCP_BROWSER_NO_AUTO_SCREENSHOT=1
+              Do NOT auto-attach a screenshot to every navigate/click
+              response. Agents must call browser_take_screenshot
+              explicitly when they want one.
+          MCP_ANDROID_DEFAULT_NO_VISION=1
+              State-Tool defaults to use_vision:false unless the tool
+              call explicitly passes use_vision:true.
+
+        MCP servers that don't know these flags ignore them, which is
+        fine — the prompt-side cost discipline block is the backstop.
+        """
+        base = {
+            "MCP_PREFER_SNAPSHOT": "1",
+        }
+        if self.name == "browser":
+            base["MCP_BROWSER_NO_AUTO_SCREENSHOT"] = "1"
+        elif self.name == "android":
+            base["MCP_ANDROID_DEFAULT_NO_VISION"] = "1"
+        return base
+
+    def _default_mcp_args(self) -> list[str]:
+        """Platform-specific MCP server CLI args for cost discipline.
+
+        For `mcp-browser` (Playwright): pass ``--snapshot-mode none`` so
+        the server does NOT auto-attach an ARIA snapshot to every tool
+        response (navigate, click, etc.). Agents must call
+        ``browser_snapshot`` explicitly when they want one. This is the
+        knob that fixes the T096 failure mode where a navigate call
+        returned 330 KB of implicit snapshot payload.
+
+        Also set ``--console-level error`` so the built-in console
+        messages feed only reports errors, not info/debug chatter that
+        bloats every turn.
+
+        Returns an empty list for platforms that don't expose matching
+        flags. See ``reference/cost-guardrails.md`` § "Browser MCP".
+        """
+        if self.name == "browser":
+            return ["--snapshot-mode", "none", "--console-level", "error"]
+        return []
 
     def start_mcp_server(self, project_dir: Path, log_fn=None) -> bool:
         """Start the MCP server process and write config file. Returns True on success."""
@@ -4794,30 +5728,99 @@ class PlatformRuntime:
         stdout_buf = b""
         status = "error"
         message = ""
+        # MCP stdio transport spec: closing stdin signals client disconnect and
+        # a compliant server shuts down cleanly. `subprocess.communicate()`
+        # closes stdin after writing, so it cannot be used to liveness-probe
+        # MCP servers — it would misread spec-compliant shutdowns as crashes.
+        # Instead: write init, keep stdin open, read one response line with a
+        # deadline, then check poll() for liveness, then terminate cleanly.
         try:
             proc = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, cwd=str(project_dir), bufsize=0,
             )
-            try:
-                stdout_buf, stderr_buf = proc.communicate(input=init_req, timeout=5)
-                # Process exited on its own within 5s → it crashed or rejected
-                # the handshake. Whatever's in stderr is probably the reason.
-                status = "crashed"
-                message = f"MCP server exited with code {proc.returncode} within 5s."
-            except subprocess.TimeoutExpired:
-                # Healthy servers block waiting for more JSON-RPC. Timing out
-                # is the *good* outcome; drain what's buffered and SIGKILL.
-                proc.kill()
-                try:
-                    stdout_buf, stderr_buf = proc.communicate(timeout=2)
-                except subprocess.TimeoutExpired:
-                    pass
-                status = "launched"
-                message = "MCP server launched and was still running at t+5s."
         except Exception as e:
             message = f"probe failed to spawn: {e!r}"
             stderr_buf = message.encode()
+            proc = None
+
+        if proc is not None:
+            try:
+                proc.stdin.write(init_req)
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError) as e:
+                # Server died before we could even write. Drain what we can.
+                try:
+                    leftover_out, leftover_err = proc.communicate(timeout=2)
+                    stdout_buf += leftover_out
+                    stderr_buf += leftover_err
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                status = "crashed"
+                message = f"MCP server closed stdin before init write: {e!r}"
+            else:
+                deadline = time.monotonic() + 5.0
+                try:
+                    # Read one line of stdout with the overall 5s deadline.
+                    # Use os.read on the fd — bufsize=0 gives us a raw FileIO
+                    # which lacks .read1, and we don't want the BufferedReader
+                    # layer's blocking reads anyway.
+                    sel = selectors.DefaultSelector()
+                    stdout_fd = proc.stdout.fileno()
+                    sel.register(stdout_fd, selectors.EVENT_READ)
+                    got_line = False
+                    while time.monotonic() < deadline:
+                        remaining = max(0.0, deadline - time.monotonic())
+                        for _key, _ev in sel.select(timeout=remaining):
+                            try:
+                                chunk = os.read(stdout_fd, 65536)
+                            except OSError:
+                                chunk = b""
+                            if not chunk:
+                                break
+                            stdout_buf += chunk
+                            if b"\n" in stdout_buf:
+                                got_line = True
+                                break
+                        if got_line or proc.poll() is not None:
+                            break
+                    sel.close()
+                finally:
+                    pass
+
+                if proc.poll() is not None:
+                    # Server exited during the read window. That's a crash
+                    # regardless of whether we got a response first — a
+                    # compliant server holds the connection open until the
+                    # client disconnects, and we did not close stdin.
+                    status = "crashed"
+                    message = (
+                        f"MCP server exited with code {proc.returncode} "
+                        f"during init handshake."
+                    )
+                else:
+                    status = "launched"
+                    message = (
+                        "MCP server launched and was still running at t+5s "
+                        "with stdin open."
+                    )
+
+                # Clean shutdown: close stdin (spec-compliant disconnect),
+                # then terminate/kill, then drain residual output for logs.
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+                try:
+                    leftover_out, leftover_err = proc.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        leftover_out, leftover_err = proc.communicate(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        leftover_out, leftover_err = b"", b""
+                stdout_buf += leftover_out
+                stderr_buf += leftover_err
 
         try:
             stderr_path.write_bytes(stderr_buf)
@@ -5111,8 +6114,7 @@ class PlatformRuntime:
                 f.write("\n")
 
         def _tail(data: bytes, n: int = 400) -> str:
-            text = data.decode(errors="replace") if data else ""
-            return text[-n:].strip()
+            return _useful_tail(data, n)
 
         # Detect build system. Check fast paths first, then multi-app repos.
         build_root: Optional[Path] = None
@@ -5433,6 +6435,34 @@ class PlatformManager:
         self._event = event_fn or (lambda _t, **_k: None)
         self._e2e_services_started = False
 
+    def _lint_android_setup_sh(self, project_dir: Path) -> None:
+        """Warn if Android target's setup.sh forgets `adb reverse`.
+
+        The Android emulator's `localhost` is its own loopback; host
+        services on `127.0.0.1:N` are unreachable without `adb reverse
+        tcp:N tcp:N` after boot. Forgetting this is the #1 silent failure
+        mode for first-time Android E2E setups: setup.sh exits 0, the
+        emulator boots, the app opens, and every network call returns
+        connection-refused — looking exactly like an app bug.
+        """
+        setup_script = project_dir / "test" / "e2e" / "setup.sh"
+        if not setup_script.exists():
+            return
+        try:
+            setup_text = setup_script.read_text()
+        except OSError:
+            return
+        if "adb reverse" in setup_text:
+            return
+        self._log(
+            "WARNING: Android target but `adb reverse` is not wired into "
+            f"{setup_script.relative_to(project_dir)}. Host services on "
+            "127.0.0.1 will be unreachable from the emulator and the "
+            "executor will see connection errors that look like app bugs. "
+            "See reference/e2e-runtime.md § 'Android emulator: host-port "
+            "bridging via adb reverse' for the canonical block."
+        )
+
     def _start_e2e_services(self, project_dir: Path) -> bool:
         """Run the project's E2E setup script to start backend services.
 
@@ -5470,8 +6500,8 @@ class PlatformManager:
             )
             if result.returncode != 0:
                 self._log(f"E2E setup failed (exit {result.returncode}):")
-                self._log(f"  stdout (last 2000 chars): {result.stdout[-2000:]}")
-                self._log(f"  stderr (last 2000 chars): {result.stderr[-2000:]}")
+                self._log(f"  stdout: {_useful_tail(result.stdout, 2000)}")
+                self._log(f"  stderr: {_useful_tail(result.stderr, 2000)}")
                 setup_log.write_text(
                     f"=== exit code: {result.returncode} ===\n"
                     f"=== stdout ===\n{result.stdout}\n"
@@ -5637,6 +6667,19 @@ class PlatformManager:
         if name in self._runtimes and self._runtimes[name]._booted:
             return self._runtimes[name]
 
+        # Static lint before we boot anything: when the target is Android,
+        # setup.sh must wire `adb reverse` for every host-side port the app
+        # talks to. Without this, the emulator sees `localhost:N` as its own
+        # loopback (not the host's), every API call returns connection-
+        # refused, and the executor agent files spurious "broken network"
+        # findings while the real cause is missing port forwarding. See
+        # reference/e2e-runtime.md § "Android emulator: host-port bridging
+        # via adb reverse" for the canonical block. Warn-only — some
+        # projects may legitimately not need port bridging (test against
+        # cloud services, mock servers in-app, etc.).
+        if capability == "mcp-android":
+            self._lint_android_setup_sh(project_dir)
+
         # Start backend services before first runtime boot
         if not self._start_e2e_services(project_dir):
             self._log("Backend E2E services failed to start — cannot proceed")
@@ -5699,8 +6742,20 @@ class PlatformManager:
         # Probe the configured binary so we capture stderr if it crashes
         # at handshake. Healthy servers block — that's the "launched"
         # outcome and we record it as ok. See probe_mcp_launch().
+        #
+        # Green = both `status="launched"` (server still alive at t+5s)
+        # AND `stdout_got_response=True` (server completed the JSON-RPC
+        # handshake). Either signal alone is insufficient: a server that
+        # crashes after writing one valid frame still returns
+        # got_response=True, but isn't usable. The runner now treats the
+        # MCP server's contract as binary — works or doesn't. If a pinned
+        # MCP server fails its probe, that's a platform problem the user
+        # must fix; the runner refuses to proceed and let the executor
+        # waste a cycle flying blind.
         probe = runtime.probe_mcp_launch(project_dir, self._log)
-        if probe.get("status") in ("launched",) or probe.get("stdout_got_response"):
+        probe_green = (probe.get("status") == "launched"
+                       and probe.get("stdout_got_response"))
+        if probe_green:
             self._event("mcp_init_ok",
                         platform=name, capability=capability,
                         probe_status=probe.get("status"))
@@ -5711,8 +6766,23 @@ class PlatformManager:
                         probe_status=probe.get("status"),
                         stderr_tail=stderr_tail,
                         message=probe.get("message", ""))
-            # Don't abort — start_mcp_server already succeeded; the probe
-            # is diagnostic. The Claude CLI may still connect successfully.
+            self._log(
+                f"MCP server `{capability}` failed its launch probe "
+                f"(status={probe.get('status')}, "
+                f"got_response={probe.get('stdout_got_response')}). "
+                f"This is a platform problem — the runner cannot let an "
+                f"executor run against a broken MCP server. "
+                f"Inspect {probe.get('stderr_path', '<no stderr captured>')} "
+                f"for the failure reason. Refusing to proceed."
+            )
+            # Tear down the partially-running MCP server before deregistering
+            # so we don't leak the subprocess. teardown() is idempotent.
+            try:
+                runtime.teardown(self._log)
+            except Exception:
+                pass
+            del self._runtimes[name]
+            return None
 
         self._log(f"{name} platform runtime fully initialized")
         return runtime
@@ -5867,6 +6937,282 @@ class PlatformManager:
     @property
     def active_runtimes(self) -> dict[str, PlatformRuntime]:
         return dict(self._runtimes)
+
+
+# ── Task-dep runtime manager (task-deps.json) ──────────────────────────
+#
+# Tasks annotated with [needs: X] where X is a key in .claude/task-deps.json
+# get a phase-scoped runtime: the dep's `start` script runs once per runner
+# session before the first task that needs it, and its `stop` script runs
+# once at teardown. This eliminates per-task start/stop thrash for heavy
+# setups like `stripe listen`, which rotates its webhook secret every
+# session and therefore requires an API restart on each cold start.
+#
+# Contract with dep scripts:
+#   - start emits a single JSON line on stdout: {"pid": N, "secret": "...",
+#     ...} (keys depend on the dep; stripe-listen emits {pid, secret,
+#     forward_to, log, reused}).
+#   - scripts are idempotent — safe to call if already running.
+#   - stop is safe to call when nothing is running.
+
+class TaskDepManager:
+    """Manages phase-scoped task-dep runtimes declared in .claude/task-deps.json.
+
+    Lifecycle: ensure(dep) starts the dep if not already started, parses the
+    JSON output for later env injection, and records the active dep. On
+    teardown_all(), every started dep's `stop` script is invoked.
+    """
+
+    def __init__(self, project_dir: Path, log_fn=None):
+        self._project_dir = project_dir
+        self._log = log_fn or (lambda msg: print(f"[task-deps] {msg}", file=sys.stderr))
+        self._deps: dict = self._load_manifest()
+        self._started: dict[str, dict] = {}  # dep_name -> parsed start output
+
+    def _load_manifest(self) -> dict:
+        manifest_p = self._project_dir / ".claude" / "task-deps.json"
+        if not manifest_p.exists():
+            return {}
+        try:
+            data = json.loads(manifest_p.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            self._log(f"Failed to read .claude/task-deps.json: {e}")
+            return {}
+        return data.get("deps") or {}
+
+    def has_dep(self, name: str) -> bool:
+        spec = self._deps.get(name)
+        if not spec:
+            return False
+        # Only deps with a real start script are managed as phase-scoped
+        # runtimes. Entries like mcp-browser (start: null) are metadata for
+        # humans / other tooling, not runnable.
+        return bool(spec.get("start"))
+
+    def has_diagnose(self, name: str) -> bool:
+        spec = self._deps.get(name)
+        return bool(spec and spec.get("diagnose"))
+
+    def diagnose(self, name: str) -> dict | None:
+        """Run the dep's `diagnose` script and return its parsed JSON.
+
+        Returns None when the dep has no diagnose entry or the script fails
+        to produce parseable JSON. The script contract is:
+          {"status": "working|fixable|broken",
+           "remediation": "<shell command>" | null,
+           "detail": "<human-readable explanation>"}
+        """
+        spec = self._deps.get(name)
+        if not spec or not spec.get("diagnose"):
+            return None
+        # The diagnose field is a shell command string (supports args), not
+        # just a script path — e.g. "scripts/mcp-diagnose.sh mcp-browser".
+        cmd = str(spec["diagnose"])
+        try:
+            r = subprocess.run(
+                ["bash", "-c", cmd],
+                capture_output=True, text=True, timeout=30,
+                cwd=str(self._project_dir),
+            )
+        except subprocess.TimeoutExpired:
+            self._log(f"dep '{name}' diagnose timed out after 30s")
+            return {"status": "broken", "remediation": None,
+                    "detail": "diagnose script timed out"}
+        except OSError as e:
+            self._log(f"dep '{name}' diagnose failed to launch: {e}")
+            return None
+
+        # Last non-empty stdout line is the JSON payload (same convention
+        # as start_output_format).
+        for line in reversed(r.stdout.strip().splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+        self._log(f"dep '{name}' diagnose emitted no parseable JSON (rc={r.returncode}): {r.stderr[-300:]}")
+        return None
+
+    def ensure_ready(self, name: str, event_writer=None) -> tuple[bool, dict | None]:
+        """Run diagnose, apply remediation if `fixable`, and report readiness.
+
+        Returns (ready, final_diagnosis):
+          ready             — True when the dep's final status is `working` or
+                              when no diagnose entry exists (unmanaged deps).
+          final_diagnosis   — the last JSON payload from the diagnose script,
+                              or None if no diagnose is configured.
+
+        Remediation chain is capped at 2 attempts (matches the cap documented
+        in phases/implement.md step 2). If the second attempt still reports
+        `fixable`, we treat it as `broken` — the hint didn't take.
+        """
+        if not self.has_diagnose(name):
+            return (True, None)
+
+        MAX_REMEDIATION_ATTEMPTS = 2
+        last: dict | None = None
+        applied_hints: list[str] = []
+
+        for attempt in range(MAX_REMEDIATION_ATTEMPTS + 1):
+            last = self.diagnose(name)
+            if last is None:
+                # Diagnose misfired (no JSON, no timeout). Let the agent see
+                # the raw failure when it spawns.
+                return (False, None)
+
+            status = last.get("status")
+            if event_writer is not None:
+                try:
+                    event_writer("task_dep_diagnose", dep=name,
+                                 status=status, attempt=attempt,
+                                 detail=(last.get("detail") or "")[:300])
+                except Exception:
+                    pass
+
+            if status == "working":
+                return (True, last)
+            if status == "broken":
+                return (False, last)
+            # status == "fixable"
+            hint = (last.get("remediation") or "").strip()
+            if not hint:
+                self._log(f"dep '{name}' status=fixable but no remediation hint; giving up")
+                return (False, last)
+            if attempt >= MAX_REMEDIATION_ATTEMPTS:
+                self._log(f"dep '{name}' still fixable after {attempt} attempts; treating as broken")
+                return (False, last)
+            if hint in applied_hints:
+                # Same hint twice → it didn't take. Don't loop.
+                self._log(f"dep '{name}' returned same hint twice; treating as broken: {hint}")
+                return (False, last)
+            applied_hints.append(hint)
+
+            self._log(f"dep '{name}' status=fixable; applying remediation: {hint}")
+            if event_writer is not None:
+                try:
+                    event_writer("task_dep_remediate", dep=name,
+                                 hint=hint, attempt=attempt)
+                except Exception:
+                    pass
+            try:
+                rr = subprocess.run(
+                    ["bash", "-c", hint],
+                    capture_output=True, text=True, timeout=600,
+                    cwd=str(self._project_dir),
+                )
+            except subprocess.TimeoutExpired:
+                self._log(f"dep '{name}' remediation '{hint}' timed out (10m cap)")
+                return (False, {"status": "broken", "remediation": None,
+                                "detail": f"remediation timed out: {hint}"})
+            except OSError as e:
+                self._log(f"dep '{name}' remediation '{hint}' failed to launch: {e}")
+                return (False, {"status": "broken", "remediation": None,
+                                "detail": f"remediation failed to launch: {e}"})
+            if rr.returncode != 0:
+                self._log(f"dep '{name}' remediation '{hint}' exit {rr.returncode}: {rr.stderr[-300:]}")
+                # Fall through and re-diagnose anyway — some remediations
+                # report non-zero but still improve the state, and the next
+                # diagnose call is the ground truth.
+
+        # Loop exit without early return means we exhausted attempts.
+        return (False, last)
+
+    def ensure(self, name: str) -> bool:
+        """Start the dep if not already started. Returns True on success."""
+        if name in self._started:
+            return True
+        spec = self._deps.get(name)
+        if not spec or not spec.get("start"):
+            return False
+        start_script = self._project_dir / spec["start"]
+        if not start_script.exists():
+            self._log(f"dep '{name}' start script missing: {start_script}")
+            return False
+
+        self._log(f"Starting task-dep '{name}' via {spec['start']}")
+        try:
+            r = subprocess.run(
+                ["bash", str(start_script)],
+                capture_output=True, text=True, timeout=120,
+                cwd=str(self._project_dir),
+            )
+        except subprocess.TimeoutExpired:
+            self._log(f"dep '{name}' start timed out")
+            return False
+        except OSError as e:
+            self._log(f"dep '{name}' start failed: {e}")
+            return False
+
+        if r.returncode != 0:
+            self._log(f"dep '{name}' start exit {r.returncode}: {r.stderr[-500:]}")
+            return False
+
+        parsed: dict = {}
+        if spec.get("start_output_format") == "json":
+            # The last non-empty line is the JSON payload (scripts may log
+            # progress on preceding lines to stderr, but stdout is reserved
+            # for the machine-readable summary per task-deps.json contract).
+            for line in reversed(r.stdout.strip().splitlines()):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                    break
+                except json.JSONDecodeError:
+                    continue
+            if not parsed:
+                self._log(f"dep '{name}' emitted no parseable JSON; using empty payload")
+
+        self._started[name] = parsed
+        reused = parsed.get("reused")
+        reused_s = " (reused existing)" if reused else ""
+        self._log(f"dep '{name}' started{reused_s}")
+        return True
+
+    def env_overrides_for(self, capabilities: set[str]) -> dict[str, str]:
+        """Env vars to inject into an agent process based on active deps.
+
+        Today this is stripe-specific: the listener writes the signing
+        secret to the project's root .env, and the running API reads it
+        at startup. The env overrides here are a convenience for agents
+        that need to hit the webhook directly (e.g. fixing an integration
+        test that forges its own signature) without round-tripping
+        through .env.
+        """
+        overrides: dict[str, str] = {}
+        if "stripe-listen" in capabilities and "stripe-listen" in self._started:
+            payload = self._started["stripe-listen"]
+            secret = payload.get("secret")
+            if secret:
+                overrides["STRIPE_WEBHOOK_SECRET"] = secret
+        return overrides
+
+    def teardown_all(self):
+        """Stop every started dep. Safe to call multiple times."""
+        for name in list(self._started.keys()):
+            spec = self._deps.get(name) or {}
+            stop_rel = spec.get("stop")
+            if not stop_rel:
+                self._started.pop(name, None)
+                continue
+            stop_script = self._project_dir / stop_rel
+            if not stop_script.exists():
+                self._log(f"dep '{name}' stop script missing: {stop_script}")
+                self._started.pop(name, None)
+                continue
+            self._log(f"Stopping task-dep '{name}' via {stop_rel}")
+            try:
+                subprocess.run(
+                    ["bash", str(stop_script)],
+                    capture_output=True, text=True, timeout=60,
+                    cwd=str(self._project_dir),
+                )
+            except Exception as e:
+                self._log(f"dep '{name}' stop error: {e}")
+            self._started.pop(name, None)
 
 
 # ── E2E Explore-Fix-Verify findings format ────────────────────────────
@@ -6081,11 +7427,381 @@ def _record_fix_attempt(e2e_dir: Path, bug_id: str, approach: str,
 EXECUTOR_MAX_SPAWNS_PER_ITER = 5
 BLOCKER_MAX_RETRIES_PER_STEP = 3
 
+# Per-spawn caps for the explore phase. A single executor spawn drops
+# its sticky tool-result context on exit; re-spawning costs one cache
+# prime but clears hundreds of kilobytes of accumulated page-snapshot
+# payloads. See reference/cost-guardrails.md § "Executor step cap".
+EXECUTOR_STEP_CAP_PER_SPAWN = 4
+EXECUTOR_WALL_CAP_S = 600  # 10 minutes
+
+# Role → model mapping for E2E sub-agents. Mechanical roles (executor,
+# fix, verify) run on Sonnet; reasoning-heavy roles (planner, diagnostic)
+# stay on Opus. Projects can override per-role via
+# `.specify/cost-config.json`. See reference/cost-guardrails.md.
+E2E_ROLE_MODELS: dict[str, str] = {
+    "planner":    "opus",
+    "executor":   "sonnet",
+    "fix":        "sonnet",   # was: implicit "opus" default; a 1-line
+                              # package.json edit cost $5.78 on opus.
+    "verify":     "sonnet",
+    "diagnostic": "opus",     # in-loop unblock; rare, reasoning-heavy
+    "supervisor": "opus",
+    "research":   "opus",
+    "crash-fix":  "sonnet",   # was: "opus"; mechanical crash-fix work
+    "build-fix":  "sonnet",
+}
+
+# Per-role idle-timeout budgets (seconds). Tight budgets catch real
+# hangs without killing legitimately slow build/install work.
+# See reference/cost-guardrails.md § "Hang budgets".
+E2E_ROLE_IDLE_S: dict[str, int] = {
+    "planner":    8 * 60,
+    "executor":   8 * 60,
+    "fix":       12 * 60,     # may run a short validate build
+    "verify":     8 * 60,
+    "diagnostic": 8 * 60,
+    "supervisor": 8 * 60,
+    "research":   8 * 60,
+    "crash-fix": 20 * 60,     # runs full builds — legitimately slow
+    "build-fix": 20 * 60,
+}
+E2E_DEFAULT_IDLE_S = 8 * 60
+
+
+def _load_cost_config(spec_dir: str | Path | None) -> dict:
+    """Load project-level cost overrides from .specify/cost-config.json.
+
+    Looks up from ``spec_dir`` to find the project root (the parent of
+    ``specs/``) and reads ``.specify/cost-config.json`` if present.
+    Returns an empty dict on any error so the runner falls back to the
+    built-in defaults. See reference/cost-guardrails.md §
+    ".specify/cost-config.json override schema".
+    """
+    if not spec_dir:
+        return {}
+    try:
+        p = Path(spec_dir).resolve()
+        # spec_dir is usually .../specs/<feature>; project root is two
+        # levels up. Try a few candidates.
+        for root in (p.parent.parent, p.parent, p):
+            cfg = root / ".specify" / "cost-config.json"
+            if cfg.exists():
+                return json.loads(cfg.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _role_model(role: str, spec_dir: str | Path | None = None) -> str:
+    """Return the model string for an E2E role, honouring project overrides."""
+    cfg = _load_cost_config(spec_dir)
+    overrides = (cfg.get("role_models") or {}) if isinstance(cfg, dict) else {}
+    if role in overrides:
+        return str(overrides[role])
+    return E2E_ROLE_MODELS.get(role, "sonnet")
+
+
+def _role_idle_s(role: str, spec_dir: str | Path | None = None) -> int:
+    """Return the idle-timeout seconds for an E2E role, honouring project overrides."""
+    cfg = _load_cost_config(spec_dir)
+    overrides = (cfg.get("hang_budget_s") or {}) if isinstance(cfg, dict) else {}
+    if isinstance(overrides, dict):
+        if role in overrides:
+            return int(overrides[role])
+        if "default" in overrides:
+            return int(overrides["default"])
+    return E2E_ROLE_IDLE_S.get(role, E2E_DEFAULT_IDLE_S)
+
 
 def _executor_dir(e2e_dir: Path) -> Path:
     d = e2e_dir / "executor"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+# Sub-agent role names whose JSONL logs contain platform-tool calls
+# during an E2E iteration. Centralized so a future role rename is a
+# one-line change here, not three sites in the engagement gate.
+# `executor` files include a `-{spawn}` segment between iter and ts;
+# `planner` and `explore` (legacy) do not. The glob templates below
+# encode that asymmetry.
+_E2E_AGENT_LOG_GLOBS = (
+    "agent-*-E2E-executor-{iteration}-*-{timestamp}.jsonl",
+    "agent-*-E2E-planner-{iteration}-{timestamp}.jsonl",
+    "agent-*-E2E-explore-{iteration}-{timestamp}.jsonl",  # legacy
+)
+
+
+def _iteration_log_paths(log_dir: Path, iteration: int, timestamp: str) -> list[Path]:
+    """Return every sub-agent JSONL log written for an E2E iteration.
+
+    Combines executor, planner, and (legacy) explore logs. Sorted by
+    path for stable ordering. Empty list when no agents ran — the
+    caller should distinguish that from "agents ran but emitted no
+    platform-tool calls" because the diagnoses differ.
+    """
+    paths: set[Path] = set()
+    for tmpl in _E2E_AGENT_LOG_GLOBS:
+        paths |= set(log_dir.glob(tmpl.format(
+            iteration=iteration, timestamp=timestamp)))
+    return sorted(paths)
+
+
+class _MergedLog:
+    """Combine several log files into a single read_text() / exists() surface.
+
+    Quacks like a Path enough for ``PlatformDriver.has_live_evidence``,
+    which only ever calls ``.exists()`` and ``.read_text()`` on its
+    argument. Used by the engagement gate to count platform-tool calls
+    across every sub-agent that ran during an iteration.
+    """
+    def __init__(self, paths):
+        self._paths = list(paths)
+
+    def exists(self) -> bool:
+        return any(p.exists() for p in self._paths)
+
+    def read_text(self) -> str:
+        parts = []
+        for p in self._paths:
+            try:
+                parts.append(p.read_text())
+            except OSError:
+                pass
+        return "\n".join(parts)
+
+
+def _load_page_manifests(e2e_dir: Path, hints: list[str] | str) -> list[dict]:
+    """Load page manifests whose filename keyword appears in any hint.
+
+    Manifests live at ``{e2e_dir}/page-manifest/<route>.json``. For a
+    task/plan that mentions ``checkout`` or ``/checkout``, the
+    ``checkout.json`` manifest is returned. Multiple matches are
+    returned in order so the injected prompt covers multi-page flows.
+
+    See ``reference/mcp-e2e-web.md`` § "Page manifests" for the schema
+    and ``reference/cost-guardrails.md`` § "Page manifests" for
+    rationale.
+    """
+    if isinstance(hints, str):
+        hints = [hints]
+    text_blob = " ".join(h or "" for h in hints).lower()
+    manifest_dir = e2e_dir / "page-manifest"
+    if not manifest_dir.exists():
+        return []
+    out: list[dict] = []
+    for mf in sorted(manifest_dir.glob("*.json")):
+        keyword = mf.stem.lower()
+        # Split hyphenated names so "product-detail.json" matches "product detail"
+        # or "product" alone (but not arbitrary substrings like "production").
+        parts = [p for p in keyword.split("-") if p]
+        matched = (
+            keyword in text_blob
+            or f"/{keyword}" in text_blob
+            or any(f" {p} " in f" {text_blob} " or f"/{p}" in text_blob for p in parts)
+        )
+        if matched:
+            try:
+                out.append(json.loads(mf.read_text()))
+            except Exception:
+                continue
+    return out
+
+
+def _format_page_manifests_section(manifests: list[dict]) -> str:
+    """Render a fenced `## Page manifests` section for prompt injection."""
+    if not manifests:
+        return ""
+    parts = [
+        "## Page manifests (use these selectors first)",
+        "",
+        "The following pages have stable selector manifests. **Use the "
+        "selectors below directly** with `browser_click` / "
+        "`browser_fill_form` — do NOT call `browser_snapshot` to "
+        "rediscover selectors. A full-page snapshot can cost $5+ in "
+        "sticky cache-read on a complex page; a manifest is ~500 bytes "
+        "and zero sticky cost. Fall back to snapshot only if a manifest "
+        "selector returns no element on the live page — then file a "
+        "finding noting the manifest is stale.",
+        "",
+    ]
+    for m in manifests:
+        route = m.get("route", "?")
+        title = m.get("title", "?")
+        parts.append(f"### {title} — `{route}`")
+        parts.append("")
+        parts.append("```json")
+        parts.append(json.dumps(m, indent=2))
+        parts.append("```")
+        parts.append("")
+    return "\n".join(parts)
+
+
+def _run_scripted_verify_phase(
+    e2e_dir: Path, open_bugs: list[dict], iteration: int, log_fn,
+) -> dict[str, str]:
+    """Run `bugs/<BUG-ID>/verify.sh` for each open bug.
+
+    Returns a map ``{bug_id: "pass"|"fail"|"inconclusive"|"missing"}``.
+    Updates ``findings.json`` in place for ``pass`` and ``fail`` results
+    and writes a runner-authored evidence file so the loop trail still
+    shows what happened without needing an agent spawn.
+
+    Contract (see ``reference/cost-guardrails.md`` § "Scripted verify
+    first"):
+      exit 0  → pass (verified fixed)
+      exit 1  → fail (verified still broken)
+      exit 2  → inconclusive (agent spawn needed)
+      other / timeout → inconclusive
+    Stdout line 1 SHOULD begin ``STATUS: FIXED`` or ``STATUS: STILL_BROKEN``.
+    """
+    findings_file = e2e_dir / "findings.json"
+    try:
+        findings = json.loads(findings_file.read_text())
+    except Exception:
+        findings = {"findings": []}
+
+    # Index findings by id for in-place updates
+    by_id = {f.get("id"): f for f in findings.get("findings", []) if f.get("id")}
+
+    # Locate project root by walking up from e2e_dir
+    # e2e_dir is .../specs/<feature>/validate/e2e → project root is 3 up
+    project_root = e2e_dir.parent.parent.parent
+    env_file = project_root / "test" / "e2e" / ".state" / "env"
+
+    # Build env for the script: inherit parent + source env_file if present
+    script_env = dict(os.environ)
+    if env_file.exists():
+        try:
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                # Strip surrounding quotes
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                    v = v[1:-1]
+                script_env[k] = v
+        except Exception:
+            pass
+
+    results: dict[str, str] = {}
+    for bug in open_bugs:
+        bug_id = bug.get("id")
+        if not bug_id:
+            continue
+        bug_dir = e2e_dir / "bugs" / bug_id
+        script = bug_dir / "verify.sh"
+        if not script.exists():
+            results[bug_id] = "missing"
+            continue
+
+        try:
+            proc = subprocess.run(
+                ["bash", str(script)],
+                capture_output=True, text=True, timeout=30,
+                cwd=str(project_root), env=script_env,
+            )
+            exit_code = proc.returncode
+            stdout = proc.stdout or ""
+            stderr = proc.stderr or ""
+        except subprocess.TimeoutExpired:
+            log_fn(f"verify.sh for {bug_id}: timeout after 30s → inconclusive")
+            results[bug_id] = "inconclusive"
+            continue
+        except Exception as exc:
+            log_fn(f"verify.sh for {bug_id}: runner error ({exc!r}) → inconclusive")
+            results[bug_id] = "inconclusive"
+            continue
+
+        if exit_code == 0:
+            result = "pass"
+            if bug_id in by_id:
+                by_id[bug_id]["status"] = "fixed"
+        elif exit_code == 1:
+            result = "fail"
+            if bug_id in by_id:
+                by_id[bug_id]["status"] = "verified_broken"
+        elif exit_code == 2:
+            result = "inconclusive"
+        else:
+            result = "inconclusive"
+
+        results[bug_id] = result
+
+        # Write evidence so the bug trail has a record without an agent.
+        evidence = (
+            f"# Verify evidence — iteration {iteration} (scripted)\n\n"
+            f"## Result: {result.upper()} (exit {exit_code})\n\n"
+            f"## Script: `{script.relative_to(project_root)}`\n\n"
+            f"## Stdout\n\n```\n{stdout}\n```\n\n"
+        )
+        if stderr.strip():
+            evidence += f"## Stderr\n\n```\n{stderr}\n```\n"
+        try:
+            (bug_dir / f"verify-evidence-{iteration}-script.md").write_text(evidence)
+        except Exception:
+            pass
+
+        log_fn(f"verify.sh for {bug_id}: exit {exit_code} → {result}")
+
+    # Persist findings if we changed any statuses
+    if any(r in ("pass", "fail") for r in results.values()):
+        try:
+            findings_file.write_text(json.dumps(findings, indent=2))
+        except Exception as exc:
+            log_fn(f"Warning: could not persist findings.json after scripted verify: {exc!r}")
+
+    return results
+
+
+def _synthesize_executor_handoff(
+    e2e_dir: Path, spawn_num: int, exit_code: int,
+) -> str | None:
+    """Build a minimal PARTIAL handoff when an executor exits without one.
+
+    Reads ``progress.md`` (which the executor updates incrementally) to
+    pick the most recent completed step. Returns None if no progress
+    exists — the caller then treats the exit as a real crash.
+
+    This is how we preserve work across hang-kills and wall-cap kills:
+    instead of discarding the whole spawn and re-planning, the next
+    spawn picks up from the last logged step. See
+    ``reference/cost-guardrails.md`` § "Hang budgets — work preservation".
+    """
+    progress = e2e_dir / "progress.md"
+    if not progress.exists():
+        return None
+    try:
+        content = progress.read_text()
+    except Exception:
+        return None
+    # Grab the last few step references from progress.md. The format is
+    # free text, but the executor prompt encourages lines like
+    # "step-N: <result>" after each step. We take the tail for context.
+    tail = "\n".join(content.splitlines()[-40:])
+    if not tail.strip():
+        return None
+    cap_reason = "hang-kill" if exit_code != 0 else "unknown-exit"
+    return (
+        f"# Executor handoff (spawn {spawn_num})\n\n"
+        f"## Status: PARTIAL\n\n"
+        f"## Cap reason: {cap_reason}\n\n"
+        f"## Steps completed this spawn\n"
+        f"- Synthesized by runner after the executor exited without "
+        f"writing a handoff (exit {exit_code}). Full progress is in "
+        f"`progress.md`; the tail is reproduced below for immediate "
+        f"context.\n\n"
+        f"## Next step to resume at: unknown — inspect `progress.md` "
+        f"and pick up from the last completed step\n\n"
+        f"## State left behind\n"
+        f"The prior spawn was killed (likely by the wall-cap or idle "
+        f"watchdog) without a clean handoff. Browser/app state may "
+        f"have been lost — treat the environment as fresh.\n\n"
+        f"## Progress tail (last 40 lines of `progress.md`)\n\n"
+        f"```\n{tail}\n```\n"
+    )
 
 
 def _blocker_step_dir(e2e_dir: Path, step_id: str) -> Path:
@@ -7472,6 +9188,14 @@ class Runner:
             except Exception:
                 pass
 
+        # Stop any phase-scoped task-dep runtimes (stripe-listen, etc.)
+        # started during this session. Safe no-op if none were started.
+        if hasattr(self, '_task_dep_manager'):
+            try:
+                self._task_dep_manager.teardown_all()
+            except Exception:
+                pass
+
         # Belt-and-suspenders: kill any Android emulator even if the platform
         # manager didn't track it (e.g. agent spawned one inside its sandbox).
         try:
@@ -7548,6 +9272,36 @@ class Runner:
                           completed=scheduler.completed_count())
         if validated_phases:
             self.log(f"Already validated: {', '.join(sorted(validated_phases))}")
+
+        # Startup recovery: retry any stale failed runner-verified.json. Prior
+        # runs may have written a `passed: false` verdict that is no longer
+        # reproducible (e.g. after a scanner bug fix, or an environment gap
+        # the user has since resolved). Without this cleanup the runner sees
+        # review-clean + rv-failed and has nothing to do, so it exits after
+        # the no-op grace period. Rerunning verification is cheap and the
+        # worst case is the same failure gets re-reported — which still
+        # matches the prior state.
+        for phase in phases:
+            rv_file = (
+                Path(spec_dir) / "validate" / phase.slug / "runner-verified.json"
+            )
+            if not rv_file.is_file():
+                continue
+            try:
+                rv_data = json.loads(rv_file.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if rv_data.get("passed", False):
+                continue  # Clean pass — preserve it
+            # Failed — drop it so verification re-runs this session
+            try:
+                rv_file.unlink()
+                self.log(
+                    f"Startup: cleared stale failed runner-verified.json for "
+                    f"{phase.name} — will re-verify this session"
+                )
+            except OSError:
+                pass
 
         consecutive_noop = 0
         max_consecutive_noop = 20
@@ -7952,6 +9706,42 @@ class Runner:
                         self._platform_manager.ensure_runtime(cap, Path.cwd())
                     task_mcp_configs = self._platform_manager.get_mcp_config_paths(task_mcp_caps)
 
+                # Phase-scoped task-dep runtimes (stripe-listen, etc.)
+                # Starts at most once per runner session; stop fires in teardown.
+                if not hasattr(self, '_task_dep_manager'):
+                    self._task_dep_manager = TaskDepManager(Path.cwd(), log_fn=self.log)
+                # Track caps we've already diagnosed this session so we don't
+                # re-probe on every task spawn — diagnose can take seconds.
+                if not hasattr(self, '_task_dep_ready'):
+                    self._task_dep_ready: dict[str, bool] = {}
+                for cap in task.capabilities:
+                    if self._task_dep_manager.has_dep(cap):
+                        self._task_dep_manager.ensure(cap)
+                    # Diagnose is independent of start/stop — a dep can have
+                    # diagnose without start (mcp-browser, mcp-android) or
+                    # both (future deps).
+                    if self._task_dep_manager.has_diagnose(cap):
+                        if self._task_dep_ready.get(cap):
+                            continue  # already verified this session
+                        ready, final = self._task_dep_manager.ensure_ready(
+                            cap,
+                            event_writer=lambda evt, **kw: self._write_event(
+                                evt, spec_dir, task_id=task.id, **kw),
+                        )
+                        self._task_dep_ready[cap] = ready
+                        if not ready:
+                            # Surface the failure to the agent through the
+                            # normal spawn path — it can then auto-unblock
+                            # or write BLOCKED.md per phases/implement.md.
+                            # We don't short-circuit here because the agent's
+                            # context (learnings.md, interview-notes.md) may
+                            # enable a fix the runner can't see.
+                            detail = (final or {}).get("detail", "no detail")
+                            self.log(
+                                f"[task-deps] cap '{cap}' diagnose failed "
+                                f"for task {task.id}: {detail[:200]}"
+                            )
+
                 proc = spawn_agent(task, prompt, log_path, stderr_path,
                                    extra_capabilities=extra_caps,
                                    mcp_config_paths=task_mcp_configs)
@@ -7975,47 +9765,45 @@ class Runner:
                 spawned += 1
                 total_runs += 1
 
-            # ── Phase-boundary validate+review ────────────────────────
-            # Single combined agent: runs tests, then reviews diff if tests
-            # pass.  Replaces the old 3-section validate/review/revalidate.
+            # ── Phase-boundary validate & review (split) ──────────────
+            #
+            # Two separate spawns:
+            #   1. validate (Sonnet) — runs tests/lint/security, writes <N>.md
+            #      with PASS or FAIL. On FAIL, runner dispatches a fix agent;
+            #      no review spawns for this phase until the next PASS.
+            #   2. review (Opus) — spawned only after validate writes PASS.
+            #      Reads diff, runs spec-conformance + test-depth + bug scan,
+            #      writes review-<cycle>.md (REVIEW-CLEAN or REVIEW-FIXES).
+            #
+            # Token wins (roughly, from measured baseline):
+            #   • Sonnet vs Opus for validate    → ~5× cheaper for Part 1
+            #   • Review skipped on trivial diff → review spawn count drops
+            #   • Skill + test-depth content loaded via Read (stable paths)
+            #     → prompt cache hits across phases
             MAX_REVIEW_CYCLES = 2
-            # Stop respawning VR agents after this many consecutive watchdog
-            # kills on the same phase. The deadlock is external to the agent
-            # (toolchain bug, infinite-loop test); further retries waste tokens.
             MAX_VR_HANGS = 3
+
             for phase in scheduler.phases_needing_validate_review():
                 if phase.slug in vr_phases:
-                    continue  # already has an agent running
+                    continue
                 if available_slots <= 0:
                     break
 
                 phase_vdir = Path(spec_dir) / "validate" / phase.slug
                 phase_vdir.mkdir(parents=True, exist_ok=True)
-
                 state = phase_states.get(phase.slug, PhaseValidationState())
-                cycle = state.review_cycle + 1
 
-                if cycle > MAX_REVIEW_CYCLES:
-                    self.log(f"Review cycle cap ({MAX_REVIEW_CYCLES}) reached for {phase.name} — treating as clean")
-                    review_file = phase_vdir / f"review-{cycle}.md"
-                    review_file.write_text(
-                        f"# Phase {phase.slug} — Review #{cycle}: REVIEW-CLEAN\n\n"
-                        f"**Date**: {datetime.now().isoformat()}\n"
-                        f"**Assessment**: Review cycle cap reached. Prior cycles addressed all critical issues.\n"
-                    )
-                    continue
-
-                # Stopgap: if this phase has hung and been killed >= MAX_VR_HANGS
-                # times, stop respawning. The deadlock is unfixable from inside
-                # the agent (likely a toolchain bug) and further retries just
-                # burn tokens.
+                # Watchdog cap on hangs still applies — same VR prefix
+                # covers both validate and review spawns so the hang
+                # history is shared.
                 vr_task_prefix = f"VR-{phase.slug}-"
                 prior_hangs = _count_prior_hangs(self.log_dir, vr_task_prefix)
                 if prior_hangs >= MAX_VR_HANGS:
-                    fail_file = phase_vdir / f"{cycle}.md"
+                    attempt_num = len(list(phase_vdir.glob("*.md"))) + 1
+                    fail_file = phase_vdir / f"{attempt_num}.md"
                     if not fail_file.exists():
                         fail_file.write_text(
-                            f"# Phase {phase.slug} — Validation #{cycle}: FAIL (HANG CAP)\n\n"
+                            f"# Phase {phase.slug} — Validation #{attempt_num}: FAIL (HANG CAP)\n\n"
                             f"**Date**: {datetime.now().isoformat()}\n"
                             f"**Assessment**: {prior_hangs} prior VR agents for this "
                             f"phase were killed by the watchdog for deadlocked "
@@ -8030,25 +9818,86 @@ class Runner:
                     )
                     continue
 
+                # Decide which spawn this phase needs right now.
+                #   not validated            → spawn validate
+                #   validated + not clean    → check trivial-diff, then spawn review
+                if not state.validated:
+                    spawn_kind = "validate"
+                else:
+                    spawn_kind = "review"
+
+                if spawn_kind == "review":
+                    # Auto-clean fast-path: if the phase diff only touched
+                    # trivial files (docs, config, flake.nix, gitignore,
+                    # CI yml), there's nothing to review. Write an
+                    # auto-REVIEW-CLEAN record and skip the spawn.
+                    base_sha = _detect_phase_diff_base(phase)
+                    is_trivial, files = _phase_diff_only_trivial(base_sha)
+                    if is_trivial:
+                        cycle = state.review_cycle + 1
+                        review_file = phase_vdir / f"review-{cycle}.md"
+                        sample = ", ".join(files[:10]) + (" …" if len(files) > 10 else "")
+                        review_file.write_text(
+                            f"# Phase {phase.slug} — Review #{cycle}: REVIEW-CLEAN\n\n"
+                            f"**Date**: {datetime.now().isoformat()}\n"
+                            f"**Assessment**: Auto-clean — phase diff contains only "
+                            f"non-source files (docs, config, workflows). No review "
+                            f"agent spawned.\n\n"
+                            f"**Changed files** ({len(files)}): {sample or '(none)'}\n"
+                        )
+                        self.log(
+                            f"Auto-REVIEW-CLEAN for {phase.name}: diff is trivial "
+                            f"({len(files)} non-source file(s))"
+                        )
+                        self._write_event("vr_auto_clean", spec_dir,
+                                          phase=phase.slug, file_count=len(files))
+                        continue
+
+                    cycle = state.review_cycle + 1
+                    if cycle > MAX_REVIEW_CYCLES:
+                        self.log(f"Review cycle cap ({MAX_REVIEW_CYCLES}) reached for {phase.name} — treating as clean")
+                        review_file = phase_vdir / f"review-{cycle}.md"
+                        review_file.write_text(
+                            f"# Phase {phase.slug} — Review #{cycle}: REVIEW-CLEAN\n\n"
+                            f"**Date**: {datetime.now().isoformat()}\n"
+                            f"**Assessment**: Review cycle cap reached. Prior cycles addressed all critical issues.\n"
+                        )
+                        continue
+
                 # Refresh the knowledge graph so the review sees post-phase
-                # commits.  Fast and idempotent; no-op when code-review-graph
-                # isn't installed.  See reference/code-review-graph.md.
+                # commits. Fast and idempotent; no-op when code-review-graph
+                # isn't installed. See reference/code-review-graph.md.
                 _code_review_graph_update()
 
-                prompt = build_validate_review_prompt(
-                    spec_dir, str(task_file), phase, str(learnings_file),
-                    str(self.skills_dir), review_cycle=cycle
-                )
+                if spawn_kind == "validate":
+                    prompt = build_validate_prompt(
+                        spec_dir, str(task_file), phase, str(learnings_file))
+                    vr_task_id = f"VR-{phase.slug}-validate"
+                    vr_desc = f"Validate: {phase.name}"
+                    # build_validate_prompt bundles Part 1 (validate) AND
+                    # Part 2 (code review) into one spawn. When the phase
+                    # diff touches test files, Part 2's Test-depth audit
+                    # (including shared-runtime hazard checks — see
+                    # reference/testing.md § "Shared-runtime review
+                    # checks") requires reasoning about concurrent
+                    # workers on a shared stack. Route to Opus when the
+                    # audit has real work to do; keep Sonnet for
+                    # production-code-only phases.
+                    base_sha = _detect_phase_diff_base(phase)
+                    if _phase_diff_touches_tests(base_sha):
+                        model = "opus"
+                    else:
+                        model = "sonnet"
+                else:
+                    prompt = build_review_prompt(
+                        spec_dir, str(task_file), phase, str(learnings_file),
+                        str(self.skills_dir), review_cycle=cycle)
+                    vr_task_id = f"VR-{phase.slug}-review-{cycle}"
+                    vr_desc = f"Review #{cycle}: {phase.name}"
+                    model = "opus"
 
                 # Append prior hang diagnoses to the variable tail so this
-                # retry knows exactly what not to run. The VR prompt body
-                # also tells agents to check logs/*.hang.md, but an explicit
-                # injection is load-bearing — the file-read instruction
-                # alone is unreliable.
-                #
-                # We APPEND (not prepend) because the prompt prefix carries
-                # the cached reference index + skill content; prepending
-                # variable per-attempt content would bust those cache hits.
+                # retry knows exactly what not to run.
                 diag_files = _find_prior_hang_diagnoses(
                     self.log_dir, vr_task_prefix, limit=2
                 )
@@ -8056,15 +9905,13 @@ class Runner:
                 if diag_section:
                     prompt = prompt + "\n\n" + diag_section
                     self.log(
-                        f"VR cycle {cycle} for {phase.name}: appending "
-                        f"{len(diag_files)} prior hang diagnosis file(s) "
-                        f"to variable tail"
+                        f"VR {spawn_kind} for {phase.name}: appending "
+                        f"{len(diag_files)} prior hang diagnosis file(s)"
                     )
 
-                vr_task_id = f"VR-{phase.slug}-{cycle}"
                 vr_task = Task(
                     id=vr_task_id,
-                    description=f"Validate+review #{cycle}: {phase.name}",
+                    description=vr_desc,
                     phase=phase.slug,
                     parallel=False,
                     status=TaskStatus.RUNNING,
@@ -8077,12 +9924,17 @@ class Runner:
                 log_path = self.log_dir / f"agent-{agent_id}-{vr_task_id}-{self.timestamp}.jsonl"
                 stderr_path = self.log_dir / f"agent-{agent_id}-{vr_task_id}-{self.timestamp}.stderr"
 
-                self.log(f"Spawning validate+review Agent {agent_id} (cycle {cycle}) for {phase.name}")
+                self.log(
+                    f"Spawning {spawn_kind} Agent {agent_id} ({model}) for {phase.name}"
+                    + (f" cycle {cycle}" if spawn_kind == "review" else "")
+                )
                 self._write_event("vr_spawn", spec_dir,
                                   phase=phase.slug, agent_id=agent_id,
-                                  cycle=cycle)
+                                  kind=spawn_kind, model=model,
+                                  cycle=(cycle if spawn_kind == "review" else None))
 
-                proc = spawn_agent(vr_task, prompt, log_path, stderr_path)
+                proc = spawn_agent(vr_task, prompt, log_path, stderr_path,
+                                   model=model)
 
                 slot = AgentSlot(
                     agent_id=agent_id,
@@ -8268,11 +10120,28 @@ class Runner:
 
                     all_passed = True
                     results = []
+                    # Capture a lower-bound mtime BEFORE running any commands.
+                    # The skip scanner later filters to summaries written at
+                    # or after this timestamp, so stale archives from prior
+                    # runs cannot poison the current verification.
+                    verify_start_mtime = time.time()
                     # Source the E2E service env if it exists, same as the
                     # pre-E2E gate — phase validation often runs integration
                     # tests too and needs DATABASE_URL etc. from setup.sh.
-                    env_sh_rv = Path("test") / "e2e" / ".state" / "env.sh"
-                    wrap_env_rv = env_sh_rv.is_file()
+                    # Probe several common locations — `test/e2e/.state/env.sh`
+                    # is the spec-kit default, but individual projects may
+                    # write the env file elsewhere (e.g. `.dev/e2e-state/`).
+                    env_sh_rv = None
+                    for candidate in (
+                        Path("test") / "e2e" / ".state" / "env.sh",
+                        Path("test") / "e2e" / ".state" / "env",
+                        Path(".dev") / "e2e-state" / "env.sh",
+                        Path(".dev") / "e2e-state" / "env",
+                    ):
+                        if candidate.is_file():
+                            env_sh_rv = candidate
+                            break
+                    wrap_env_rv = env_sh_rv is not None
                     for cmd, label in test_cmds:
                         self.log(f"  Running: {label}")
                         try:
@@ -8311,8 +10180,13 @@ class Runner:
                     # Zero-skips enforcement: even if every command exited 0,
                     # scan test summary files for skipped tests. Any skip is a
                     # FAIL regardless of reporter exit code. See
-                    # reference/testing.md § "Zero-skips rule".
-                    skipped_records = _scan_for_skipped_tests()
+                    # reference/testing.md § "Zero-skips rule". Only summaries
+                    # touched by the verification runs above are considered —
+                    # stale archives from previous runs are filtered out by
+                    # the verify_start_mtime floor.
+                    skipped_records = _scan_for_skipped_tests(
+                        min_mtime=verify_start_mtime,
+                    )
                     if skipped_records:
                         all_passed = False
                         for summary_path, count, names in skipped_records:
@@ -8536,7 +10410,8 @@ class Runner:
                 os.kill(pid, 9)
             except OSError:
                 pass
-        self._hang_probes.pop(agent.agent_id, None)
+        if hasattr(self, "_hang_probes"):
+            self._hang_probes.pop(agent.agent_id, None)
         return reason
 
     def _poll_agents(self):
@@ -9320,6 +11195,7 @@ class Runner:
         e2e_log,
         learnings_file: str,
         mcp_caps: set[str],
+        wait_for_subagent,
     ) -> bool:
         """Run integration tests against live services before the E2E crawl.
 
@@ -9502,7 +11378,7 @@ class Runner:
                 status=TaskStatus.RUNNING, line_num=0,
             )
             try:
-                _wait_for_subagent(fix_task, fix_prompt, fix_id)
+                wait_for_subagent(fix_task, fix_prompt, fix_id)
             except Exception as exc:
                 e2e_log(f"Pre-E2E gate: fix agent crashed: {exc}")
                 # Don't terminate — give the next round a chance to re-run
@@ -9980,8 +11856,22 @@ Full log: `{setup_log.relative_to(project_dir) if setup_log.is_absolute() else s
         except OSError:
             pass
 
-        env_sh = project_dir / "test" / "e2e" / ".state" / "env.sh"
-        wrap_env = env_sh.is_file()
+        # Floor used by the skip scan below — summaries written before this
+        # instant are stale archives from prior runs and must not poison the
+        # current gate result.
+        gate_start_mtime = time.time()
+
+        env_sh = None
+        for candidate in (
+            project_dir / "test" / "e2e" / ".state" / "env.sh",
+            project_dir / "test" / "e2e" / ".state" / "env",
+            project_dir / ".dev" / "e2e-state" / "env.sh",
+            project_dir / ".dev" / "e2e-state" / "env",
+        ):
+            if candidate.is_file():
+                env_sh = candidate
+                break
+        wrap_env = env_sh is not None
         if wrap_env:
             e2e_log(f"  (sourcing {env_sh.relative_to(project_dir)} for test env)")
 
@@ -10045,8 +11935,10 @@ Full log: `{setup_log.relative_to(project_dir) if setup_log.is_absolute() else s
                 e2e_log(f"    PASS")
 
         # Independent skip scan — even if every command exited 0, a reporter
-        # may have lied. See reference/testing.md § "Zero-skips rule".
-        skips = _scan_for_skipped_tests()
+        # may have lied. See reference/testing.md § "Zero-skips rule". Floor
+        # by gate_start_mtime so stale summary archives from prior runs do
+        # not contribute to the current gate result.
+        skips = _scan_for_skipped_tests(min_mtime=gate_start_mtime)
         for summary_path, count, names in skips:
             all_passed = False
             skip_summaries.append({
@@ -10148,6 +12040,35 @@ Full log: `{setup_log.relative_to(project_dir) if setup_log.is_absolute() else s
                 "body": "\n".join(body_lines),
             })
         return blockers
+
+    # ── Regression fast-path dispatch ────────────────────────────────────
+    #
+    # The actual spec-path / detection / run logic lives on each
+    # PlatformDriver so adding a new platform is one class, not a fork
+    # in the runner. iOS inherits the base class' no-op which always
+    # returns False — iOS tasks fall through to the MCP loop as today.
+
+    def _regression_driver(self, task: Task) -> Optional["PlatformDriver"]:
+        """Pick the driver that owns the regression path for this task.
+
+        Uses the same precedence as MCP tool injection (browser > android
+        > ios) so projects that mix capabilities get a deterministic
+        choice.
+        """
+        mcp_caps = task.capabilities & _MCP_CAPABILITIES
+        return _pick_driver(mcp_caps)
+
+    def _has_regression(self, task: Task, project_dir: Path) -> bool:
+        driver = self._regression_driver(task)
+        if driver is None:
+            return False
+        return driver.find_regression_spec(task, project_dir) is not None
+
+    def _run_regression(self, task: Task, project_dir: Path, log_fn) -> bool:
+        driver = self._regression_driver(task)
+        if driver is None:
+            return False
+        return driver.run_regression(task, project_dir, log_fn)
 
     # ── E2E Explore-Fix-Verify loop ──────────────────────────────────────
 
@@ -10322,17 +12243,6 @@ Full log: `{setup_log.relative_to(project_dir) if setup_log.is_absolute() else s
                 if stale.exists():
                     stale.unlink()
 
-        # Supervisor interval: every N iterations, assess progress
-        SUPERVISOR_INTERVAL = 10
-        # Watchdog: kill an agent if its JSONL log goes idle (no new
-        # entries).  MCP-heavy E2E tasks legitimately run for 45+ min with
-        # hundreds of tool calls, so a wall-clock cap is wrong — we only
-        # want to kill agents that have stopped producing output.
-        # Builds (e.g. `make gomobile`) can go 10 min without log output,
-        # so the idle threshold is generous.
-        AGENT_IDLE_TIMEOUT_S = 15 * 60   # kill after 15 min of log silence
-        AGENT_HARD_TIMEOUT_S = 120 * 60  # absolute cap as a safety net
-
         def e2e_log(msg: str):
             ts = datetime.now().strftime("%H:%M:%S")
             line = f"[{ts}] {msg}"
@@ -10347,11 +12257,58 @@ Full log: `{setup_log.relative_to(project_dir) if setup_log.is_absolute() else s
                         break
             self.log(msg)
 
+        # ── Regression fast-path (per-platform) ──
+        # If a previous E2E loop for this task already emitted a regression
+        # test (Playwright for web, Patrol/Flutter or Gradle androidTest for
+        # Android), run that instead of spawning an exploration agent.
+        # Regression runs cost ~zero agent tokens this way — the MCP loop
+        # only returns when the regression fails. iOS has no fast-path yet
+        # (IOSDriver inherits the base no-op), so it always falls through.
+        if self._has_regression(task, project_dir):
+            if self._run_regression(task, project_dir, e2e_log):
+                e2e_log(f"Regression PASS — task {task.id} done (0 agent tokens)")
+                # Mark task done via the standard completion-claim path so
+                # downstream verification still runs.
+                _write_e2e_completion_claim(spec_dir, task.id, e2e_dir, findings=None)
+                _mark_task_done(task_file, task.id)
+                return
+            else:
+                e2e_log("Regression FAILED — falling back to MCP explore loop")
+
+        # Supervisor interval: every N iterations, assess progress
+        SUPERVISOR_INTERVAL = 10
+        # Watchdog: kill an agent if its JSONL log goes idle (no new
+        # entries).  MCP-heavy E2E tasks legitimately run for 45+ min with
+        # hundreds of tool calls, so a wall-clock cap is wrong — we only
+        # want to kill agents that have stopped producing output.
+        #
+        # The default idle timeout below is a fallback for call sites
+        # that don't supply a role-specific budget. The real budgets live
+        # in E2E_ROLE_IDLE_S (module scope); each _wait_for_subagent call
+        # should pass ``idle_timeout_s=_role_idle_s(role, spec_dir)``.
+        # See reference/cost-guardrails.md § "Hang budgets".
+        AGENT_IDLE_TIMEOUT_S = E2E_DEFAULT_IDLE_S  # default: 8 min
+        AGENT_HARD_TIMEOUT_S = 120 * 60  # absolute cap as a safety net
+
         def _wait_for_subagent(sub_task: Task, prompt: str, label: str,
                                caps: set[str] | None = None,
                                mcp_configs: list[Path] | None = None,
-                               model: str = "opus") -> int:
-            """Spawn a sub-agent, track it, wait for completion. Returns exit code."""
+                               model: str = "opus",
+                               idle_timeout_s: int | None = None,
+                               wall_cap_s: int | None = None) -> int:
+            """Spawn a sub-agent, track it, wait for completion. Returns exit code.
+
+            ``idle_timeout_s`` overrides the default idle-kill budget for
+            this specific spawn. Pass ``_role_idle_s("fix", spec_dir)`` at
+            the call site; omit (or pass None) to use the outer default.
+
+            ``wall_cap_s`` optionally overrides the hard wall-clock cap
+            for this specific spawn (smaller than AGENT_HARD_TIMEOUT_S).
+            Executor spawns pass ``EXECUTOR_WALL_CAP_S`` so a single
+            spawn can't monopolize the iteration.
+            """
+            effective_idle = idle_timeout_s if idle_timeout_s is not None else AGENT_IDLE_TIMEOUT_S
+            effective_wall = wall_cap_s if wall_cap_s is not None else AGENT_HARD_TIMEOUT_S
             self.agent_counter += 1
             aid = self.agent_counter
             log_p = self.log_dir / f"agent-{aid}-{sub_task.id}-{self.timestamp}.jsonl"
@@ -10391,13 +12348,13 @@ Full log: `{setup_log.relative_to(project_dir) if setup_log.is_absolute() else s
                     last_activity = agent_start
                 idle_s = now - last_activity
                 wall_s = now - agent_start
-                if idle_s > AGENT_IDLE_TIMEOUT_S:
+                if idle_s > effective_idle:
                     kill_reason = (
-                        f"idle for {int(idle_s)}s (no log output) — killing"
+                        f"idle for {int(idle_s)}s (no log output, budget {effective_idle}s) — killing"
                     )
-                elif wall_s > AGENT_HARD_TIMEOUT_S:
+                elif wall_s > effective_wall:
                     kill_reason = (
-                        f"exceeded {AGENT_HARD_TIMEOUT_S}s hard wall-clock limit — killing"
+                        f"exceeded {effective_wall}s wall-clock cap — killing"
                     )
                 if kill_reason:
                     e2e_log(
@@ -10649,6 +12606,7 @@ Full log: `{setup_log.relative_to(project_dir) if setup_log.is_absolute() else s
             task=task, spec_dir=spec_dir, e2e_dir=e2e_dir,
             project_dir=project_dir, e2e_log=e2e_log,
             learnings_file=learnings_file, mcp_caps=mcp_caps,
+            wait_for_subagent=_wait_for_subagent,
         ):
             e2e_log("Pre-E2E integration gate FAILED — stopping")
             self._write_pre_e2e_gate_blocked(task, e2e_dir)
@@ -12416,6 +14374,15 @@ is the only signal and it's misleading. Example:
         MAX_CONSECUTIVE_EXPLORE_FAILURES = 3
         e2e_loop_succeeded = False
         fix_agent_ran = False
+        # Set when the prior iteration's fix agent ran — the next iteration
+        # must cold-restart services before explore/verify so we don't probe
+        # stale processes from before the fix landed. See the Kanix
+        # supertokens-cdi-mismatch post-mortem in fix-agent-playbook.md.
+        pending_service_reset = False
+        # Slugs reported in the prior iteration's `## Infrastructure blockers`.
+        # Repetition after a cold restart + fix-agent means the fix didn't
+        # stick (or targeted the wrong thing) — escalate instead of looping.
+        prior_infra_slugs: set[str] = set()
 
         # ── Pre-loop: rejection research ──
         # If a prior attempt was rejected by the verifier, spawn a research
@@ -12464,6 +14431,23 @@ is the only signal and it's misleading. Example:
         while not self._shutdown.is_set():
             iteration += 1
             e2e_log(f"=== E2E iteration {iteration} ===")
+
+            # ── Cold service restart after a prior-iteration fix agent ──
+            # Without this, explore/verify in the new iteration probes the
+            # same processes that were running before the fix landed —
+            # producing five straight "still broken" handoffs against
+            # orphaned daemons while the fixed code never ran.
+            if pending_service_reset:
+                try:
+                    _pdir = Path(spec_dir).parent if spec_dir else Path.cwd()
+                    e2e_log(
+                        f"Cold-restarting E2E services before iteration "
+                        f"{iteration} (prior iteration ran a fix agent)"
+                    )
+                    self._platform_manager.reset_e2e_services(_pdir)
+                except Exception as exc:
+                    e2e_log(f"reset_e2e_services raised {exc!r} — continuing anyway")
+                pending_service_reset = False
 
             # ── Supervisor check every N iterations ──
             if iteration > 1 and (iteration - 1) % SUPERVISOR_INTERVAL == 0:
@@ -12606,7 +14590,8 @@ The crash log is also saved at `{crash_log_file}`.
                 )
                 _wait_for_subagent(crash_fix_task, crash_fix_prompt,
                                    f"E2E-crash-fix-{iteration}-{crash_fix_attempt}",
-                                   model="opus")
+                                   model=_role_model("crash-fix", spec_dir),
+                                   idle_timeout_s=_role_idle_s("crash-fix", spec_dir))
 
                 # Rebuild and reinstall after fix
                 e2e_log("Rebuilding after crash fix...")
@@ -12694,10 +14679,20 @@ The crash log is also saved at `{crash_log_file}`.
                     e2e_log(f"DEBUG: {traceback.format_exc()}")
                     break
 
-                # Clean up stale exit files from prior iteration
+                # Clean up stale exit files from prior iteration. Also purge
+                # handoff-spawn-*.md archives so the engagement gate's
+                # "latest executor diagnosis" excerpt can never quote a
+                # handoff from a prior run/iteration. Without this, an old
+                # spawn-N.md sitting in the dir gets pasted into BLOCKED.md
+                # as if it were the current diagnosis, sending humans on a
+                # wild-goose chase fixing problems that were already
+                # resolved.
                 exec_d = _executor_dir(e2e_dir)
-                for stale in (exec_d / "handoff.md", exec_d / "blocker.md",
-                              e2e_dir / "plan.md"):
+                stale_files = [exec_d / "handoff.md", exec_d / "blocker.md",
+                               e2e_dir / "plan.md"]
+                if exec_d.exists():
+                    stale_files.extend(exec_d.glob("handoff-spawn-*.md"))
+                for stale in stale_files:
                     if stale.exists():
                         stale.unlink()
 
@@ -12706,6 +14701,7 @@ The crash log is also saved at `{crash_log_file}`.
                     planner_prompt = self._build_e2e_planner_prompt(
                         spec_dir, findings_file, ui_flow_content, spec_content,
                         iteration, e2e_dir, task, task_block,
+                        mcp_caps=mcp_caps,
                     )
                 except Exception as exc:
                     import traceback
@@ -12724,7 +14720,8 @@ The crash log is also saved at `{crash_log_file}`.
                     planner_exit = _wait_for_subagent(
                         planner_task, planner_prompt,
                         f"E2E-planner-{iteration}",
-                        model="opus")
+                        model=_role_model("planner", spec_dir),
+                        idle_timeout_s=_role_idle_s("planner", spec_dir))
                     e2e_log(f"Planner exit={planner_exit}")
                 except Exception as exc:
                     import traceback
@@ -12767,11 +14764,17 @@ The crash log is also saved at `{crash_log_file}`.
                             capabilities=mcp_caps,
                         )
                         try:
+                            # Resolve per-spawn wall cap (honours cost-config override)
+                            _cfg_exec = _load_cost_config(spec_dir)
+                            _wall_cap = int(_cfg_exec.get(
+                                "executor_wall_cap_s", EXECUTOR_WALL_CAP_S))
                             exec_exit = _wait_for_subagent(
                                 executor_task, executor_prompt,
                                 f"E2E-executor-{iteration}-{spawn_num}",
                                 mcp_configs=mcp_config_paths,
-                                model="sonnet")
+                                model=_role_model("executor", spec_dir),
+                                idle_timeout_s=_role_idle_s("executor", spec_dir),
+                                wall_cap_s=_wall_cap)
                         except Exception as exc:
                             import traceback
                             e2e_log(f"Executor spawn FAILED: {exc}")
@@ -12838,7 +14841,8 @@ The crash log is also saved at `{crash_log_file}`.
                                 _wait_for_subagent(
                                     diag_task, diag_prompt,
                                     f"E2E-diagnostic-{iteration}-{spawn_num}",
-                                    model="opus")
+                                    model=_role_model("diagnostic", spec_dir),
+                                    idle_timeout_s=_role_idle_s("diagnostic", spec_dir))
                             except Exception as exc:
                                 import traceback
                                 e2e_log(f"Diagnostic spawn FAILED: {exc}")
@@ -12871,6 +14875,49 @@ The crash log is also saved at `{crash_log_file}`.
                                 archive_p = exec_dir_p / f"handoff-spawn-{spawn_num}.md"
                                 archive_p.write_text(handoff_content)
                                 handoff_p.unlink()
+
+                                # Detect slugs repeating from the prior
+                                # iteration. By the time we see iteration N+1,
+                                # services have been cold-restarted and a fix
+                                # agent has run, so a repeated slug means
+                                # either (a) the fix targeted the wrong
+                                # thing, or (b) the fix was correct but the
+                                # executor is probing something else that
+                                # shares the same symptom. Either way, the
+                                # next fix agent must NOT re-apply the prior
+                                # approach. Annotate the blocker bodies so
+                                # the synthesized research file surfaces the
+                                # repeat signal to the fix agent.
+                                this_slugs = {b["slug"] for b in infra_blockers}
+                                repeated = this_slugs & prior_infra_slugs
+                                if repeated:
+                                    e2e_log(
+                                        f"⚠ Repeated infra blocker(s) after "
+                                        f"cold restart + fix attempt: "
+                                        f"{sorted(repeated)}. Prior fix did "
+                                        f"not resolve the symptom; fix agent "
+                                        f"must try a different approach."
+                                    )
+                                    for b in infra_blockers:
+                                        if b["slug"] in repeated:
+                                            b["body"] = (
+                                                f"> **⚠ REPEAT BLOCKER** — this "
+                                                f"slug (`{b['slug']}`) was "
+                                                f"already reported in "
+                                                f"iteration {iteration - 1} "
+                                                f"and a fix agent ran. "
+                                                f"Services were cold-restarted "
+                                                f"before this iteration's "
+                                                f"probe, so the prior fix did "
+                                                f"not eliminate the symptom. "
+                                                f"Read "
+                                                f"`bugs/<BUG-ID>/fix-approach-latest.md` "
+                                                f"and try a **different** "
+                                                f"approach — do not re-apply "
+                                                f"the last one.\n\n"
+                                                + b["body"]
+                                            )
+
                                 added = _synthesize_infra_findings(
                                     e2e_dir, infra_blockers, iteration, spawn_num
                                 )
@@ -12894,8 +14941,31 @@ The crash log is also saved at `{crash_log_file}`.
                             e2e_log(f"Executor {spawn_num} PARTIAL — continuing")
                             continue
 
-                        # Neither file — treat as a crash
-                        e2e_log(f"Executor {spawn_num} exited without handoff/blocker (exit {exec_exit})")
+                        # Neither file — the executor exited (or was killed)
+                        # without writing handoff or blocker. Preserve work by
+                        # synthesizing a minimal PARTIAL handoff from
+                        # progress.md (which the executor updates after each
+                        # step) so the next spawn can continue. This catches
+                        # the hang-kill and wall-cap cases described in
+                        # cost-guardrails.md § "Hang budgets — work preservation".
+                        synthesized = _synthesize_executor_handoff(
+                            e2e_dir, spawn_num, exec_exit,
+                        )
+                        if synthesized is not None:
+                            archive_p = exec_dir_p / f"handoff-spawn-{spawn_num}.md"
+                            archive_p.write_text(synthesized)
+                            prior_handoff = synthesized
+                            prior_handoff_path = archive_p
+                            e2e_log(
+                                f"Executor {spawn_num} exited without handoff "
+                                f"(exit {exec_exit}) — synthesized PARTIAL handoff "
+                                f"from progress.md; continuing with next spawn"
+                            )
+                            continue
+                        e2e_log(
+                            f"Executor {spawn_num} exited without handoff/blocker "
+                            f"(exit {exec_exit}); no progress to synthesize — ending"
+                        )
                         explore_exit = exec_exit if exec_exit != 0 else 1
                         break
                     else:
@@ -13045,9 +15115,33 @@ The crash log is also saved at `{crash_log_file}`.
             # `mcp__mcp-android__*`, and iOS can be plugged in without
             # editing this site.
             driver = _pick_driver(mcp_caps)
-            explore_log = self.log_dir / f"agent-{self.agent_counter}-E2E-explore-{iteration}-{self.timestamp}.jsonl"
+            # The engagement gate accepts evidence from any sub-agent that
+            # ran this iteration (planner, executor spawns, or the legacy
+            # single-explore role). What matters is whether *some* sub-agent
+            # drove the platform — picking only one filename pattern (as the
+            # prior implementation did, hard-coded to the now-deprecated
+            # explore role) produced false negatives that wrote BLOCKED.md
+            # after a clean run. See _iteration_log_paths for the role list.
+            iter_log_paths = _iteration_log_paths(
+                self.log_dir, iteration, self.timestamp)
+            merged_log = _MergedLog(iter_log_paths)
+            # Keep the single-path symbol around for the crash-detection block
+            # below (which reads stderr from "the" explore log) and for the
+            # MCP-init-status probe which only inspects the first line of one
+            # file. Prefer the planner log if present (it's the entry point
+            # for the iteration); fall back to the latest agent log we found.
+            planner_log_match = list(self.log_dir.glob(
+                f"agent-*-E2E-planner-{iteration}-{self.timestamp}.jsonl"))
+            if planner_log_match:
+                explore_log = planner_log_match[0]
+            elif iter_log_paths:
+                explore_log = iter_log_paths[-1]
+            else:
+                # No agent ran this iteration — preserve the prior path so
+                # downstream code that calls .exists() on it gets False.
+                explore_log = self.log_dir / f"agent-{self.agent_counter}-E2E-explore-{iteration}-{self.timestamp}.jsonl"
             if driver is not None:
-                live_evidence = driver.has_live_evidence(findings, explore_log)
+                live_evidence = driver.has_live_evidence(findings, merged_log)
             else:
                 live_evidence = 0
             all_entries = (findings.get("findings") or []) + (findings.get("validations") or [])
@@ -13074,11 +15168,31 @@ The crash log is also saved at `{crash_log_file}`.
                     f" (MCP server `{cap_label}` init status: **{mcp_status}**)"
                     if mcp_status else ""
                 )
+                # Distinguish "no agent logs at all this iteration" from
+                # "agent logs exist but contain no platform tool calls".
+                # The first is a runner/spawn bug; the second is a real
+                # engagement failure. Without this split, both look identical
+                # in the BLOCKED.md and humans can't tell which to chase.
+                if not iter_log_paths:
+                    log_diag = (
+                        f"No agent logs found for iteration {iteration} "
+                        f"(searched {self.log_dir}/ for "
+                        f"`E2E-{{planner,executor,explore}}-{iteration}-*-{self.timestamp}.jsonl`). "
+                        f"This means the planner/executor never spawned, or "
+                        f"their logs landed somewhere unexpected — engagement "
+                        f"gate has no input to evaluate."
+                    )
+                else:
+                    log_diag = (
+                        f"Inspected {len(iter_log_paths)} agent log(s) for "
+                        f"iteration {iteration}; none contained a "
+                        f"`{driver.tool_prefix if driver else 'mcp__'}*` tool call."
+                    )
                 e2e_log(
                     f"MCP engagement check FAILED ({cap_label}){status_note}: "
                     f"{total_findings} findings, 0 with live evidence "
                     f"(screenshots or live-mcp verification). "
-                    f"{blocked_findings} blocked."
+                    f"{blocked_findings} blocked. {log_diag}"
                 )
                 status_line = (
                     f"MCP server `{cap_label}` init status reported by agent: **{mcp_status}**.\n\n"
@@ -13092,7 +15206,12 @@ The crash log is also saved at `{crash_log_file}`.
                 exec_dir_p = _executor_dir(e2e_dir)
                 latest_handoff_excerpt = ""
                 if exec_dir_p.exists():
-                    handoffs = sorted(exec_dir_p.glob("handoff-spawn-*.md"))
+                    # Sort by mtime — alphabetical sort puts spawn-10 before
+                    # spawn-2, and a leftover spawn-N.md from a prior session
+                    # would shadow today's spawn-1..N-1.md. Iteration-start
+                    # cleanup also purges these now, so this is belt-and-braces.
+                    handoffs = sorted(exec_dir_p.glob("handoff-spawn-*.md"),
+                                      key=lambda p: p.stat().st_mtime)
                     if handoffs:
                         try:
                             latest = handoffs[-1].read_text()
@@ -13108,8 +15227,10 @@ The crash log is also saved at `{crash_log_file}`.
                     f"Platform: `{cap_label}`. {status_line}"
                     f"The explore agent produced {total_findings} findings with "
                     f"0 screenshots and 0 `{driver.tool_prefix if driver else 'mcp__'}*` "
-                    f"tool calls in its log. {blocked_findings} findings marked "
-                    f"'blocked'.\n\n"
+                    f"tool calls across {len(iter_log_paths)} agent log(s) "
+                    f"inspected for this iteration. {blocked_findings} findings "
+                    f"marked 'blocked'.\n\n"
+                    f"**Engagement gate diagnostic:** {log_diag}\n\n"
                     f"This means the agent did not interact with the app via MCP "
                     f"(no screenshots taken, no UI elements tapped). "
                     f"Code review alone does not satisfy E2E validation.\n\n"
@@ -13316,6 +15437,13 @@ The crash log is also saved at `{crash_log_file}`.
 
             # ── Phase 2: FIX (no MCP needed) ──
             fix_agent_ran = True
+            # Next iteration's explore/verify must see services freshly
+            # restarted from the fixed code, not ghosts from this iteration.
+            pending_service_reset = True
+            # Remember this iteration's infra slugs so the next iteration
+            # can detect repeats (same slug returning after a fix attempt
+            # and a cold service restart — signals the fix was wrong).
+            prior_infra_slugs = {b["slug"] for b in infra_blockers_this_iter}
             e2e_log(f"Phase 2: Fix ({len(open_bugs)} bugs)")
 
             # Snapshot HEAD before fix agent runs so we can detect if it changed anything
@@ -13341,7 +15469,9 @@ The crash log is also saved at `{crash_log_file}`.
                 phase=task.phase, parallel=False,
                 status=TaskStatus.RUNNING, line_num=0,
             )
-            _wait_for_subagent(fix_task, fix_prompt, f"E2E-fix-{iteration}")
+            _wait_for_subagent(fix_task, fix_prompt, f"E2E-fix-{iteration}",
+                               model=_role_model("fix", spec_dir),
+                               idle_timeout_s=_role_idle_s("fix", spec_dir))
 
             # ── Check if fix agent actually changed anything ──
             # Compare current HEAD and working tree against the commit before fix ran
@@ -13523,23 +15653,54 @@ This is build-fix attempt {attempt} of {BUILD_FIX_MAX_ATTEMPTS}.
                 e2e_log("Rebuild failed — skipping verify, continuing to next iteration")
                 continue
 
-            # ── Phase 4: VERIFY (with MCP) ──
-            e2e_log(f"Phase 4: Verify fixes")
-            verify_prompt = self._build_e2e_verify_prompt(
-                spec_dir, findings_file, ui_flow_content, e2e_dir,
-                mcp_caps=mcp_caps,
+            # ── Phase 4a: SCRIPTED VERIFY (no agent) ──
+            # Each bug's fix agent is instructed to write bugs/BUG-XXX/verify.sh.
+            # We run those scripts first and mark findings directly from their
+            # exit codes. Only bugs whose scripts are missing or inconclusive
+            # fall through to the verify-agent spawn below. See
+            # reference/cost-guardrails.md § "Scripted verify first".
+            e2e_log(f"Phase 4a: Scripted verify ({len(open_bugs)} bugs)")
+            script_results = _run_scripted_verify_phase(
+                e2e_dir, open_bugs, iteration, e2e_log,
             )
-            verify_task = Task(
-                id=f"E2E-verify-{iteration}",
-                description=f"E2E verify iteration {iteration}",
-                phase=task.phase, parallel=False,
-                status=TaskStatus.RUNNING, line_num=0,
-                capabilities=mcp_caps,
-            )
-            _wait_for_subagent(verify_task, verify_prompt,
-                               f"E2E-verify-{iteration}",
-                               mcp_configs=mcp_config_paths,
-                               model="sonnet")
+            agent_verify_bugs = [
+                b for b in open_bugs
+                if script_results.get(b.get("id", ""), "missing")
+                   in ("missing", "inconclusive")
+            ]
+
+            if not agent_verify_bugs:
+                e2e_log(
+                    f"Phase 4b: SKIPPED verify-agent spawn — all "
+                    f"{len(open_bugs)} bugs closed by verify.sh "
+                    f"(passes: {sum(1 for v in script_results.values() if v == 'pass')}, "
+                    f"fails: {sum(1 for v in script_results.values() if v == 'fail')})"
+                )
+            else:
+                # ── Phase 4b: VERIFY AGENT (with MCP) ──
+                e2e_log(
+                    f"Phase 4b: Verify agent ({len(agent_verify_bugs)}/"
+                    f"{len(open_bugs)} bugs needed agent verify — "
+                    f"{len(open_bugs) - len(agent_verify_bugs)} already "
+                    f"closed by verify.sh)"
+                )
+                verify_prompt = self._build_e2e_verify_prompt(
+                    spec_dir, findings_file, ui_flow_content, e2e_dir,
+                    mcp_caps=mcp_caps,
+                    bug_id_subset=[b.get("id", "") for b in agent_verify_bugs],
+                )
+                verify_task = Task(
+                    id=f"E2E-verify-{iteration}",
+                    description=f"E2E verify iteration {iteration}",
+                    phase=task.phase, parallel=False,
+                    status=TaskStatus.RUNNING, line_num=0,
+                    capabilities=mcp_caps,
+                )
+                _wait_for_subagent(verify_task, verify_prompt,
+                                   f"E2E-verify-{iteration}",
+                                   mcp_configs=mcp_config_paths,
+                                   model=_role_model("verify", spec_dir),
+                                   idle_timeout_s=_role_idle_s("verify", spec_dir))
 
             # Re-read findings after verify
             try:
@@ -13696,6 +15857,74 @@ This is build-fix attempt {attempt} of {BUILD_FIX_MAX_ATTEMPTS}.
         if hasattr(self, '_platform_manager'):
             self._platform_manager.teardown_all(project_dir=Path(spec_dir).parent if spec_dir else None)
 
+    def _build_cost_discipline_section(
+        self,
+        driver: Optional["PlatformDriver"],
+        iteration: int = 1,
+        spawn_num: int = 1,
+    ) -> str:
+        """Hard cost-discipline block for MCP explore/executor agents.
+
+        Same text every spawn, every iteration — no escalation path, no
+        ratio watching. The cheap tool is the default; expensive tools are
+        only allowed when they produce bug evidence. Enforcement is at the
+        prompt level: an agent that screenshots during navigation is
+        violating the contract.
+
+        (`iteration` / `spawn_num` kept in the signature for call-site
+        compatibility but no longer used.)
+        """
+        if driver is None:
+            return ""
+
+        return """## Cost rules (hard — apply every call)
+
+Two-tier discipline. The cheapest tier is the default; the middle
+tier is a fallback; the expensive tier is only for bug evidence.
+
+**Web (`mcp-browser`)** — updated after the T096 post-mortem where two
+full-page `browser_snapshot` responses cost ~$10 of sticky cache-read:
+
+- **Default (read 1–5 specific fields/values, locate a known element)**
+  → `browser_evaluate` returning a small JSON object.
+  Example:
+  ```js
+  await browser_evaluate({ expression: `({
+    heading: document.querySelector('h1')?.innerText,
+    formFields: [...document.querySelectorAll('input,select,textarea')].map(e => ({
+      name: e.name, type: e.type, error: e.validationMessage
+    })),
+    errors: [...document.querySelectorAll('[role=alert],.error')].map(e => e.innerText),
+    url: location.pathname
+  })` });
+  ```
+  Returns ~500 bytes. Zero sticky cost.
+- **Fallback (first visit to a genuinely unfamiliar page)** →
+  `browser_snapshot` — ONE shot, then prefer `browser_evaluate` for
+  subsequent interactions on that page. A full-page snapshot on a
+  complex page can be 300 KB+; every later turn re-cache-reads it
+  until you navigate away.
+- **Visual bug evidence only** → `browser_take_screenshot`. Every
+  screenshot must produce a finding whose `screenshot_path` points
+  at the file. No finding = wasted budget.
+
+**Android (`mcp-android`)**:
+
+- **Default** → `State-Tool` WITHOUT `use_vision` (structured UI tree).
+- **Visual bug evidence only** → `State-Tool` with `use_vision:true`
+  or `Screenshot`. Same finding-or-wasted-budget rule.
+
+There is no grace period. Spawn 1 call 1 follows this rule. If you
+reach for a snapshot or vision capture and you're not about to file
+a bug, use the cheap tool instead.
+
+**Page manifests (web)**: if a manifest exists at
+`specs/<feature>/validate/e2e/page-manifest/<route>.json`, read
+selectors from it and use them directly with `browser_click` /
+`browser_fill_form` — skip `browser_snapshot` entirely. Fall back to
+snapshot only if a manifest selector returns no element, and file a
+finding so the manifest gets updated."""
+
     def _build_e2e_explore_prompt(self, spec_dir: str, findings_file: Path,
                                    ui_flow: str, spec_content: str,
                                    iteration: int, e2e_dir: Path,
@@ -13779,14 +16008,20 @@ A previous agent completed this task, but the independent verifier rejected it. 
 
 """
 
+        _role = "e2e-explore"
         _required = _required_reads_block(
-            "e2e-explore",
-            [
-                str(_REF_DIR / "mcp-e2e.md"),
+            _role,
+            _mcp_e2e_refs_for_caps(mcp_caps) + [
                 str(_REF_DIR / "e2e-runtime.md"),
             ],
         )
-        _ref_index = _reference_index_pointer()
+        _ref_index = _reference_index_pointer(_role)
+
+        # Cost-discipline section is always emitted. When a prior iteration's
+        # log shows wasteful screenshot:snapshot ratios, the block escalates
+        # with concrete numbers.
+        cost_section = self._build_cost_discipline_section(
+            driver, iteration, spawn_num=1)
 
         return f"""You are an E2E exploration agent with access to MCP tools that let you interact with a running app.
 
@@ -13798,16 +16033,15 @@ A previous agent completed this task, but the independent verifier rejected it. 
 
 {mission}
 {rejection_context}
-## CRITICAL: Context window management
+{cost_section}
 
-You are running inside a context window with limited capacity. Accumulating too many screenshots will crash you mid-session. Follow these rules strictly:
+## Context window hygiene
 
-1. **Prefer structured state (snapshot/hierarchy) over screenshots** for decisions — screenshots are useful for human review and bug evidence, not for tree traversal. For browser MCP, `browser_snapshot` is the cheap path; for Android MCP, prefer a no-vision `State-Tool` call and only add `use_vision` when you need to *see* something.
-2. **Maximum 20 screenshots per session** — count them. Always save screenshots to disk (see your platform's section below) and reference paths in findings rather than re-reading images.
-3. **Don't re-read screenshots you've already analyzed.**
-4. **Write findings incrementally** — update `{findings_file}` after each screen/flow you complete, not just at the end. If you crash, the next agent can pick up from your partial findings.
-5. **Write a progress checkpoint** — after completing each screen or flow, append a line to `{e2e_dir}/progress.md` noting what you covered (e.g., "Cart screen: validated add/remove, coupon errors"). The next iteration reads this to skip already-validated areas.
-6. **If you're running low on context** (10+ screenshots or 100+ tool calls), write your current findings and progress immediately, then stop gracefully.
+1. **Hard cap: 20 screenshots per session.** Count them.
+2. **Don't re-read screenshots you've already analyzed** — reference paths in findings.
+3. **Write findings incrementally** — update `{findings_file}` after each screen/flow. If you crash, the next agent picks up from partial findings.
+4. **Write a progress checkpoint** — after completing each screen or flow, append a line to `{e2e_dir}/progress.md`. The next iteration skips already-validated areas.
+5. **Low on context** (10+ screenshots or 100+ tool calls)? Save and stop gracefully.
 
 {tools_section}
 {screenshot_section}
@@ -13815,7 +16049,7 @@ You are running inside a context window with limited capacity. Accumulating too 
 
 1. **Check progress first** — read `{e2e_dir}/progress.md` if it exists. Skip screens/flows already marked as validated.
 2. Open the app using the platform's MCP tools (for browser: `browser_navigate` to the appropriate URL from the backend env; for Android: launch via `adb shell am start` or the intent helper).
-3. **Inspect the current screen** using the cheapest structured tool available (`browser_snapshot` for web, `State-Tool` without vision for Android). Only take a screenshot when you need visual evidence or when the structured state is insufficient.
+3. **Inspect the current screen** using the cheapest structured tool. For **web**: prefer a targeted `browser_evaluate` returning a small JSON object with just the fields/errors you care about; fall back to `browser_snapshot` only on the first visit to a genuinely unfamiliar page. For **Android**: use `State-Tool` without `use_vision`. Only take a screenshot for bug evidence, never for navigation.
 4. Compare what you see against the UI_FLOW.md specification below.
 5. Try both happy paths AND error paths for each flow.
 6. When you find a bug, document it with:
@@ -13928,7 +16162,8 @@ Write your findings to `{findings_file}` as JSON:
                                    ui_flow: str, spec_content: str,
                                    iteration: int, e2e_dir: Path,
                                    parent_task: "Task | None" = None,
-                                   task_block: str = "") -> str:
+                                   task_block: str = "",
+                                   mcp_caps: set[str] | None = None) -> str:
         """Opus planner: reads spec + progress, writes plan.md (ordered steps)."""
         findings_inline, findings_overflow = _prepare_findings_context(
             findings_file, e2e_dir)
@@ -13949,15 +16184,29 @@ Plan ONLY the exploration needed to satisfy this task's "Done when" criteria. Do
 
         plan_file = e2e_dir / "plan.md"
 
+        _role = "e2e-planner"
         _required = _required_reads_block(
-            "e2e-planner",
-            [str(_REF_DIR / "mcp-e2e.md")],
+            _role,
+            _mcp_e2e_refs_for_caps(mcp_caps),
         )
-        _ref_index = _reference_index_pointer()
+        _ref_index = _reference_index_pointer(_role)
+
+        # Inject page manifests that match the task/spec text so the
+        # planner references stable selectors instead of guessing.
+        hint_text = " ".join([
+            task_block or "",
+            (parent_task.description if parent_task else "") or "",
+            spec_content or "",
+        ])
+        manifests_section = _format_page_manifests_section(
+            _load_page_manifests(e2e_dir, hint_text)
+        )
 
         return f"""You are an E2E test planner. You produce an ordered step list for a Sonnet executor to walk through. You do NOT interact with the app — you only plan.
 
 {_required}
+
+{manifests_section}
 
 Read the § Tool catalog rows so the steps you write reference real tool names. The executor will not make up tool names — if your plan calls a non-existent tool, the step blocks.
 
@@ -14097,15 +16346,38 @@ A previous attempt on the current step got stuck. A diagnostic agent analyzed it
 {unblock_context}
 </unblock>"""
 
+        # Cost discipline — inject targeted back-pressure when the prior
+        # spawn in this iteration burned screenshots where snapshots would
+        # have sufficed. See BrowserDriver.cheap_vs_expensive_calls.
+        cost_section = self._build_cost_discipline_section(
+            driver, iteration, spawn_num)
+
+        _role = "e2e-executor"
         _required = _required_reads_block(
-            "e2e-executor",
-            [str(_REF_DIR / "mcp-e2e.md")],
+            _role,
+            _mcp_e2e_refs_for_caps(mcp_caps),
         )
-        _ref_index = _reference_index_pointer()
+        _ref_index = _reference_index_pointer(_role)
+
+        # Per-spawn caps, honouring .specify/cost-config.json overrides.
+        _cfg = _load_cost_config(spec_dir)
+        exec_step_cap = int(_cfg.get("executor_step_cap", EXECUTOR_STEP_CAP_PER_SPAWN))
+        exec_wall_cap_s = int(_cfg.get("executor_wall_cap_s", EXECUTOR_WALL_CAP_S))
+
+        # Inject any page manifests whose keyword appears in the plan.
+        try:
+            plan_text = plan_file.read_text() if plan_file.exists() else ""
+        except Exception:
+            plan_text = ""
+        manifests_section = _format_page_manifests_section(
+            _load_page_manifests(e2e_dir, [plan_text, prior_handoff or ""])
+        )
 
         return f"""You are an E2E test executor. You follow a pre-written plan step-by-step and interact with the app via MCP tools. You do NOT improvise beyond the plan.
 
 {_required}
+
+{manifests_section}
 
 The mcp-e2e § Findings format and § Context window management sections define the exact JSON shape and tool-budget rules you'll be evaluated against.
 
@@ -14138,11 +16410,21 @@ You have three ways to exit. Choose exactly ONE before you stop:
 [BUG-IDs added to findings.json this spawn, or "none"]
 ```
 
-**(B) Partial — ready to hand off** — you've done useful work but feel you should stop (tool-call budget getting high, context feels loaded, etc.). Write `{handoff_file}`:
+**(B) Partial — hand off and exit** — you have a HARD per-spawn cap:
+
+- At most **{exec_step_cap}** plan steps per spawn.
+- At most **{exec_wall_cap_s}** seconds of wall time per spawn.
+
+After you complete the {exec_step_cap}th step OR wall time approaches the cap, STOP. Write `{handoff_file}` with Status: PARTIAL and exit cleanly. The runner spawns the next executor with your handoff as input. Why the cap: a long-running executor accumulates sticky tool-result context that gets re-cached on every turn; a fresh spawn drops that context for the cost of one cache prime. See `cost-guardrails.md` § "Executor step cap".
+
+Do NOT try to "finish the plan" if you're past the cap — you will be killed and your partial work will be synthesized into a cruder handoff than one you would write yourself.
+
 ```markdown
 # Executor handoff (spawn {spawn_num})
 
 ## Status: PARTIAL
+
+## Cap reason: step-cap | wall-cap | self-elected
 
 ## Steps completed this spawn
 - step-N: [short result]
@@ -14228,6 +16510,8 @@ If the second attempt also fails in a way you can't classify, THEN write the blo
 {handoff_section}
 
 {unblock_section}
+
+{cost_section}
 
 {tools_section}
 {screenshot_section}
@@ -14501,14 +16785,15 @@ For each bug above:
                 "\"How a fix agent can verify\" check from the report.\n"
             )
 
+        _role = "e2e-fix"
         _required = _required_reads_block(
-            "e2e-fix",
+            _role,
             [
                 str(_REF_DIR / "fix-agent-playbook.md"),
                 str(_REF_DIR / "e2e-failure-patterns.md"),
             ],
         )
-        _ref_index = _reference_index_pointer()
+        _ref_index = _reference_index_pointer(_role)
 
         return f"""You are an E2E fix agent. Your job is to fix ALL reported bugs in a single batch pass.
 
@@ -14551,6 +16836,51 @@ The playbook's § Core principle (reproduce before hypothesizing) and § Default
 7. **For each bug you fix**, write a brief description of your approach to
    `{e2e_dir}/bugs/<BUG-ID>/fix-approach-latest.md` — one paragraph describing
    what you changed and why. This is used by the verify agent and supervisor.
+8. **For each bug you fix**, also write a `verify.sh` at
+   `{e2e_dir}/bugs/<BUG-ID>/verify.sh` that the runner will execute
+   before deciding whether to spawn a verify agent. A good `verify.sh`
+   is a 5-10 line bash script that reproduces the bug's "steps_to_reproduce"
+   at the lowest layer possible — usually a single curl / API call /
+   grep of the build log — and exits **0** on fixed, **1** on
+   still-broken, **2** on inconclusive. Stdout line 1 should begin
+   ``STATUS: FIXED`` or ``STATUS: STILL_BROKEN``. The runner sources
+   ``test/e2e/.state/env`` before invoking, so you can use `$API_URL`,
+   `$ADMIN_COOKIE`, etc. Timeout is 30 s. See
+   `.claude/skills/spec-kit/reference/cost-guardrails.md` § "Scripted
+   verify first" for the full contract.
+
+   Example (for a bug where POST /api/checkout returned 500 due to
+   Stripe key misconfig):
+
+   ```bash
+   #!/usr/bin/env bash
+   # Verifies BUG-001 — POST /api/checkout no longer 500s on valid cart.
+   set -eu
+   CART_TOKEN=$(curl -s -X POST "$API_URL/api/cart" | jq -r .token)
+   curl -s -X POST "$API_URL/api/cart/$CART_TOKEN/items" \\
+     -H 'content-type: application/json' \\
+     -d '{{"product_id":"base-plate","variant":"tpu","qty":1}}' > /dev/null
+   CODE=$(curl -s -o /tmp/checkout.out -w '%{{http_code}}' \\
+     -X POST "$API_URL/api/checkout/$CART_TOKEN" \\
+     -H 'content-type: application/json' \\
+     -d '{{"email":"t@t.test","shipping_address":{{"line1":"1 Main","city":"Austin","state":"TX","postal_code":"78701","country":"US"}}}}')
+   if [ "$CODE" = "200" ]; then
+     echo "STATUS: FIXED"
+     echo "EVIDENCE: POST /api/checkout returned 200 (cart_token=$CART_TOKEN)"
+     echo "COMMAND: curl -X POST API_URL/api/checkout/CART_TOKEN"
+     exit 0
+   else
+     echo "STATUS: STILL_BROKEN"
+     echo "EVIDENCE: POST /api/checkout returned $CODE"
+     echo "COMMAND: curl -X POST API_URL/api/checkout/CART_TOKEN"
+     cat /tmp/checkout.out
+     exit 1
+   fi
+   ```
+
+   Skipping `verify.sh` forces the runner to spawn a full verify agent
+   for your bug, which historically costs ~$12 per cycle. Writing a
+   good `verify.sh` is a 2-minute task that saves that cost.
 
 ## Rules
 
@@ -14566,8 +16896,14 @@ The playbook's § Core principle (reproduce before hypothesizing) and § Default
 
     def _build_e2e_verify_prompt(self, spec_dir: str, findings_file: Path,
                                   ui_flow: str, e2e_dir: Path,
-                                  mcp_caps: set[str] | None = None) -> str:
-        """Build the prompt for the E2E verify agent."""
+                                  mcp_caps: set[str] | None = None,
+                                  bug_id_subset: list[str] | None = None) -> str:
+        """Build the prompt for the E2E verify agent.
+
+        ``bug_id_subset`` narrows the agent to a specific list of bug IDs
+        (typically those whose scripted ``verify.sh`` was missing or
+        inconclusive). When None, the agent considers all open bugs.
+        """
         # Verify agent needs bug details but not pass entries.
         # Higher inline limit since it needs steps-to-reproduce etc.
         findings_inline, findings_overflow = _prepare_findings_context(
@@ -14586,15 +16922,35 @@ The playbook's § Core principle (reproduce before hypothesizing) and § Default
             observed_hint = ("[Snapshot / hierarchy / tree excerpt showing the relevant UI "
                              "element(s). Paste the exact output.]")
 
+        _role = "e2e-verify"
         _required = _required_reads_block(
-            "e2e-verify",
-            [str(_REF_DIR / "mcp-e2e.md")],
+            _role,
+            _mcp_e2e_refs_for_caps(mcp_caps),
         )
-        _ref_index = _reference_index_pointer()
+        _ref_index = _reference_index_pointer(_role)
+
+        subset_section = ""
+        if bug_id_subset:
+            subset_section = (
+                f"## Bug subset (narrowed by scripted verify)\n\n"
+                f"The runner already ran `verify.sh` for every bug this "
+                f"iteration. It closed some of them outright and recorded "
+                f"scripted evidence in `bugs/<BUG-ID>/verify-evidence-"
+                f"<iter>-script.md`. You only need to investigate the bugs "
+                f"listed below — their scripts were missing or returned "
+                f"inconclusive (exit 2 or other). For every other bug in "
+                f"findings.json, **do not re-verify** — trust the scripted "
+                f"result and move on.\n\n"
+                f"Bugs needing agent verification this iteration:\n"
+                + "\n".join(f"- {bid}" for bid in bug_id_subset)
+                + "\n\n"
+            )
 
         return f"""You are an E2E verify agent with access to MCP tools. Your job is to verify bug fixes, produce structured evidence, and find new bugs.
 
 {_required}
+
+{subset_section}
 
 The mcp-e2e § Findings format defines the exact verify-evidence shape. The fix agent reads what you write — concrete deltas only.
 
@@ -14681,6 +17037,22 @@ to the bug's evidence directory: `"bug_dir": "{e2e_dir}/bugs/<BUG-ID>"`
 - Add any newly discovered bugs (with `bug_dir` field)
 - **Always write structured evidence** — no exceptions
 - Do NOT modify source code — only update `{findings_file}` and write evidence files
+
+## MANDATORY precheck before claiming STILL_BROKEN on any infrastructure bug
+
+Before writing `Status: STILL_BROKEN` for a bug whose root cause touches a long-running host process (API, auth, database, emulator-adjacent daemon), verify the process you're probing postdates the fix:
+
+```bash
+git log -1 --format='%ct  %H  %s' HEAD
+stat -c '%Y  %n' .dev/e2e-state/*.log 2>/dev/null
+```
+
+If any service log mtime is **older** than the HEAD commit timestamp, the running process predates the fix and you are observing ghost behavior. In that case:
+1. Do NOT write STILL_BROKEN.
+2. Write `Status: STALE_PROCESS_DETECTED` in the evidence file.
+3. Record the mtime gap and stop — the runner will cold-restart services and re-dispatch verification.
+
+Skipping this precheck is the single biggest reason verify loops grind through 5+ no-op spawns re-filing the same BLOCKER on an already-fixed defect. See `reference/fix-agent-playbook.md § "Mtime check before claiming STILL_BROKEN"` for the failure history.
 """
 
     def _build_e2e_supervisor_prompt(self, spec_dir: str, e2e_dir: Path,
@@ -14960,11 +17332,12 @@ These approaches have already been tried and failed. Do NOT recommend any of the
 
         next_idx = (prev_idx or 0) + 1
 
+        _role = "e2e-research"
         _required = _required_reads_block(
-            "e2e-research",
+            _role,
             [str(_REF_DIR / "fix-agent-playbook.md")],
         )
-        _ref_index = _reference_index_pointer()
+        _ref_index = _reference_index_pointer(_role)
 
         return f"""You are a research agent investigating a specific bug before a fix agent attempts to resolve it.
 
@@ -15128,11 +17501,12 @@ were reached. Do NOT repeat strategies that previous supervisors already rejecte
                     "signal for REDIRECT_RESEARCH with new questions.\n"
                 )
 
+        _role = "e2e-bug-supervisor"
         _required = _required_reads_block(
-            "e2e-bug-supervisor",
+            _role,
             [str(_REF_DIR / "fix-agent-playbook.md")],
         )
-        _ref_index = _reference_index_pointer()
+        _ref_index = _reference_index_pointer(_role)
 
         return f"""You are a bug supervisor agent. A specific bug has failed to be fixed after multiple attempts. Review the history and decide the next action.
 

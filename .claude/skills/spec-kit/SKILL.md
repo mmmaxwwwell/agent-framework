@@ -50,7 +50,12 @@ reference/           # Enterprise knowledge base — loaded on demand by phase f
   readme.md          # Human-facing README.md structure, sections, quality checklist
   pre-pr.md          # Pre-PR gate: single-command validation, multi-build discovery, non-vacuous checks
   e2e-runtime.md     # Real-runtime E2E: emulator, browser, simulator patterns, side-by-side architecture
-  mcp-e2e.md         # MCP-driven E2E exploration loop (explore/plan/execute/verify), findings.json shape, per-platform tool semantics
+  mcp-e2e.md         # Stub — redirects to the split files below (kept so old references don't 404)
+  mcp-e2e-core.md    # MCP-driven E2E, platform-neutral: loop, findings.json, regression, backend env, scripted verify
+  mcp-e2e-web.md     # Web-specific (mcp-browser): browser_evaluate-first cost rule, page manifests, Playwright spec
+  mcp-e2e-android.md # Android-specific (mcp-android): State-Tool vision budget, emulator, Patrol spec
+  mcp-e2e-ios.md     # iOS-specific (mcp-ios): thin placeholder, regression fast-path deferred
+  cost-guardrails.md # Per-role models, hang budgets, verify.sh contract, browser_evaluate rule, graph excludes
   fix-agent-playbook.md # General debugging heuristics for any spawned fix-agent: falsification rule, anti-patterns, claim format
   e2e-failure-patterns.md # Library of known platform-runtime failure signatures, matched per-attempt by the runner
   agent-file-schemas.md # IC-AGENT-* schemas for every cross-agent file (findings.json, plan.md, handoff.md, etc.) — the runner parses specific anchors

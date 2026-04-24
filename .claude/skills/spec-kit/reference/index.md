@@ -4,6 +4,15 @@ This index lets you read the right reference file at the right moment, without h
 
 Paths are relative to `.claude/skills/spec-kit/reference/`.
 
+> **Scope note** — This index is used by general-purpose agents
+> (task-implementer, validate, review, ci-fix, platform-fix, etc.)
+> whose file touch-set isn't known ahead of time. **E2E sub-agents**
+> (planner, executor, fix, verify, research, bug-supervisor) do **not**
+> read this index; the runner injects the right reference files for
+> the role directly. If you are an E2E sub-agent, ignore this file
+> and follow your Tier-1 required-reads list. See
+> `cost-guardrails.md` § "Reference injection" for why.
+
 ## Step 1 — Classify the task and files BEFORE reading anything else
 
 Before you Read any reference file beyond the ones your role mandates as Tier-1, classify what you're about to work on. Pick **one** task-kind tag and **all** applicable file-domain tags. The classifications drive Step 2 (the lookup table); skipping classification means you'll read the wrong things.
@@ -81,8 +90,11 @@ Find every row whose **Tags** column contains at least one of your active tags. 
 | Adding a new test command or coverage tooling | `testing.md` § Code coverage collection | Coverage is mandatory; missing tools must be installed, not skipped | `task:implement, domain:test, domain:devshell` |
 | Diagnosing a platform-runtime / service-bringup failure | `e2e-failure-patterns.md` (find the matching `## Signature: <name>`) | Library of known failure shapes with proven root causes | `task:fix-infra, task:fix-platform-runtime, domain:platform-runtime, domain:devshell` |
 | Doing any fix-agent work (platform, services, integration, E2E bug) | `fix-agent-playbook.md` § Core principle, § Default fix preference order, § What NOT to do | Falsification rule, anti-patterns, claim format | `task:fix-bug, task:fix-build, task:fix-infra, task:fix-platform-runtime, task:fix-ci` |
-| Writing or following an MCP-driven E2E session | `mcp-e2e.md` § The explore-research-fix-verify loop, § Findings format | Defines findings.json shape, evidence format, platform tool semantics | `task:explore-e2e, task:plan-e2e, task:execute-e2e, task:verify-e2e, domain:e2e-test` |
-| Debugging an MCP launch failure (probe red, agent can't reach tool) | `mcp-e2e.md` § Platform runtimes + `e2e-failure-patterns.md` § mcp-launch-failed | Probe stderr is authoritative; sandbox/path issues are most common | `task:fix-platform-runtime, domain:platform-runtime` |
+| Modifying `parallel_runner.py`, role prompts, or E2E conventions — anything that affects per-cycle cost | `cost-guardrails.md` | Origin of current role→model, hang budgets, executor caps, verify.sh, browser_evaluate rule; says **why** before changing | `task:supervise, task:plan-runner, domain:runner-config, domain:e2e-test` |
+| Writing or following an MCP-driven E2E session (platform-neutral: loop, findings, regression, env) | `mcp-e2e-core.md` | Defines findings.json shape, loop structure, scripted-verify contract, backend env | `task:explore-e2e, task:plan-e2e, task:execute-e2e, task:verify-e2e, domain:e2e-test` |
+| MCP E2E on web (`mcp-browser`) | `mcp-e2e-web.md` | browser_evaluate-first cost rule, page manifests, Playwright regression spec | `task:*-e2e, domain:e2e-test, platform:web` |
+| MCP E2E on Android (`mcp-android`) | `mcp-e2e-android.md` | State-Tool vision budget, emulator/ADB gotchas, Patrol regression | `task:*-e2e, domain:e2e-test, platform:android` |
+| Debugging an MCP launch failure (probe red, agent can't reach tool) | `mcp-e2e-core.md` § Platform runtimes / Nix-first + `e2e-failure-patterns.md` § mcp-launch-failed | Probe stderr is authoritative; sandbox/path issues are most common | `task:fix-platform-runtime, domain:platform-runtime` |
 | Working with a real platform runtime (Android/iOS/web) | `e2e-runtime.md` | Why host-side tests are insufficient; what readiness means per platform | `task:explore-e2e, task:execute-e2e, task:verify-e2e, task:fix-platform-runtime, domain:platform-runtime, domain:e2e-test` |
 | Touching CI workflows or fixing CI failures | `cicd.md` § Pipeline stages, § Non-vacuous CI validation, § Skip-as-failure CI validation | Defines what CI must run, how to detect silent passes | `task:fix-ci, task:implement, domain:ci` |
 | Running `nix` commands in CI / inside the sandbox | `nix-ci.md` | Daemon flags, devshell rules, `nix flake check` background pattern | `task:fix-ci, task:fix-infra, task:fix-build, domain:nix, domain:ci, domain:devshell` |
@@ -123,7 +135,7 @@ Matched rows: "Touching payment flows" (`domain:payment`), "Adding API endpoints
 
 **Example 3 — Android emulator won't boot during E2E.**
 Classification: `task:fix-platform-runtime + domain:platform-runtime + domain:devshell`.
-Matched rows: "Diagnosing a platform-runtime / service-bringup failure" (`task:fix-platform-runtime`), "Doing any fix-agent work" (`task:fix-platform-runtime`), "Working with a real platform runtime" (`task:fix-platform-runtime, domain:platform-runtime`), "Debugging an MCP launch failure" (`task:fix-platform-runtime`), and "Running nix commands" if Nix project (`domain:devshell`). Read: `e2e-failure-patterns.md`, `fix-agent-playbook.md`, `e2e-runtime.md`, `mcp-e2e.md` § Platform runtimes, `nix-ci.md` (if Nix).
+Matched rows: "Diagnosing a platform-runtime / service-bringup failure" (`task:fix-platform-runtime`), "Doing any fix-agent work" (`task:fix-platform-runtime`), "Working with a real platform runtime" (`task:fix-platform-runtime, domain:platform-runtime`), "Debugging an MCP launch failure" (`task:fix-platform-runtime`), and "Running nix commands" if Nix project (`domain:devshell`). Read: `e2e-failure-patterns.md`, `fix-agent-playbook.md`, `e2e-runtime.md`, `mcp-e2e-core.md` § Platform runtimes / Nix-first, `nix-ci.md` (if Nix).
 
 ## How to use this index
 

@@ -155,7 +155,15 @@ def _classify_task_prefix(task_id: str) -> str:
     """Group task_ids into readable buckets for reporting."""
     t = task_id or ""
     if t.startswith("VR-"):
-        return "validate-review"
+        # Split into validate / review / legacy so post-change runs
+        # show the two spawn types separately. Legacy combined spawns
+        # used IDs like "VR-<slug>-<cycle>" (just a digit) — those still
+        # bucket as the old "validate-review" name.
+        if t.endswith("-validate"):
+            return "validate"
+        if "-review-" in t:
+            return "review"
+        return "validate-review"  # legacy combined
     if t.startswith("E2E-explore"):
         return "e2e-explore (legacy)"
     if t.startswith("E2E-planner"):

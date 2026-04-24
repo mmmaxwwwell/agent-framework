@@ -466,7 +466,13 @@ Example:
   Done when: guest completes checkout with test card 4242424242424242; `payment_intent.succeeded` webhook received; order transitions to `paid`; confirmation page renders with order id.
 ```
 
-The run-tasks runner reads `[needs: stripe-listen]`, looks up the dep in `.claude/task-deps.json`, executes the start script before the task and the stop script after. No additional agent boilerplate needed.
+The parallel runner reads `[needs: stripe-listen]`, looks up the dep in `.claude/task-deps.json`, and manages the listener **phase-scoped**: the start script fires once per runner session before the first task that needs it, and the stop script fires once at teardown. The start script's own idempotency handles the case where a listener is already running from a previous session (it detects the live PID, re-reads the secret into `.env`, and returns `"reused": true`).
+
+Phase-scoped lifecycle matters because:
+- Each `stripe listen` session rotates the webhook signing secret. If the runner started/stopped per task, the API would need to restart between every Stripe E2E task to pick up the new secret.
+- The listener is a long-lived subprocess; starting and stopping it N times across N tasks wastes ~2-3s per task and is a bug surface (race conditions around PID file cleanup).
+
+See `parallel_runner.py` → `TaskDepManager` for the implementation. No additional agent boilerplate needed.
 
 **Task categories that typically need `stripe-listen`** (include all that apply to the project):
 

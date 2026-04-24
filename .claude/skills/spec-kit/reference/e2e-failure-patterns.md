@@ -325,3 +325,21 @@ nix develop --command mcp-android --emulator < /dev/null &
 - Editing `test/e2e/setup.sh`. setup.sh is not the failure path — services are up. Agents that chase setup.sh logs waste 2-4 attempts before noticing.
 - Raising the boot timeout. The MCP server either launches in <1s or doesn't launch at all; time is not the variable.
 - Re-running `nix develop` from inside the runner without re-entering the sandbox. The devShell the runner sees is frozen at runner start.
+
+## Signature: mcp-exits-clean-within-5s (fixed — historical)
+
+**Match:** MCP server exits with code 0 within 5s of receiving `initialize`, stdout contains a valid JSON-RPC `initialize` response, probe labels it `crashed`.
+
+**This is NOT a bug in the MCP server.** The MCP stdio transport spec says a compliant server shuts down cleanly when stdin closes (client disconnect signal). If you see `exit code 0` within 5s of a successful `initialize` response, the server is doing the right thing — something closed stdin on it.
+
+**Historical root cause (now fixed in `parallel_runner.py`):** `probe_mcp_launch` used `subprocess.communicate(input=init_req, timeout=5)`, which closes stdin after writing. Spec-compliant servers (Playwright MCP v0.0.56 and any other well-behaved MCP server) respond to the `initialize`, then exit cleanly on the stdin close. The probe read `exit 0 within 5s` as a crash.
+
+**Current probe behavior:** `probe_mcp_launch` now writes `initialize`, keeps stdin open, reads one response line with a 5s deadline, then checks `poll()` for liveness. A server that exits during this window has genuinely crashed. A server still running at `t+5s` with a valid JSON-RPC response on stdout is healthy.
+
+**If this signature re-appears:**
+
+1. Confirm you're running a version of `parallel_runner.py` that contains the `selectors`-based read loop. Search for `import selectors` in the file; if absent, the runner is pre-fix.
+2. Do NOT add per-repo keepalive wrappers (delayed-stdin-close shims in `flake.nix`, `.mcp.json`, or a `scripts/mcp-*-keepalive.js`). They papered over the runner bug; they are not needed once the runner is fixed and they make debugging harder by making one repo's `mcp-browser` behave differently from every other consumer's.
+3. Do NOT patch `nix-mcp-debugkit` or the upstream MCP server to delay stdin-close handling — that would break spec compliance for every other consumer.
+
+**Residual risk:** A real crash (the server genuinely dies mid-init) is still reported as `crashed` — the fixed probe distinguishes clean-disconnect-on-stdin-close from unexpected-exit by not closing stdin during the liveness window. If you see a crash claim and are suspicious, check the probe's captured `stderr` file — a real crash leaves a real error there.

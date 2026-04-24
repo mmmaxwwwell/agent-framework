@@ -50,7 +50,7 @@ The markdown report has five sections:
 
 1. **Grand total** — events processed, agent completions, total tokens (split in/out), estimated dollar cost, total agent wall-clock time.
 2. **Cost & tokens by model** — one row per model family (opus/sonnet/haiku) with event count, input buckets (fresh / cache_read / cache_create), output, total tokens, cost, and % of spend.
-3. **Cost & tokens by phase** — task-id prefix buckets (`task`, `validate-review`, `e2e-planner`, `e2e-executor`, `e2e-fix`, etc.) ranked by cost. Useful for spotting the expensive phases.
+3. **Cost & tokens by phase** — task-id prefix buckets (`task`, `validate`, `review`, `e2e-planner`, `e2e-executor`, `e2e-fix`, etc.) ranked by cost. Useful for spotting the expensive phases. Legacy runs from before the VR split use the combined `validate-review` bucket; new runs use separate `validate` (Sonnet) and `review` (Opus) buckets.
 4. **Phase × model matrix** — shows where each model is actually being used. Validates that model-choice changes landed (e.g., that `e2e-verify` is on Sonnet after the switch).
 5. **Effectiveness signals** — computed heuristics specific to the E2E loop:
    - Planner+executor cost vs. legacy explore baseline (for comparing the split refactor against prior runs)

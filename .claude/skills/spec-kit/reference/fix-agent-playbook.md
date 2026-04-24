@@ -113,6 +113,28 @@ If verification requires destructive cleanup you're not authorized to do
 (dropping databases, removing checked-in state), say so explicitly in your
 final message — don't silently skip verification.
 
+## Mtime check before claiming "STILL_BROKEN"
+
+Before writing "fix didn't work" / `verify_status=still_broken` / re-filing the same infra blocker, run this check — it takes five seconds and catches the most common wrong answer:
+
+```bash
+# When did the fix commit land?
+git log -1 --format=%ct HEAD
+# When was each service started? (mtime of the service log)
+stat -c '%Y  %n' .dev/e2e-state/*.log 2>/dev/null
+```
+
+If **any service log is older than the fix commit**, the running process predates the fix. You are debugging a ghost. The correct response is:
+
+1. `test/e2e/teardown.sh` (or kill the stale pids manually)
+2. `test/e2e/setup.sh` (cold restart with the fixed code)
+3. Re-probe the behavior
+4. Only then write your conclusion
+
+The runner's `reset_e2e_services` does this automatically on the next iteration, but you may be called *inside* an iteration — don't trust service state you didn't start yourself.
+
+The Kanix `supertokens-cdi-mismatch` incident was five spawns of wasted work because this check wasn't run: the fix landed, the fix agent verified with `signup → 200`, but the subsequent verify-executor agents probed the orphaned pre-fix supertokens process and wrote "still broken" five times in a row. Every spawn's service logs were older than the fix commit; nobody looked.
+
 ## Default fix preference order
 
 When multiple fixes are plausible:
@@ -169,6 +191,51 @@ not curl the backend and claim the flow is validated.
   test placeholders.
 - Do not expand scope: if the bug is in setup.sh, don't also refactor the
   API config loader "while you're here."
+
+## Writing `verify.sh` (MANDATORY when closing an E2E bug)
+
+When you close an E2E bug, also write
+`specs/<feature>/validate/e2e/bugs/<BUG-ID>/verify.sh`. The runner
+executes this script before deciding whether to spawn a verify agent.
+A good `verify.sh` saves ~$12 per bug per iteration — see
+`cost-guardrails.md` § "Scripted verify first".
+
+**Contract**
+
+- Runner invokes: `bash verify.sh`, cwd = project root.
+- Runner sources `test/e2e/.state/env` before invoking (you can use
+  `$API_URL`, `$ADMIN_COOKIE`, `$DATABASE_URL`, etc.).
+- Runner enforces a 30 s timeout.
+
+**Exit codes**
+
+| Code | Meaning | Runner action |
+|---|---|---|
+| `0` | Verified fixed | Finding → `fixed`; runner writes evidence from stdout |
+| `1` | Verified still broken | Finding → `verified_broken`; runner writes evidence |
+| `2` | Inconclusive | Falls through to verify-agent spawn |
+| other / timeout | Treated as inconclusive | Falls through to verify-agent spawn |
+
+**Stdout format** (the runner parses the first 3 lines):
+
+```
+STATUS: FIXED | STILL_BROKEN
+EVIDENCE: <one-line concrete delta — e.g. "POST /api/checkout returned 200 with order_id=ord_xxx">
+COMMAND: <command(s) used to verify>
+```
+
+**Authoring tips**
+
+- Reproduce `steps_to_reproduce` at the **lowest layer possible**. A
+  UI flow becomes a curl call; a widget test becomes a `grep` of a
+  build log; a crash becomes a `head -20` of a stderr capture.
+- Keep it to shell + curl + jq + grep. If you need the UI, let the
+  runner spawn a verify agent instead.
+- Exit 2 (inconclusive) is legitimate when a bug genuinely can't be
+  scripted — prefer it over a flaky `exit 0`.
+- A `verify.sh` that always `exit 0`s lies. The runner can't
+  distinguish "fix worked" from "author was lazy" — treat this as a
+  correctness contract with future cycles.
 
 ## Finishing
 

@@ -92,20 +92,23 @@ Cross-step gotchas (e.g., "steps 3-5 share cart state — do not reset between t
 
 **Step ID format:** `step-<N>` sequentially. The executor matches these IDs when resuming from a prior handoff.
 
-## IC-AGENT-004: `handoff.md`
+## IC-AGENT-004: `handoff.md` / `handoff-spawn-<N>.md`
 
-- **Writer:** e2e-executor
+- **Writers:** e2e-executor (primary); parallel_runner's `_synthesize_executor_handoff` (fallback, when the executor exits or is killed without writing one)
 - **Readers:** next e2e-executor spawn; e2e-fix (when `## Infrastructure blockers` section present)
 - **Format:** Markdown
-- **Location:** `{e2e_dir}/e2e/spawn-<N>/handoff.md`
-- **Runner-parsed anchors:** `## Status:`, `## Infrastructure blockers`, `### BLOCKER-<slug>` (parsed by `_parse_infra_blockers` at parallel_runner.py:5789)
+- **Location:** `{e2e_dir}/executor/handoff.md` (current spawn) → archived to `{e2e_dir}/executor/handoff-spawn-<N>.md` after the runner consumes it
+- **Runner-parsed anchors:** `## Status:`, `## Cap reason:`, `## Infrastructure blockers`, `### BLOCKER-<slug>` (parsed by `_parse_infra_blockers` at parallel_runner.py)
 
-Three exit modes — exactly one `Status:` value, chosen by the executor:
+Exit modes — exactly one `Status:` value:
 
 ```markdown
 # Executor handoff (spawn 3)
 
 ## Status: COMPLETE | PARTIAL
+
+## Cap reason: step-cap | wall-cap | self-elected | blocker | hang-kill | unknown-exit
+<!-- REQUIRED when Status: PARTIAL. Tells the runner why the spawn ended. -->
 
 ## Steps completed this spawn
 - step-1: [short result]
@@ -133,6 +136,15 @@ BUG-001, BUG-002
 ```
 
 **Status values:** `COMPLETE` (all plan steps done), `PARTIAL` (stopped gracefully mid-plan), `PARTIAL` + `## Infrastructure blockers` (app-level defect prevents progress; routes to fix agent instead of another executor spawn).
+
+**Cap reasons:**
+
+- `step-cap` — executor hit `EXECUTOR_STEP_CAP_PER_SPAWN` (default 4).
+- `wall-cap` — executor approached `EXECUTOR_WALL_CAP_S` (default 600 s).
+- `self-elected` — executor chose to stop early (context feels loaded, tool-call budget high).
+- `blocker` — executor wrote `blocker.md` instead (same file, different field).
+- `hang-kill` / `unknown-exit` — runner-synthesized handoff, not agent-authored. The executor was killed by the idle watchdog or wall-cap without writing its own handoff. See `reference/cost-guardrails.md` § "Hang budgets — work preservation".
+
 **BLOCKER slug format:** kebab-case (e.g., `BLOCKER-supertokens-cdi-mismatch`). The runner uses the slug as the finding ID when it synthesizes entries into `findings.json` with `category: "infrastructure"`.
 
 ## IC-AGENT-005: `blocker.md`
@@ -592,6 +604,40 @@ What might break if this fix is applied naively.
 Delta: `git diff <prev_review_sha>...HEAD`
 Full phase: `git diff <base_sha>...HEAD`
 ```
+
+## IC-AGENT-016: `bugs/<BUG-ID>/verify.sh`
+
+- **Writer:** e2e-fix (REQUIRED when closing any E2E bug)
+- **Readers:** parallel_runner's `_run_scripted_verify_phase`
+- **Format:** Executable bash script
+- **Location:** `{e2e_dir}/bugs/<BUG-ID>/verify.sh`
+- **Runner invocation:** `bash verify.sh`, cwd = project root, env sourced from `test/e2e/.state/env`, 30 s timeout
+
+**Exit codes**
+
+| Code | Meaning | Runner action |
+|---|---|---|
+| `0` | Verified fixed | Finding → `fixed`; evidence written from stdout |
+| `1` | Verified still broken | Finding → `verified_broken`; evidence written |
+| `2` | Inconclusive | Falls through to e2e-verify agent spawn |
+| other / timeout | Treated as inconclusive | Falls through to e2e-verify agent spawn |
+
+**Stdout format** (parsed by the runner for the evidence file):
+
+```
+STATUS: FIXED | STILL_BROKEN
+EVIDENCE: <one-line concrete delta>
+COMMAND: <command used>
+```
+
+Lines after line 3 are captured verbatim in
+`verify-evidence-<iter>-script.md` next to the script.
+
+**Rationale:** a missing or inconclusive `verify.sh` triggers a full
+verify-agent spawn for that bug (~$12 per iteration). See
+`reference/cost-guardrails.md` § "Scripted verify first" for the
+contract origin and `reference/fix-agent-playbook.md` § "Writing
+verify.sh" for authoring guidance and a canonical example.
 
 ## Schema maintenance rules
 

@@ -229,37 +229,68 @@ Implementing agents MUST know this format to read failure logs during the fix-va
 
 When running the fix-validate loop, agents read `test-logs/` for the latest run, diagnose from `summary.json` → `failures/*.log`, fix code, and re-run. For full details on the test output specification and the testing philosophy (real servers, no mocks at system boundaries, stub process pattern), see `reference/testing.md`.
 
-### Automatic code review (per-phase)
+### Phase-boundary validate + review (split)
 
-Code review runs **after every phase**, not just at the end. It's structurally enforced by the runner — agents cannot skip it.
+Code review runs **after every phase**, not just at the end. It's structurally enforced by the runner — agents cannot skip it. The validate and review steps are **separate agent spawns** with different models, giving the runner more control over cost and skip conditions.
 
 **Phase lifecycle:** tasks done → validate → (review → re-validate)* → clean → phase complete
 
-After all tasks in a phase pass validation, the runner spawns a **review agent** that:
+After all tasks in a phase are done, the runner walks this lifecycle:
 
-1. **Reviews the phase's diff** using the appropriate code-review skill (React, Node, or general — auto-detected from `package.json`)
-2. **Spec-conformance check (MANDATORY)** — for each task in the phase, the review agent reads the task description and "Done when" criteria from `tasks.md`, then verifies the implementation matches:
-   - **Exact names**: if the task says a CLI should show a "STATUS" column, verify the code uses "STATUS" — not "STATE", "SOURCE", or any synonym. Same for struct field names, JSON tags, config keys, error messages, log messages, and UI labels.
-   - **All specified steps**: if the task describes a 5-step sequence (e.g., "log initiated → stop accepting → drain → hooks → flush"), verify ALL steps are present — not just the middle three. Count them.
-   - **Mechanism, not just behavior**: if the task says "validate using struct tags + custom validation," verify BOTH mechanisms exist — not just that validation works. Functionally equivalent but structurally different is a spec violation.
-   - **Cross-boundary data contracts**: if the task involves one system writing data that another reads (e.g., Nix module writes JSON, Go daemon reads it), verify the field names and types match on BOTH sides. Read the producer's output format and the consumer's input struct — they must agree on every key name, nesting, and type.
-   - **No stubs in production code**: if the task says "implement X using library Y," verify the production code actually calls library Y — not a stub returning hardcoded values. Test doubles in test directories are fine.
-   - **UI completeness**: if the task says "add loading states to all async screens," verify EVERY screen that performs async operations has a loading indicator — not just some of them. Cross-reference the list of screens mentioned in the task or spec.
-3. **Auto-fixes bugs** — security vulnerabilities, correctness issues, broken error handling, missing input validation, spec-conformance violations found in step 2, anything that would cause runtime failures or data loss. Commits each fix.
-4. **Writes a review record** to `validate/<phase>/review-N.md` with one of two outcomes:
-   - **`REVIEW-CLEAN`** — no bugs found, code is clean. Phase is complete.
-   - **`REVIEW-FIXES`** — fixes were applied. Runner spawns a validation agent to re-run tests.
+#### 1. Validate spawn (Sonnet)
 
-**If the review applied fixes** (REVIEW-FIXES):
-1. The runner re-validates (runs build/test commands via a validation agent)
-2. If validation fails → standard fix-validate loop (fix task appended, fix agent runs, re-validate)
-3. If validation passes → runner spawns **another review cycle** to check the fixes
-4. The cycle repeats until a review comes back REVIEW-CLEAN (no more bugs found)
-5. Safety cap: after 5 review cycles, the runner treats the phase as clean
+Runs build/test/lint/security/coverage per `reference/validate-review.md § Part 1`. Writes `validate/<phase>/<N>.md` with heading `PASS` or `FAIL`.
 
-**Why per-phase instead of end-of-project?** Issues compound across phases. A bug in Phase 2 may look fine in isolation but cause cascading failures when Phase 3 builds on it. Catching issues early means fix agents have simpler context and fewer moving parts.
+- **FAIL** → runner dispatches a standard fix agent; re-enters the validate step on the next scheduler pass. No review spawns.
+- **PASS** → phase advances to the review step.
 
-Review records accumulate in `validate/<phase>/review-1.md`, `review-2.md`, etc. Each review cycle gets the full history of prior findings to avoid re-reporting fixed issues.
+Sonnet is used because Part 1 is mechanical (run commands, read output, write structured report) — Opus-level reasoning is not needed.
+
+#### 2. Review trivial-diff fast-path (no spawn)
+
+Before spawning a review agent, the runner checks `git diff <phase-base>...HEAD --name-only`. If EVERY changed file is a non-source type (docs, YAML, JSON, Makefile, flake.nix files excluded — `.nix` IS source, see `parallel_runner.py:_SOURCE_FILE_EXTENSIONS`), the runner auto-writes `review-<cycle>.md` with `REVIEW-CLEAN` and the phase is complete. No review agent spawns, saving ~$10-20 per trivial phase.
+
+A phase that modified ANY source extension (`.go`, `.ts`, `.py`, `.kt`, `.rs`, `.nix`, `.dart`, etc.) is not eligible for the fast-path and proceeds to step 3.
+
+#### 3. Review spawn (Opus)
+
+Runs `reference/validate-review.md § Part 2`:
+
+- **Spec-conformance check** — for each task in the phase, the review agent reads the task description and "Done when" criteria from `tasks.md` and verifies the implementation matches (exact names, all specified steps, mechanism not just behavior, cross-boundary data contracts, no stubs in production code, UI completeness). Any violation is a bug and gets fixed in this pass.
+- **Test-depth audit** — zero-skips rule, correct tier placement, non-vacuous assertions, no mocking inside tier boundaries, error-path coverage, behavior-over-implementation. Any violation is a bug and gets fixed.
+- **Bug scan** — exhaustive, single pass. Security vulnerabilities, correctness issues, broken error handling, missing input validation, anything that would cause runtime failures or data loss.
+- **Apply fixes** directly in code with conventional commit messages.
+- **Re-run tests** if any fixes were applied.
+- **Write `review-<cycle>.md`** with heading `REVIEW-CLEAN` (nothing found) or `REVIEW-FIXES` (fixes applied).
+
+Opus is used because Part 2 is where deep reasoning matters — catching spec violations, finding the real bug behind a symptom, judging whether a fragile test is load-bearing or cosmetic.
+
+#### 4. Cycle handling (REVIEW-FIXES)
+
+When the review applied fixes:
+
+1. Runner re-validates (back to step 1, which runs fresh validate agent because fixes may have broken tests)
+2. If validation fails → standard fix-validate loop resumes
+3. If validation passes → runner spawns another review cycle to check the fixes
+4. The cycle repeats until REVIEW-CLEAN
+
+Safety cap: after `MAX_REVIEW_CYCLES = 2` cycles the runner writes an auto REVIEW-CLEAN record and accepts the phase. In practice most phases converge on cycle 1.
+
+#### 5. Why per-phase instead of end-of-project?
+
+Issues compound across phases. A bug in Phase 2 may look fine in isolation but cause cascading failures when Phase 3 builds on it. Catching issues early means fix agents have simpler context and fewer moving parts.
+
+Review records accumulate in `validate/<phase>/review-1.md`, `review-2.md`, etc. Each review cycle gets the prior records (by Read path, not inlined — cache-friendly) so it can skip already-fixed issues.
+
+#### Cost shape
+
+The split saves roughly 50-60% of the VR phase's cost compared to the old combined spawn:
+
+- **Validate on Sonnet** instead of Opus: ~5× cheaper per spawn for a near-identical job
+- **Review skipped on trivial diffs**: ~20-30% of phases in practice (flake updates, docs, workflow edits)
+- **Shared prompt content via Read paths**: the 28KB of test-depth rules, review-skill instructions, and spec-conformance criteria now lives in `reference/validate-review.md` at a stable path, so every spawn after the first gets it from the prompt cache
+
+Compared to the old combined spawn (~35KB per-spawn prompt, Opus only), the new validate prompt is ~7KB (Sonnet) and the new review prompt is ~7KB (Opus). The reference content is loaded once and cached.
 
 ### learnings.md
 
@@ -369,16 +400,33 @@ When an agent encounters a blocker, it MUST evaluate the situation before giving
    | **External system access** | NO | Need VPN, need account creation, need human to grant permissions |
    | **Hardware requirement** | NO | Physical device needed, USB connection required, biometric enrollment |
 
-2. **Consult user preference artifacts**: Before attempting ANY solution, read these files from the spec directory:
+   **Scope aversion is not a blocker.** A bounded environment/tooling failure is in-scope for this task even when the fix touches files outside the task's nominal surface area. Bounded means: the fix is one or two of {reinstall a dep, rebuild a venv, restart a service, pin or update a single flake input, add a missing package to `flake.nix`, set an env var}. Only declare `BLOCKED.md` when the fix requires human credentials, external service access, hardware, or flake surgery touching multiple inputs with unclear coupling. The instinct "this looks like infra, don't touch it" is correct for destructive or multi-input changes and wrong for the bounded list above — make the call explicitly, don't default to bail.
+
+   **Never anchor on a prior `BLOCKED.md` without re-diagnosing.** If a `BLOCKED.md` exists when you start a task, treat its claims as a hypothesis, not a verdict. Re-run the diagnose step (below) and re-probe the failing command yourself before accepting that the blocker is real. A stale blocker left by a previous agent is the single most common cause of pipeline stalls — it self-reinforces because each subsequent agent reads it and inherits the bail.
+
+2. **Run the dep's `diagnose` script first (if present).** If the task has `[needs: X]` tags and `.claude/task-deps.json` defines a `diagnose` entry for `X`, execute it BEFORE declaring the dep unsatisfiable. The script returns structured JSON:
+
+   ```json
+   {"status": "working|fixable|broken", "remediation": "…" | null, "detail": "…"}
+   ```
+
+   Decision rules:
+   - `working` → proceed with the task. Any earlier "crash" signal was a transient probe artifact.
+   - `fixable` → execute the `remediation` hint exactly once, then re-run `diagnose`. If it now returns `working`, proceed. If it still returns `fixable` with the same hint, the hint didn't take — treat as `broken` and fall through to step 6. If it returns `fixable` with a *different* hint, execute that once too (chain depth capped at 2 to prevent loops).
+   - `broken` → fall through to step 6 (human input needed). Include the `detail` field in `BLOCKED.md`.
+
+   The diagnose contract exists specifically to defeat the "crashed with no stderr" failure mode — a probe that collapses ModuleNotFoundError and a health-check timeout into the same `crashed` status. Structured diagnosis separates "fix this by doing X" from "genuinely stuck."
+
+3. **Consult user preference artifacts**: Before attempting ANY solution, read these files from the spec directory:
    - **`interview-notes.md`** — key decisions, user pushbacks, things the user rejected
    - **`research.md`** — alternatives considered and why they were rejected
    - **`spec.md`** — requirements and constraints
 
    If a candidate solution conflicts with a user preference or rejected alternative documented in these files, **skip it and try the next option**. For example: if the user said "no Docker, use Nix for everything" and the obvious fix is to spin up a Docker container, don't do it — find a Nix-based solution instead. User preferences from the interview are constraints, not suggestions.
 
-3. **If auto-resolvable and preference-compatible**: Attempt to fix it. Install the tool, configure the environment, fix the build error, start the service. Record what you did in `learnings.md` so future agents don't hit the same issue.
+4. **If auto-resolvable and preference-compatible**: Attempt to fix it. Install the tool, configure the environment, fix the build error, start the service. Record what you did in `learnings.md` so future agents don't hit the same issue.
 
-4. **If uncertain**: Spawn a sub-agent to evaluate the options. The sub-agent MUST read `interview-notes.md` and `research.md` before evaluating solutions. The sub-agent should:
+5. **If uncertain**: Spawn a sub-agent to evaluate the options. The sub-agent MUST read `interview-notes.md` and `research.md` before evaluating solutions. The sub-agent should:
    - Read the error/blocker details
    - Read user preference artifacts (interview-notes.md, research.md)
    - Research possible solutions (check docs, search for similar issues)
@@ -387,7 +435,7 @@ When an agent encounters a blocker, it MUST evaluate the situation before giving
    - If yes, execute the solution and report back
    - If no, explain why — either human input is needed, or all viable solutions conflict with user preferences
 
-5. **Only write `BLOCKED.md` if**:
+6. **Only write `BLOCKED.md` if**:
    - The blocker genuinely requires human input (credentials, design decisions, access)
    - The agent attempted auto-resolution and it failed (document what was tried)
    - The agent spawned an unblocker sub-agent and it couldn't find a solution
@@ -403,7 +451,8 @@ Common scenarios that agents MUST handle without writing BLOCKED.md:
 - **Database not running**: Start it using project-local scripts or `nix develop` process-compose. Create the test database, run migrations.
 - **Port conflict**: Find an available port, update the config.
 - **Missing test fixtures**: Generate them (keypairs, template files, mock data).
-- **Dependency version mismatch**: Update the lockfile or `flake.nix` pins, resolve the conflict.
+- **Dependency version mismatch**: Update the lockfile or `flake.nix` pins, resolve the conflict. **Always attempt to upgrade the older component first; only downgrade if upgrade fails or is demonstrably incompatible.** This applies to library-version conflicts, protocol-version conflicts (e.g. SDK requires CDI 5.4, server implements CDI 5.3 — upgrade the server first, then downgrade the SDK if that fails), Nix input updates, and lockfile refreshes. Rationale: upgrades gain bug fixes and features; downgrades are a durable regression the project inherits forever. Document the outcome in `learnings.md` so the next version bump doesn't repeat the investigation.
+- **Client/server protocol mismatch** (SDK vs. service, client vs. server, consumer vs. producer): this is a version mismatch with two possible fix sites. The order is: (1) upgrade the side implementing the older protocol, (2) if that's blocked upstream, upgrade the *other* side to a version that speaks the older protocol, (3) only as a last resort, downgrade the newer side. An agent that hits this MUST make the decision and execute it — do not write `BLOCKED.md` to ask which one. The upgrade-first rule is the decision; apply it.
 - **Missing project dependency**: Add to `package.json` / `pyproject.toml` / `flake.nix` and install project-locally (`npm install --ignore-scripts`, `pip install --only-binary :all:` in a venv). Then `npm rebuild <pkg>` only for packages needing native compilation. Never install globally.
 
 ---
