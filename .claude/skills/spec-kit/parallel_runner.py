@@ -12080,7 +12080,8 @@ Full log: `{setup_log.relative_to(project_dir) if setup_log.is_absolute() else s
         enforced_caps = {"mcp-browser", "mcp-android"}
         if not (task.capabilities & enforced_caps):
             return False
-        project_dir = Path(spec_dir).parent
+        # spec_dir is .../specs/<feature>; project root is two levels up.
+        project_dir = Path(spec_dir).resolve().parent.parent
         if self._has_regression(task, project_dir):
             return False
         driver = self._regression_driver(task)
