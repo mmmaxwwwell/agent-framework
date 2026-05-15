@@ -293,6 +293,19 @@ Signature: the file's first line MUST be `// regression for <TASK_ID>`
 (or `# regression for <TASK_ID>` in Kotlin). Without the signature the
 runner treats the file as unrelated and falls through.
 
+**`<TASK_ID>` always means the task you are currently working on** —
+not a task referenced in the description or "Done when" clause. The
+runner's `missing_regression_spec` gate looks for the spec at the path
+derived from your current task id; if it's missing, the task fails and
+is not marked done, no matter what other artifacts you produced.
+
+Backfill-style tasks (whose described deliverables are specs *for other
+tasks*) must produce **both**: the deliverables the task names, AND a
+spec at the runner-expected path for the current `TASK_ID`. The second
+file may be a thin delegator that re-runs the other specs' assertions —
+its job is to satisfy the mechanical gate. First-line signature
+references the current task id.
+
 If you cannot produce a regression (the flow requires manual
 intervention), file a `REGRESSION-NEEDED` finding instead of emitting
 a placeholder — the runner treats a missing regression as a bug on the

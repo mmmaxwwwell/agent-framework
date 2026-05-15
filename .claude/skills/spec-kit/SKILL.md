@@ -19,6 +19,7 @@ phases/              # One file per workflow phase — load only what's needed
   install.md         # Phase 0: install specify, init project
   interview.md       # Phase 2: specification interview
   plan.md            # Phase 5: architecture walkthrough and plan generation
+  workflows.md       # Phase 5.5: persona-driven E2E workflows — test contract
   tasks.md           # Phase 6: task list generation
   implement.md       # Phase 7: autonomous runner, fix-validate, auto-unblocking
 reference/           # Enterprise knowledge base — loaded on demand by phase files
@@ -349,8 +350,9 @@ phase, so it must exist before they start.
 
 | Check (in this order) | Location | If exists → | If missing → |
 |----------------------|----------|-------------|-------------|
-| Task list | `specs/*/tasks.md` or `tasks.md` | Ready for Phase 7 (implement) | Check for plan |
-| Plan | `specs/*/plan.md` or `plan.md` | Ready for Phase 6 (tasks) | Check for spec |
+| Task list | `specs/*/tasks.md` or `tasks.md` | Ready for Phase 7 (implement) | Check for workflows |
+| Workflows | `specs/*/workflows.md` | Ready for Phase 6 (tasks) | Check for plan |
+| Plan | `specs/*/plan.md` or `plan.md` | Ready for Phase 5.5 (workflows) | Check for spec |
 | Feature spec | `specs/*/spec.md` | Check for `[NEEDS CLARIFICATION]` tags → Phase 3 (clarify), then Phase 4 (analyze loop) → once clean, Phase 5 (plan) | Check for constitution |
 | Constitution | `.specify/memory/constitution.md` | Ready for Phase 2 (specify) | Start with Phase 1 (constitution) |
 | Interview notes | `specs/*/interview-notes.md` | Resume from where interview left off | Fresh project — start interview |
@@ -371,6 +373,7 @@ Present the user with their current state and next recommended step.
 | Clarify (Phase 3) | Read `.specify/commands/clarify.md` template directly. Scans for ambiguities across 11 categories, generates up to 5 prioritized questions presented one at a time, integrates answers back into the spec. |
 | Analyze (Phase 4) | Read `.specify/commands/analyze.md` template directly. **Mandatory and looping** — see below. |
 | Plan (Phase 5) | `phases/plan.md` |
+| Workflows (Phase 5.5) | `phases/workflows.md` — persona-driven E2E test contract; replaces Acceptance Scenarios in spec.md. **Mandatory** before tasks. |
 | Tasks (Phase 6) | `phases/tasks.md` |
 | Implement (Phase 7) | `phases/implement.md`. Note: spec-kit's built-in `/speckit.implement` runs in a single context and will hit limits on larger projects — use the parallel runner instead. |
 | Checklist (Phase 8) | Read `.specify/commands/checklist.md` template directly |
@@ -388,7 +391,7 @@ For each phase:
 
 After completing any phase, **automatically start the next phase** without waiting for the user to ask. The one exception: **never auto-start Phase 7 (implement)**. Instead, summarize what's ready and ask the user to confirm before launching the implementation runner.
 
-The full auto-advance chain: constitution → specify → clarify → **analyze loop** → plan → tasks → **stop and confirm** → implement.
+The full auto-advance chain: constitution → specify → clarify → **analyze loop** → plan → **workflows** → **analyze loop (re-run, workflows.md is a new artifact)** → tasks → **stop and confirm** → implement.
 
 ### Phase 4 (analyze) — mandatory loop until clean
 

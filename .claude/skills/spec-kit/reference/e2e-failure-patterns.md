@@ -259,6 +259,102 @@ cat .specify/mcp/browser.json  # is --executable-path configured?
 
 ---
 
+## Signature: stale-android-apk-after-source-fix (Android)
+
+**Match:** A bug fix to a Flutter or Android source file landed (committed
+or staged). A subsequent `flutter build apk --debug` (or `gradlew
+assembleDebug`) reports exit 0 and "Built app-debug.apk" / "BUILD
+SUCCESSFUL". `adb install -r` then succeeds. But the bug's `verify.sh`
+still fails — the running app behaves like the pre-fix code.
+
+Concretely: the APK file mtime predates the fix commit, OR
+`unzip -p <apk> assets/flutter_assets/kernel_blob.bin | strings | grep
+<post-fix-symbol>` returns empty, OR `adb shell dumpsys package <pkg> |
+grep lastUpdateTime` shows a timestamp older than the latest build.
+
+**Typical root cause:** Gradle's incremental build cache hit. The source
+file changed but the task's cache key didn't invalidate (most often: the
+edit only touched a string literal Gradle considered semantically equal
+to the prior build's input, or the worktree's mtime is older than the
+last-known-good cache snapshot, or a parent task's "UP-TO-DATE" verdict
+short-circuited the dependency chain). Gradle then reuses the pre-fix
+artifact. `adb install -r` accepts the valid APK and reports success,
+but it's the same broken binary as before.
+
+The build agent and the verify agent both see "exit 0" signals and
+naturally conclude the fix shipped. Multiple fix iterations in a row
+will hit this same cache and reach the same wrong conclusion. The kanix
+T099 case ran 4 iterations × multiple agents × ~2 hours of wall-clock
+before one agent finally typed `flutter clean`.
+
+**Diagnostic commands:**
+
+```bash
+APK=$(find <build-root>/build/app/outputs -name '*-debug.apk' | head -1)
+ls -l "$APK"                                 # mtime — compare to fix commit
+git log -1 --format='%ci %h %s' -- <source>  # when did the fix land?
+unzip -p "$APK" assets/flutter_assets/kernel_blob.bin | strings | \
+  grep '<post-fix-symbol>'                   # empty = pre-fix code in APK
+adb shell dumpsys package <pkg> | grep lastUpdateTime
+                                              # device install timestamp
+```
+
+If APK mtime > fix commit AND grep finds the post-fix symbol AND
+device lastUpdateTime > APK mtime, the fix is genuinely deployed. If
+ANY of those three fails, the cache lied to you.
+
+**Fix (mandatory — do not skip the clean step):**
+
+```bash
+cd <flutter-app> && flutter clean && \
+  flutter build apk --debug && \
+  adb install -r build/app/outputs/flutter-apk/app-debug.apk
+```
+
+For pure Gradle: `./gradlew clean assembleDebug` then `adb install -r`.
+
+**`flutter clean` is mandatory after any source change** — the project's
+build scripts (`scripts/e2e-install-apks.sh` and `test/e2e/setup.sh`)
+already detect staleness and run it automatically; if you are
+building outside those scripts (e.g. directly via `flutter build apk`),
+you must run `flutter clean` first whenever any source file is newer
+than the existing APK.
+
+**Verify the install actually applied** — every Android `verify.sh`
+for a code-fix bug must grep the installed APK's content, not just
+the build log. Sample:
+
+```bash
+#!/usr/bin/env bash
+set -eu
+APK=$(find admin/build/app/outputs -name '*-debug.apk' | head -1)
+if unzip -p "$APK" assets/flutter_assets/kernel_blob.bin 2>/dev/null \
+     | strings | grep -q '/api/admin/fulfillment-tasks'; then
+  echo "STATUS: FIXED"
+  echo "EVIDENCE: APK kernel_blob.bin contains post-fix URL"
+  exit 0
+else
+  echo "STATUS: STILL_BROKEN"
+  echo "EVIDENCE: APK does not contain post-fix URL — Gradle cache hit"
+  exit 1
+fi
+```
+
+**Anti-patterns:**
+
+- **Trusting build-log mtime > fix-commit epoch as proof of recompilation.**
+  The build log writes whether or not the cache hit. Mtime of the log
+  tells you the build *ran*, not that it *recompiled*.
+- **Trusting Gradle's "exit 0 / Built app-debug.apk" output.** Cache
+  hits print these too.
+- **Trusting `adb install -r` to mean "new code on device."** It will
+  happily reinstall the same APK with no observable change.
+- **Re-running `flutter build apk` without `flutter clean` and expecting
+  different output.** Guaranteed to hit the same cache; this is the
+  literal loop the kanix T099 case got stuck in for 4 iterations.
+
+---
+
 ## Signature: emulator-boot-timeout (Android)
 
 **Match:** Android platform boot: `start-emulator` times out, `adb devices`

@@ -1,6 +1,36 @@
-# Integration Testing Requirements
+# Testing Requirements
 
-Every spec-kit project MUST include comprehensive integration tests that validate all user flows end-to-end. This is non-negotiable — without working tests, the autonomous fix-validate loop that powers implementation is blind.
+Every spec-kit project MUST include all three test tiers — **unit, integration, and end-to-end (E2E)** — and every tier MUST run in the verify gate at every phase boundary. This is non-negotiable. A green gate that exercised only unit + integration is a *false* green; the autonomous fix-validate loop that powers implementation depends on the gate matching reality, and reality means the artifact a user actually runs.
+
+## Tier authoring order (read this first)
+
+The agents write tests in this order so the same flow is not rewritten three times:
+
+1. **Unit tests are written alongside the code they test, in the same task.** As each module is implemented, its unit tests land in the same commit. No "we'll add tests later" — unit coverage is part of the task's definition of done.
+2. **Integration tests are written when a module is ready to be integrated with other parts of the app**, at natural stopping points where a meaningful slice of the system can be exercised end-to-end *inside one process boundary* (HTTP → handler → real DB → real auth → response, no UI runtime). Wait until the slice is stable — don't write an integration test for a function that's about to be refactored into three. The goal is to minimize rewrite churn; one well-placed integration test beats five throwaway ones.
+3. **E2E tests are written once unit and integration cover most of the app.** E2E exists to verify the runtime artifact a user actually launches — `npm run dev`, `npm run start`, the built bundle, the deployed app. Until the lower tiers cover the business logic, an E2E suite is testing a moving target. Once they do, the E2E suite locks down the user-visible behavior and catches the *integration of integrations*: missing build-step plugins, missing runtime deps, broken dev scripts, unstyled pages, 404s on real routes — all the things that pass unit + integration and still ship broken.
+
+This is authoring order. It is **not** running order. Once a tier exists, it runs at every phase from then on. Adding E2E in Phase 7 does not exempt Phases 8–N from running E2E.
+
+## Verify gate enforces all three tiers
+
+At every phase boundary, the runner discovers and executes every `test*` / `lint` / `build` / `typecheck` script declared in every workspace `package.json` (root + `apps/*` + `packages/*` + common monorepo subdirs). This includes `test:e2e`, `test:integration`, `test:contract`, `test:unit`, and any other `test:*` script the project declares. If a script is in `package.json` and the gate finds it, **it runs** — there is no opt-out flag, no skip allowlist, no "the binary isn't on PATH so we skip it" path. A script that exists must pass.
+
+**Corollary 1**: declaring a test script in `package.json` is a commitment. If your project advertises `test:e2e` but you don't want it run yet, don't add the script. Once added, it gates every phase.
+
+**Corollary 2**: every user-facing artifact must have an E2E test that runs it the way a user does. If the project ships `npm run dev`, there is an E2E that runs `npm run dev` and asserts the UI renders correctly (styled, interactive, API reachable). If the project ships a `node dist/server.js`-style production launch, there is an E2E that builds and runs it. The Playwright/MCP suites that drive the *server in isolation* are valuable but they are not sufficient — they bypass the very layer (build script, dev script, bundler config, runtime deps) where most ship-breaking bugs live.
+
+## Obstacles are solved, not skipped
+
+The wrapper assumes a Nix-flake-managed environment (or equivalent reproducible toolchain). Native modules, browser binaries, slicer CLIs, FFmpeg, openssl, simulators — all of it is solvable by adding the right package to `flake.nix` or by writing the right wrapper. The agent's job is to find that solution. The only thing an agent *cannot* solve is **credentials it doesn't have** (API keys, signed certificates from a private CA, hardware tokens). Everything else has a solution and the agent must find it.
+
+**Rules that follow:**
+
+- **No `doCheck = false` to escape a failing check.** If a Nix derivation can't run a test in the sandbox, the test must still run *somewhere* in the gate (typically: in the devshell, executed by the wrapper's discovered command list — which the wrapper does enforce). Disabling a check without a runs-in-the-gate replacement is FAIL.
+- **No `it.skip`, `it.skipIf`, `test.skip`, `.only`, `xdescribe`, `xit`, `--skip-tests`, or runtime skip guards.** If a test can't run in the standard environment, it goes in a separate file pattern excluded by `include`/`exclude` config at the *runner* level — and even then, the wrapper expects every advertised tier to run. See "Zero-skips rule" below.
+- **No `if (process.env.CI) return;` shortcuts.** That kind of guard hides the failure from CI, where it matters most.
+- **When a check genuinely cannot pass without credentials, the agent writes BLOCKED.md and escalates to the user.** This is the only legitimate escalation path. "It's hard" is not an escalation; "I need an X.509 cert signed by Acme's private CA to test the integration with their API" is.
+- **When a test exposes a real bug, the fix goes in the *code*, not the test.** Loosening an assertion, increasing a timeout past the spec's budget, or removing a check to make the gate green is FAIL.
 
 ## Test tier taxonomy (READ THIS FIRST)
 

@@ -177,7 +177,11 @@ This check catches the most insidious class of bugs: code that compiles, passes 
 Agents MUST NEVER classify a build, test, lint, or security failure as "expected," "work in progress," "known issue," or "will be fixed later." If a command fails, the agent fixes it — period. There are exactly TWO valid responses to a validation failure:
 
 1. **Fix the code** so the command passes
-2. **Write BLOCKED.md** if the failure genuinely requires human input (missing credentials, design ambiguity, hardware)
+2. **Write BLOCKED.md** if the failure genuinely requires **credentials the agent doesn't have** (an API key, a private-CA signed cert, a hardware token). That is the only legitimate escalation path.
+
+**Everything else is solvable by the agent.** The wrapper assumes a Nix-flake-managed environment: missing CLI tools (`openssl`, `ffmpeg`, slicers, simulators), native modules (better-sqlite3, sharp), browser binaries, emulator support — all are solvable by adding the right package to `flake.nix` or writing the right wrapper. "It's hard," "the sandbox doesn't allow it," "this needs a special environment" are not valid BLOCKED reasons.
+
+**No skip-without-replacement.** Disabling a check (`doCheck = false`, `it.skip`, `test.skipIf`, `.only`, `xdescribe`, `--skip-tests`, `if (process.env.CI) return`, try/catch swallowing setup errors) is FAIL unless the agent adds a runs-in-the-gate replacement that exercises the same coverage. "We test this in the devshell instead" is acceptable only if the wrapper's verify gate (which runs in the devshell) actually executes the equivalent command — and the agent has confirmed by running it locally.
 
 **Why the coverage proof catches what prohibition lists don't:** Previous versions of this skill listed prohibited rationalizations ("don't say X," "don't claim Y"). Agents read those lists and found adjacent rationalizations not on the list. The coverage proof inverts the burden: instead of prohibiting excuses, it requires positive evidence. You must show which build systems were modified, which were tested, and how many tests ran. If the numbers don't add up, it's FAIL — no rationalization can change arithmetic.
 

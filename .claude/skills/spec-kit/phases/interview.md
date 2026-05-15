@@ -247,7 +247,9 @@ Mark deferred items with `[DEFERRED]` tag and the recommended approach.
 
 ## When You're Satisfied
 
-When you believe the spec is comprehensive (no `[NEEDS CLARIFICATION]` tags, all user stories have acceptance scenarios, edge cases are covered, all enterprise infrastructure decisions are documented):
+When you believe the spec is comprehensive (no `[NEEDS CLARIFICATION]` tags, all user stories have a one-line "Independent Test" hint, edge cases are covered, all enterprise infrastructure decisions are documented):
+
+**Acceptance Scenarios are NOT written in this phase.** Phase 5.5 (workflows) replaces them with a full persona-driven workflows.md that becomes the E2E test contract. Each user story here only needs: title, priority, prose, "Why this priority", and "Independent Test" (one line). The Given/When/Then bullets that older spec-kit projects wrote are now deprecated — they get expanded into workflows.md later. If you find yourself writing more than one sentence of Given/When/Then, stop — that detail belongs in workflows.md.
 
 1. **Do NOT auto-advance to planning.** Tell the user the spec looks comprehensive and ask if they'd like to continue refining or move to planning.
 2. **Wait for explicit confirmation.** The user must say they're ready.

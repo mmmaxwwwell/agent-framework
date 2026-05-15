@@ -97,6 +97,27 @@ Load `reference/testing.md` before writing these tasks:
 - **If the project uses protocols** (SSH, SMTP, WebSocket, etc.): real protocol test servers
 - **If the project spawns external processes** (check spec for CLI tools, agents, child workers): stub process scripts that accept the same flags/protocols as the real tool. See the "External process boundary testing" section in `reference/testing.md` — this is the most commonly missed test category and the one most likely to cause "both sides green, system broken" failures.
 
+### Three-tier test ordering (mandatory)
+
+Read `reference/testing.md` § "Tier authoring order" before generating tasks. Summary the task generator must honor:
+
+1. **Unit tests are written in the same task as the code.** Every implementation task that adds non-trivial logic includes its unit tests in the same commit. Do not generate "add unit tests for X" tasks separately from "implement X" — they are one task.
+2. **Integration tests are scheduled at natural module-stable points**, not per task. After a slice of related modules is implemented and unlikely to be refactored, generate ONE integration-test task that exercises the slice end-to-end inside one process boundary. Minimize the number of times an integration test is rewritten — wait until the slice is stable, then test it once.
+3. **E2E tests come after unit + integration cover most of the app.** Schedule E2E tasks in a late phase, after the feature phases. The E2E tasks are **generated from `workflows.md`** (Phase 5.5 output), one task per workflow. Every workflow → exactly one E2E task. Workflows already specify steps, DOM, network, edges, and budget — the task description is a thin reference back to the workflow (`Implement E2E for W-U2 per workflows.md`).
+
+The verify gate runs every `test*` script declared in every workspace `package.json` (root + `apps/*` + `packages/*` + monorepo subdirs) at every phase boundary. If you declare `test:e2e` in `package.json`, it gates every phase from that point on. Don't declare it until the project is ready for E2E to be a hard requirement.
+
+### Reading workflows.md
+
+If `specs/<feature>/workflows.md` exists (Phase 5.5 has run), it is the **primary source for E2E tasks**. Generate:
+
+- One task per workflow under every persona section in workflows.md (developer, sysadmin, and each end-user persona — counts vary by project). Tag with the workflow's id (e.g. `W-DEV-1`, `W-SYS-3`, `W-OP-2`, `W-ADM-1`). Task description references the workflow's section in workflows.md, does NOT duplicate the step list.
+- One task per affordance gap workflows.md surfaced (e.g. "Add `data-printer-name` attribute to printer card to support W-OP-1 step 2").
+- One late-phase task: "Declare `test:e2e` script in every package.json that hosts E2E specs, so the verify gate picks them up." This is a no-op if already declared but ensures it's audited.
+- A `Phase E2E hardening` block at the end of tasks.md that groups all workflow tasks. This phase MUST run after every feature phase has shipped its integration tests (i.e. after the last user-story phase).
+
+If `workflows.md` does NOT exist, the task generator must STOP and direct the user to run Phase 5.5 first. Do not invent workflows from spec.md — that's Phase 5.5's job and skipping it produces shallow E2Es.
+
 ### Fix-validate loop
 Task list MUST follow the fix-validate loop pattern. Load `reference/testing.md` for the required task structure:
 1. Write tests for the feature (they should fail — TDD)
@@ -204,6 +225,7 @@ For every platform runtime the project targets (Android / iOS / web / desktop), 
 | 4 | `test/e2e/setup.sh` + `test/e2e/teardown.sh` — start/stop backend services, kill orphan processes on known ports, clean stale sockets, write `$STATE_DIR/env` with service URLs + test credentials, idempotent | The runner auto-invokes these before booting the emulator; no annotation needed | `reference/e2e-runtime.md` §"Backend service setup for MCP E2E loops" |
 | 5 | App build + install scripts (APK for Android, `.app` for iOS, static bundle for web) feeding into the runner's install step | The runner rebuilds+installs between fix iterations — this script is the contract | `reference/e2e-runtime.md` §"Runtime selection" |
 | 6 | Scripted regression harness per platform (Playwright for web, Patrol / Flutter integration_test or Gradle androidTest for Android, XCUITest for iOS — iOS deferred). **The explore agent auto-emits the regression spec on first success for both web and Android** (see `reference/mcp-e2e.md § Regression fast-path`); subsequent runs skip the MCP agent entirely when the spec passes. iOS tasks always fall through to the MCP loop today. | MCP exploration finds bugs; scripted tests prevent regressions. On later runs, the scripted harness is what actually executes, not the MCP agent — this is where the token savings compound across an E2E phase. | `reference/e2e-runtime.md` §"MCP + scripted complementarity" |
+| 7 | **Multi-app Android repos only**: every `[needs: mcp-android]` task MUST also carry a `[android-app: <dir>]` annotation naming the Flutter app it exercises (e.g. `[android-app: admin]`, `[android-app: customer]`). Cross-app E2E tasks pick the app whose UI the test *drives* — backend assertions across both apps belong in `[android-app: <driver>]` with the other app verified via API. Do NOT set a project-wide `ANDROID_BUILD_ROOT` default in your devshell — that silently breaks every task targeting the *other* app. | The runner uses this annotation to pick the build root, the install target, and the regression-spec location. Without it, a single env-default forces every task to one app. With it, the runner can interleave admin and customer tasks in the same session. | `reference/mcp-e2e-android.md` §"Multi-app monorepos" |
 
 #### Part B — E2E scenario coverage checklist (enumerate, then map to tasks)
 
@@ -231,6 +253,7 @@ When generating tasks for a multi-runtime project:
 2. Write the **E2E / MCP infrastructure phase** BEFORE the feature phases — make these prerequisites of Phase 1 or Phase 2, not an afterthought in the final phase.
 3. After drafting the integration/E2E phase, walk Part B categories 1–13 out loud in the task-generation response, mapping each to a specific task ID. If a category has no mapping, either add a task or add an explicit "deferred because X" line.
 4. If iOS, Android, web, or desktop is listed in the interview but no `mcp-<that-platform>` tasks exist, STOP and ask the user whether to include or explicitly defer.
+5. **Multi-app Android repos**: if the project has more than one Flutter app at the repo root (each with its own `pubspec.yaml`, e.g. `admin/` + `customer/`), every `[needs: mcp-android]` task MUST carry `[android-app: <dir>]`. Walk every `mcp-android` task in the draft and confirm the annotation is present and names a real directory. The runner cannot guess which app a task targets from prose — an unannotated multi-app task will silently use whichever app the runner picked first and the regression-spec gate will fail.
 
 **This checklist is the mechanism. Without it, the initial kanix task list shipped with zero MCP setup tasks and missed six E2E categories — that's the failure mode this checklist prevents.**
 

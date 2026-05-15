@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -335,6 +336,14 @@ class Task:
     line_num: int
     dependencies: list[str] = field(default_factory=list)
     capabilities: set[str] = field(default_factory=set)  # e.g. {"gh"} from [needs: gh]
+    # `[android-app: <dir>]` annotation: pins which Flutter app under the
+    # repo root the runner should target for build-detect, package-detect,
+    # and regression-spec discovery. None means "auto-detect" (single-app
+    # repos) or "fall back to ANDROID_BUILD_ROOT env / scan all apps"
+    # (multi-app repos). Required in multi-app monorepos to disambiguate
+    # which app the task exercises — a project-wide env default silently
+    # breaks every task targeting the *other* app.
+    android_app: Optional[str] = None
 
 
 @dataclass
@@ -394,6 +403,10 @@ TASK_RE = re.compile(
 )
 PARALLEL_RE = re.compile(r'\[P\]')
 NEEDS_RE = re.compile(r'\[needs:\s*([^\]]+)\]')
+# `[android-app: admin]` or `[android-app: customer]` — pins which Flutter
+# app a task targets in multi-app repos. The captured value is a directory
+# name relative to the repo root.
+ANDROID_APP_RE = re.compile(r'\[android-app:\s*([^\]]+)\]')
 PHASE_HEADING_RE = re.compile(r'^##\s+Phase\s*(?::?\s*\d*\s*[-–—:]?\s*)?(.+)$', re.IGNORECASE)
 DEPENDENCY_SECTION_RE = re.compile(r'^##\s+(?:Phase\s+)?Dependencies', re.IGNORECASE)
 # Phase reference: "Phase 2b (Retro Wiring)" → captures "2b"
@@ -531,6 +544,15 @@ def parse_task_file(path: Path) -> tuple[list[Phase], dict[str, list[str]]]:
             if needs_match:
                 caps = {c.strip().lower() for c in needs_match.group(1).split(',')}
 
+            # Parse [android-app: <dir>] target-app annotation. Multi-app
+            # Android monorepos must declare which app each task exercises;
+            # the runner uses this to pick the build root, regression-spec
+            # location, and package name. Single-app repos can omit it.
+            android_app: Optional[str] = None
+            app_match = ANDROID_APP_RE.search(line)
+            if app_match:
+                android_app = app_match.group(1).strip()
+
             task = Task(
                 id=task_id,
                 description=desc,
@@ -539,6 +561,7 @@ def parse_task_file(path: Path) -> tuple[list[Phase], dict[str, list[str]]]:
                 status=status,
                 line_num=i + 1,
                 capabilities=caps,
+                android_app=android_app,
             )
             current_phase.tasks.append(task)
 
@@ -1043,6 +1066,15 @@ class TUI:
         self.lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Free-form "what is the main loop doing right now" string shown
+        # under the dependency graph when no agents are running. Updated
+        # via set_activity() from the scheduler. Without this, an empty
+        # agent list looks indistinguishable from "stuck" — the TUI just
+        # says "No agents running" even when the loop is busy scanning
+        # phase states, running runner-verify, waiting on the circuit
+        # breaker, etc.
+        self._activity: str = "starting up"
+        self._activity_ts: float = time.time()
 
     def start(self):
         self._thread = threading.Thread(target=self._render_loop, daemon=True)
@@ -1056,6 +1088,18 @@ class TUI:
     def update_agents(self, agents: list[AgentSlot]):
         with self.lock:
             self.agents = list(agents)
+
+    def set_activity(self, msg: str) -> None:
+        """Record what the scheduler is currently doing.
+
+        Shown under the dependency graph when no agents are running so
+        the user can tell "actively working" from "stuck." Call this at
+        every decision point in the main loop (phase scan, runner-verify,
+        spawn decisions, circuit-breaker waits, etc.).
+        """
+        with self.lock:
+            self._activity = msg
+            self._activity_ts = time.time()
 
     def _get_terminal_size(self) -> tuple[int, int]:
         try:
@@ -1076,6 +1120,8 @@ class TUI:
         cols, rows = self._get_terminal_size()
         with self.lock:
             agents = list(self.agents)
+            activity = self._activity
+            activity_age = time.time() - self._activity_ts
 
         # Clear screen and move cursor to top
         output = "\033[2J\033[H"
@@ -1093,7 +1139,18 @@ class TUI:
 
         # Bottom section: agent output panes
         if not agents:
-            output += f"\n {DIM}No agents running. Waiting for ready tasks...{RESET}\n"
+            # Show the current scheduler activity + how long since it was
+            # last updated. Lets the user distinguish "actively deciding"
+            # from "stuck." If activity is stale (>30s) we colour it
+            # yellow as a soft warning.
+            age_str = ""
+            if activity_age >= 2:
+                if activity_age < 60:
+                    age_str = f" ({int(activity_age)}s)"
+                else:
+                    age_str = f" ({int(activity_age // 60)}m{int(activity_age % 60)}s)"
+            colour = "\033[33m" if activity_age >= 30 else DIM
+            output += f"\n {colour}Scheduler: {activity}{age_str}{RESET}\n"
         else:
             remaining_rows = max(rows - graph_height - 2, 8)
             num_agents = len(agents)
@@ -1903,6 +1960,177 @@ ran tests/linting and found failures. Your job is to fix them.
 ## Latest validation failure
 
 {failure_text}
+"""
+
+
+def build_rv_fix_prompt(spec_dir: str, task_file: str, learnings_file: str,
+                        phase: Phase, rv_file: Path, attempt: int) -> str:
+    """Prompt for a fix agent dispatched after a runner-verify failure.
+
+    Unlike VR-fix, this fires AFTER review-clean: the LLM-driven validate
+    pass already passed, but the runner's deterministic re-run of the test
+    commands failed. The fix agent reads the captured stdout/stderr tails
+    from rv_file and patches the code so the commands pass on the next
+    runner-verify (which the runner schedules automatically).
+    """
+    phase_slug = phase.slug
+    task_ids = ", ".join(t.id for t in phase.tasks)
+    validate_dir = f"{spec_dir}/validate/{phase_slug}"
+
+    try:
+        rv_data = json.loads(rv_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        rv_data = {"commands": []}
+
+    failed_blocks = []
+    for entry in rv_data.get("commands", []):
+        if entry.get("passed", True):
+            continue
+        label = entry.get("label", entry.get("command", "?"))
+        cmd = entry.get("command", "?")
+        exit_code = entry.get("exit_code", "?")
+        err = entry.get("error")
+        block = [
+            f"### Command: `{label}`",
+            "",
+            f"- Invocation: `{cmd}`",
+            f"- Exit code: `{exit_code}`",
+        ]
+        if err:
+            block.append(f"- Error: {err}")
+        if entry.get("skipped_summaries"):
+            block.append("- Skipped-test summaries:")
+            for s in entry["skipped_summaries"]:
+                block.append(f"  - {s.get('path')}: {s.get('count')} skipped")
+                for n in (s.get("names") or [])[:10]:
+                    block.append(f"    - {n}")
+        stdout_tail = entry.get("stdout_tail")
+        stderr_tail = entry.get("stderr_tail")
+        if stdout_tail:
+            block.append("\n#### stdout tail (last 8 KiB)\n")
+            block.append("```")
+            block.append(stdout_tail.rstrip())
+            block.append("```")
+        if stderr_tail:
+            block.append("\n#### stderr tail (last 8 KiB)\n")
+            block.append("```")
+            block.append(stderr_tail.rstrip())
+            block.append("```")
+        failed_blocks.append("\n".join(block))
+
+    failed_section = "\n\n".join(failed_blocks) if failed_blocks else (
+        "(rv_file did not record per-command output; re-run the commands "
+        "yourself to capture failures)"
+    )
+
+    nix_note = ""
+    if (Path.cwd() / "flake.nix").exists():
+        nix_note = (
+            "\n**Environment**: This project uses Nix (`flake.nix`). Your PATH "
+            "already includes all tools from the nix devshell — run commands "
+            "directly. Do NOT prefix commands with `nix develop --command`.\n"
+        )
+
+    _required = _required_reads_block(
+        "rv-fix",
+        [
+            str(_REF_DIR / "testing.md"),
+            str(_REF_DIR / "fix-agent-playbook.md"),
+        ],
+    )
+    _ref_index = _reference_index_pointer()
+
+    # Build the list of exact re-run commands the agent must satisfy. The
+    # agent's mandatory exit checklist references these by number so it
+    # can't "fix one thing and declare done" without confirming every
+    # command exits 0.
+    failed_commands = [
+        entry for entry in rv_data.get("commands", [])
+        if not entry.get("passed", True)
+    ]
+    rerun_lines = []
+    for i, entry in enumerate(failed_commands, start=1):
+        cmd = entry.get("command", "?")
+        rerun_lines.append(f"   {i}. `{cmd}` — must exit 0")
+    rerun_checklist = "\n".join(rerun_lines) if rerun_lines else (
+        "   (no per-command output was captured; re-run the phase's full "
+        "gate set yourself and confirm each command exits 0)"
+    )
+
+    return f"""You are a runner-verify fix agent for phase **{phase.name}** ({phase_slug}).
+
+The LLM validation cycle for this phase already passed (`REVIEW-CLEAN`), but
+the runner's independent re-execution of the test/lint/build commands FAILED.
+That means the validation cycle accepted code that doesn't actually pass the
+project's gate commands when run deterministically from the runner. Your job
+is to fix the gate-command failures.
+{nix_note}
+
+## Failed commands (READ FIRST)
+
+These are the exact failures the runner captured. Read every `stdout tail` /
+`stderr tail` block before doing anything else — the answer is almost always
+in there.
+
+{failed_section}
+
+## Exit checklist (NON-NEGOTIABLE)
+
+Before you finish, you MUST run each of these commands FROM THE REPO ROOT
+and confirm exit 0. Do not declare done without doing this — the runner
+will re-run them anyway, and if any of them fail you will be invoked again
+(attempt #{attempt} of MAX_VR_FIX_ATTEMPTS=5; further attempts after the cap
+will stall the entire phase):
+
+{rerun_checklist}
+
+If you cannot make a command pass after reading its tail and inspecting the
+code, STOP and write a single-paragraph diagnosis to `{learnings_file}`
+explaining what you found. Do NOT commit a guess. Do NOT delete tests to
+make them pass.
+
+{_required}
+
+## Context
+
+- **Phase**: {phase.name} ({phase_slug})
+- **Tasks in this phase**: {task_ids}
+- **Task file**: `{task_file}`
+- **Learnings file**: `{learnings_file}`
+- **Validation directory**: `{validate_dir}/`
+- **Runner-verify report**: `{rv_file}`
+- **Fix attempt**: #{attempt}
+
+{_ref_index}
+
+## Instructions
+
+1. Read each failed-command block above. The stdout/stderr tails contain
+   the actual failure output captured by the runner — do not guess; read.
+2. For each failure, read the relevant source files and identify the root
+   cause. Common categories:
+   - A test asserts behavior the implementation doesn't yet provide
+   - A test is environment-dependent and broke under the runner's env
+     (e.g. no TTY, different CWD, missing env var). If the failure looks
+     environmental — e.g. an interactive prompt in stdout_tail, a hang
+     until timeout, a tool-not-found error — fix the project's *script*
+     or *env*, not the test. Write the diagnosis to `{learnings_file}`.
+   - A lint or typecheck rule was violated by the phase's edits
+   - The build produces a broken artifact (missing file, bad import)
+3. Fix each failure with minimal, targeted changes. Do not refactor unrelated
+   code. Do not weaken or skip tests to make them pass — see testing.md
+   § Zero-skips rule. If a test is genuinely wrong, fix the test to assert
+   what the code *should* do, then make the code match.
+4. **Run the full Exit checklist above before declaring done.** Paste each
+   command's exit code into your final response so it is auditable.
+5. Update `{learnings_file}` if you discovered anything non-obvious (max 3
+   concise bullets).
+6. Commit your fixes with a descriptive commit message referencing the
+   phase slug.
+
+**Do NOT modify the task list** — the runner manages task status.
+**Do NOT write validation files** — the runner re-runs verify automatically.
+**Do NOT delete `{rv_file}`** — the runner manages it.
 """
 
 
@@ -4349,11 +4577,19 @@ def _discover_test_commands() -> list[tuple[str, str]]:
     # A monorepo without a root package.json (e.g. an api/ + site/ split)
     # still has tests that must run; we scan well-known subdir names.
     def _detect_pkg_runner(dir_: Path) -> str:
-        """Return 'pnpm', 'yarn', or 'npm' based on lockfiles in dir_."""
-        if (dir_ / "pnpm-lock.yaml").exists():
-            return "pnpm"
-        if (dir_ / "yarn.lock").exists():
-            return "yarn"
+        """Return 'pnpm', 'yarn', or 'npm' based on lockfiles in dir_ or
+        any ancestor up to the cwd. pnpm/yarn workspaces only have a
+        lockfile at the workspace root; sub-packages inherit it."""
+        cwd = Path.cwd().resolve()
+        cur = dir_.resolve()
+        while True:
+            if (cur / "pnpm-lock.yaml").exists():
+                return "pnpm"
+            if (cur / "yarn.lock").exists():
+                return "yarn"
+            if cur == cwd or cur.parent == cur:
+                break
+            cur = cur.parent
         return "npm"
 
     def _pkg_commands(pkg_path: Path, label_prefix: str) -> list[tuple[str, str]]:
@@ -4376,11 +4612,38 @@ def _discover_test_commands() -> list[tuple[str, str]]:
                 run = f"yarn --cwd {dir_} run"
             else:
                 run = f"npm --prefix {dir_} run"
-        for name in ["test", "lint", "build", "check", "typecheck"]:
+        # Canonical gate scripts: build/lint/typecheck plus EVERY test tier.
+        # The three-tier testing contract (unit → integration → E2E, per
+        # reference/testing.md) is only enforced if all three tiers run in
+        # the gate. Hardcoding `test` alone made E2E invisible in past runs.
+        canonical = ["test", "lint", "build", "check", "typecheck"]
+        for name in canonical:
             if name in scripts:
                 cmds.append(
                     (f"{run} {name}", f"{label_prefix}{runner} run {name}")
                 )
+        # Pick up every additional `test:*` tier the project declares
+        # (test:unit, test:integration, test:e2e, test:contract, ...).
+        # Skipping one because "it's slow" or "the binary isn't on PATH"
+        # is exactly how broken artifacts ship; the verify gate must
+        # exercise everything the package.json advertises.
+        #
+        # Skip mutating "update/fix/refresh/snapshot" variants — those are
+        # author-driven commands that rewrite golden files, not gates.
+        mutating_suffixes = ("update", "fix", "refresh", "snapshot", "snap")
+        for name in sorted(scripts.keys()):
+            if not isinstance(name, str):
+                continue
+            if name in canonical:
+                continue
+            if not (name.startswith("test:") or name == "e2e"):
+                continue
+            tail = name.rsplit(":", 1)[-1].lower()
+            if tail in mutating_suffixes:
+                continue
+            cmds.append(
+                (f"{run} {name}", f"{label_prefix}{runner} run {name}")
+            )
         return cmds
 
     root_pkg = Path("package.json")
@@ -4389,10 +4652,31 @@ def _discover_test_commands() -> list[tuple[str, str]]:
 
     # Common monorepo subdirs — scan any that has a package.json + a test script.
     # Order matters only for log readability.
+    seen_pkgs: set[Path] = set()
     for sub in ("api", "backend", "server", "site", "web", "frontend", "client"):
         sub_pkg = Path(sub) / "package.json"
         if sub_pkg.exists():
             commands.extend(_pkg_commands(sub_pkg, f"{sub}: "))
+            seen_pkgs.add(sub_pkg.resolve())
+
+    # Workspace layouts: `apps/*/package.json` and `packages/*/package.json`.
+    # pnpm/yarn/npm workspaces are the dominant convention for monorepos that
+    # split a frontend + server + library; the gate must run every member's
+    # tests, otherwise broken artifacts (failing E2E in apps/<x>/) ship
+    # unnoticed under a green root `pnpm run test`.
+    for ws_root in ("apps", "packages"):
+        ws_path = Path(ws_root)
+        if not ws_path.is_dir():
+            continue
+        for member in sorted(ws_path.iterdir()):
+            sub_pkg = member / "package.json"
+            if not sub_pkg.exists():
+                continue
+            resolved = sub_pkg.resolve()
+            if resolved in seen_pkgs:
+                continue
+            seen_pkgs.add(resolved)
+            commands.extend(_pkg_commands(sub_pkg, f"{ws_root}/{member.name}: "))
 
     # Check for Cargo.toml (Rust)
     if Path("Cargo.toml").exists():
@@ -4984,10 +5268,15 @@ agent tokens.
 
 1. If the project has a Flutter app (a directory at the repo root with
    `pubspec.yaml`), write to `<app-dir>/integration_test/<TASK_ID>_test.dart`.
-   Most projects have ONE Flutter app — use it. If there are multiple
-   (e.g. `customer/` + `admin/`) pick the one whose UI your task
-   actually exercises; the runner's `ANDROID_BUILD_ROOT` env var (if
-   set) names the default app.
+   - **Single-app repo** (one `pubspec.yaml`): use that app's directory.
+   - **Multi-app repo** (e.g. `admin/` + `customer/`): use the
+     directory named in your task's `[android-app: <dir>]` annotation.
+     That same value drives the runner's build/install target, so the
+     spec MUST land under it. If the annotation is missing in a
+     multi-app repo, write a finding to `findings.json`
+     (`{{"id":"PLANNER-MISSING-ANDROID-APP","status":"new","summary":"..."}}`)
+     instead of guessing — picking the wrong directory will cause the
+     regression-spec gate to fail or silently exercise the wrong app.
 2. If the project is a pure Kotlin/Java Android app (no Flutter,
    `app/build.gradle` at repo root), write to
    `app/src/androidTest/java/<TASK_ID>Test.kt`.
@@ -5071,14 +5360,37 @@ All namespaced as `mcp__mcp-android__<name>`.
     # exist side by side. Non-Flutter Android projects (pure Gradle) are
     # covered by the `app/src/androidTest/` fallback.
 
-    def _flutter_project_candidates(self, project_dir: Path) -> list[Path]:
-        """Find all Flutter project roots under project_dir.
+    def _flutter_project_candidates(
+        self, project_dir: Path,
+        app_override: Optional[str] = None,
+        ignore_env: bool = False,
+    ) -> list[Path]:
+        """Find Flutter project roots under project_dir.
+
+        Picks ``app_override`` (e.g. from a task's ``[android-app: admin]``
+        annotation, or ``ANDROID_BUILD_ROOT`` env) when it points at a real
+        Flutter app. Otherwise scans for every directory containing
+        ``pubspec.yaml``. Multi-app monorepos: callers that need exactly
+        one app must pass ``app_override``; callers that can scan (e.g.
+        regression-spec discovery) get the full list.
+
+        Pass ``ignore_env=True`` to skip the ANDROID_BUILD_ROOT fallback
+        and force the full scan — used by the regression-spec gate's
+        permissive second pass so it doesn't keep returning the same
+        single override-pinned app.
 
         A Flutter project has a `pubspec.yaml` at its root. We skip
         hidden directories, node_modules, build outputs, and common nix
         scratch dirs to keep detection fast.
         """
-        override = os.environ.get("ANDROID_BUILD_ROOT")
+        # Override precedence: explicit arg (from per-task
+        # `[android-app: <dir>]`) > ANDROID_BUILD_ROOT env. The driver
+        # has no PlatformManager handle, so TLS-based per-task overrides
+        # are read by the *caller* (regression_spec_candidates uses
+        # task.android_app directly) and passed in here as app_override.
+        override = app_override
+        if not override and not ignore_env:
+            override = os.environ.get("ANDROID_BUILD_ROOT")
         if override:
             cand = project_dir / override
             if (cand / "pubspec.yaml").is_file():
@@ -5103,9 +5415,31 @@ All namespaced as `mcp__mcp-android__<name>`.
         return found
 
     def regression_spec_candidates(self, task: "Task", project_dir: Path) -> list[Path]:
+        # Per-task `[android-app: <dir>]` annotation wins; falls back to
+        # `ANDROID_BUILD_ROOT` env, then to scanning every Flutter app in
+        # the repo. Scanning is the right default for regression-spec
+        # discovery in multi-app monorepos: a project-wide env-var default
+        # silently breaks every task targeting the *other* app.
+        app_override = getattr(task, "android_app", None)
         out: list[Path] = []
-        for app_dir in self._flutter_project_candidates(project_dir):
+        targeted = self._flutter_project_candidates(project_dir, app_override)
+        for app_dir in targeted:
             out.append(app_dir / "integration_test" / f"{task.id}_test.dart")
+        # When the override pinned a single app, also accept a spec
+        # committed under any *other* Flutter app in the repo. Two reasons:
+        # (1) cross-app E2E tasks (e.g. customer + admin in one flow) may
+        # legitimately put the spec under either app; (2) defends against
+        # stale `ANDROID_BUILD_ROOT` defaults silently failing the gate
+        # when the executor wrote to the correct app but the env points
+        # at the wrong one. Build/install still uses the override — only
+        # the regression-spec gate is permissive.
+        if app_override or os.environ.get("ANDROID_BUILD_ROOT"):
+            already = {p.resolve() for p in targeted}
+            for app_dir in self._flutter_project_candidates(
+                    project_dir, ignore_env=True):
+                if app_dir.resolve() in already:
+                    continue
+                out.append(app_dir / "integration_test" / f"{task.id}_test.dart")
         # Gradle fallback for pure Android projects (no Flutter).
         # The explore agent is instructed to use this path when no Flutter
         # app is present.
@@ -6148,10 +6482,22 @@ class PlatformRuntime:
                 names = ", ".join(c.name for c in candidates)
                 msg = (
                     f"Multi-app repo: found {len(candidates)} Android build roots "
-                    f"({names}); set ANDROID_BUILD_ROOT env var to disambiguate"
+                    f"({names}); annotate the task with `[android-app: <dir>]` "
+                    f"or set ANDROID_BUILD_ROOT env to disambiguate"
                 )
                 log(msg)
-                override = os.environ.get("ANDROID_BUILD_ROOT")
+                # Per-task `[android-app: <dir>]` wins over env. The
+                # E2E loop sets it on PlatformManager via
+                # `_scoped_app_override` before calling into the runtime;
+                # we read it back through the manager back-reference set
+                # in ensure_runtime. Falls back to env when no manager is
+                # attached (standalone use, tests).
+                override = None
+                mgr = getattr(self, "_manager", None)
+                if mgr is not None:
+                    override = mgr._current_app_override()
+                else:
+                    override = os.environ.get("ANDROID_BUILD_ROOT")
                 if override:
                     picked = project_dir / override
                     if (picked / "pubspec.yaml").exists() and (picked / "android").exists():
@@ -6435,6 +6781,38 @@ class PlatformManager:
         # manager standalone working unchanged.
         self._event = event_fn or (lambda _t, **_k: None)
         self._e2e_services_started = False
+        # Per-thread (per-task) Android app override. Multi-app monorepos
+        # use this to scope build-detect, package-detect, and regression
+        # discovery to the app the current task targets — set from the
+        # task's `[android-app: <dir>]` annotation right before each
+        # platform call. `threading.local` keeps concurrent E2E tasks from
+        # stepping on each other's overrides; falls back to the
+        # `ANDROID_BUILD_ROOT` env when the override isn't set.
+        self._tls = threading.local()
+
+    def _current_app_override(self) -> Optional[str]:
+        """Return the per-task Android-app override, falling back to env.
+
+        Read by build-detect, package-detect, and Flutter project discovery
+        so a single task that pins ``[android-app: admin]`` doesn't have
+        to plumb the value through every internal call.
+        """
+        ov = getattr(self._tls, "android_app", None)
+        if ov:
+            return ov
+        return os.environ.get("ANDROID_BUILD_ROOT")
+
+    @contextlib.contextmanager
+    def _scoped_app_override(self, app: Optional[str]):
+        """Set the per-thread Android-app override for the duration of a
+        platform call. None means "no override; fall back to env".
+        """
+        prev = getattr(self._tls, "android_app", None)
+        self._tls.android_app = app
+        try:
+            yield
+        finally:
+            self._tls.android_app = prev
 
     def _lint_android_setup_sh(self, project_dir: Path) -> None:
         """Warn if Android target's setup.sh forgets `adb reverse`.
@@ -6666,7 +7044,26 @@ class PlatformManager:
         name = capability.replace("mcp-", "")  # "mcp-android" -> "android"
 
         if name in self._runtimes and self._runtimes[name]._booted:
-            return self._runtimes[name]
+            # For Android, verify the emulator is still responsive before
+            # declaring the runtime already-booted. The emulator can go
+            # offline between spawns (OOM-killed, crashed, power-off)
+            # leaving _booted=True while adb sees no device. Without this
+            # check mcp-android starts against a dead emulator and the
+            # executor session sees zero MCP tools
+            # (INFRA-mcp-android-not-connected).
+            if name == "android":
+                if not self._runtimes[name]._check_android_ready(self._log):
+                    self._log("Android emulator went offline since last boot — re-booting")
+                    try:
+                        self._runtimes[name].teardown(self._log)
+                    except Exception:
+                        pass
+                    del self._runtimes[name]
+                    # Fall through to fresh boot below
+                else:
+                    return self._runtimes[name]
+            else:
+                return self._runtimes[name]
 
         # Static lint before we boot anything: when the target is Android,
         # setup.sh must wire `adb reverse` for every host-side port the app
@@ -6687,6 +7084,13 @@ class PlatformManager:
             return None
 
         runtime = PlatformRuntime(name=name, capability=capability)
+        # Back-reference so PlatformRuntime helpers (build-detect,
+        # package-detect) can read the per-task `[android-app: <dir>]`
+        # override the manager holds in thread-local state. Without this,
+        # the runtime would only see the project-wide ANDROID_BUILD_ROOT
+        # env, which is wrong in multi-app monorepos where different
+        # tasks target different apps.
+        runtime._manager = self
         self._log(f"Initializing {name} platform runtime...")
 
         if not runtime.boot(project_dir, self._log, self._event):
@@ -6851,8 +7255,9 @@ class PlatformManager:
 
         Handles three layouts:
           1. Single-app at project_dir (android/app/... or app/...)
-          2. Multi-app monorepo with ANDROID_BUILD_ROOT env var pointing at
-             the target subdirectory (e.g. "admin", "customer")
+          2. Multi-app monorepo with the current task's `[android-app:
+             <dir>]` annotation pointing at the target subdirectory
+             (preferred), falling back to ANDROID_BUILD_ROOT env.
           3. Multi-app monorepo with no override — walks candidate build
              roots discovered by _find_android_build_roots and returns the
              first match. Kept consistent with _build_install_android so
@@ -6898,8 +7303,10 @@ class PlatformManager:
         if pkg:
             return pkg
 
-        # 2. Explicit override for multi-app repos
-        override = os.environ.get("ANDROID_BUILD_ROOT")
+        # 2. Explicit override for multi-app repos. Per-task
+        # `[android-app: <dir>]` (set by the E2E loop on the manager's
+        # thread-local) wins over the project-wide ANDROID_BUILD_ROOT env.
+        override = self._current_app_override()
         if override:
             pkg = _detect_in(project_dir / override)
             if pkg:
@@ -7665,9 +8072,13 @@ def _run_scripted_verify_phase(
     # Index findings by id for in-place updates
     by_id = {f.get("id"): f for f in findings.get("findings", []) if f.get("id")}
 
-    # Locate project root by walking up from e2e_dir
-    # e2e_dir is .../specs/<feature>/validate/e2e → project root is 3 up
-    project_root = e2e_dir.parent.parent.parent
+    # Locate project root by walking up from e2e_dir.
+    # e2e_dir is .../<project>/specs/<feature>/validate/e2e → project root
+    # is 4 levels up (e2e → validate → <feature> → specs → <project>).
+    # Resolve first: callers may pass a relative spec_dir (e.g. "specs/admin"),
+    # which would leave project_root as the empty Path and break both the cwd
+    # and the script path passed to bash (exit 127, "No such file or directory").
+    project_root = e2e_dir.resolve().parent.parent.parent.parent
     env_file = project_root / "test" / "e2e" / ".state" / "env"
 
     # Build env for the script: inherit parent + source env_file if present
@@ -7692,7 +8103,7 @@ def _run_scripted_verify_phase(
         bug_id = bug.get("id")
         if not bug_id:
             continue
-        bug_dir = e2e_dir / "bugs" / bug_id
+        bug_dir = (e2e_dir / "bugs" / bug_id).resolve()
         script = bug_dir / "verify.sh"
         if not script.exists():
             results[bug_id] = "missing"
@@ -8950,12 +9361,17 @@ The full history of CI attempts is in `{debug_dir}/`. Reference it for the learn
 # ── Main orchestrator ─────────────────────────────────────────────────
 
 class Runner:
-    def __init__(self, spec_dirs: list[str], max_runs: int, headless: bool, max_parallel: int, layout: str = "vertical"):
+    def __init__(self, spec_dirs: list[str], max_runs: int, headless: bool, max_parallel: int, layout: str = "vertical", continue_on_stall: bool = False):
         self.spec_dirs = spec_dirs
         self.max_runs = max_runs
         self.headless = headless
         self.max_parallel = max_parallel
         self.layout = layout
+        # When False (default), a noop-exit stall on a feature with pending
+        # work is a hard error: the runner writes STALLED.md and sys.exit(2)s
+        # rather than silently advancing to the next spec_dir. See
+        # _run_feature noop-exit branch and the outer feature loop.
+        self.continue_on_stall = continue_on_stall
         self.script_dir = Path(__file__).parent
         self.skills_dir = self.script_dir.parent
         self.blocked_file = Path("BLOCKED.md")
@@ -8968,6 +9384,14 @@ class Runner:
         self._shutdown = threading.Event()
         self._draining = threading.Event()  # First Ctrl-C: finish running agents, don't spawn new ones
         self.agents: list[AgentSlot] = []
+        # Bounded buffer of agents that just transitioned to done/failed/etc.
+        # _poll_agents removes finished slots from self.agents in the same
+        # call that sets status="done", so consumers in the main loop (the
+        # rv_fix_complete emitter, VR-fix completion detector, etc.) miss
+        # them. Drain from this buffer instead. Capped to avoid unbounded
+        # growth on long runs.
+        self._recently_finished: list[AgentSlot] = []
+        self._recently_finished_cap = 200
         self.agent_counter = self._find_max_agent_id()
         self._lock = threading.Lock()
 
@@ -9015,6 +9439,229 @@ class Runner:
                 f.write(json.dumps(record) + "\n")
         except OSError:
             pass  # Don't crash the runner over a log write failure
+
+    def _recent_runner_verify_failures(
+        self, spec_dir: str, phase_slug: str, n: int = 3,
+    ) -> list[list[str]]:
+        """Return the last `n` runner_verify FAIL signatures for a phase.
+
+        Each entry is the sorted list of failed command labels from one
+        runner_verify event. Used by _no_progress_for_phase to detect when
+        repeated fix attempts aren't reducing the failure set.
+        """
+        log_path = Path(spec_dir) / "run-log.jsonl"
+        if not log_path.is_file():
+            return []
+        signatures: list[list[str]] = []
+        try:
+            with open(log_path) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if rec.get("event") != "runner_verify":
+                        continue
+                    if rec.get("phase") != phase_slug:
+                        continue
+                    if rec.get("passed", False):
+                        # A PASS resets the staleness window — clear history.
+                        signatures = []
+                        continue
+                    failed = sorted(rec.get("failed", []) or [])
+                    signatures.append(failed)
+        except OSError:
+            return []
+        return signatures[-n:]
+
+    def _no_progress_for_phase(
+        self, spec_dir: str, phase_slug: str, lookback: int = 3,
+    ) -> bool:
+        """True when the last `lookback` verify cycles all failed identically.
+
+        Identical = same set of failed commands across consecutive verify
+        events with no intervening PASS. Indicates fix agents declared
+        success without actually reducing the failure set — the burn
+        loop pattern. Caller should stall instead of spawning another
+        fix agent.
+        """
+        sigs = self._recent_runner_verify_failures(spec_dir, phase_slug, n=lookback)
+        if len(sigs) < lookback:
+            return False
+        first = sigs[0]
+        if not first:  # empty failure list means PASS — shouldn't happen here
+            return False
+        return all(s == first for s in sigs[1:])
+
+    def _activity(self, msg: str) -> None:
+        """Update the TUI's 'what is the scheduler doing right now' line.
+
+        No-op when running headless (no TUI attached). The TUI shows this
+        message under the dependency graph whenever no agents are running
+        so the user can distinguish active work from a stall.
+        """
+        if self.tui is not None:
+            self.tui.set_activity(msg)
+
+    def _rv_fix_attempt_count(self, spec_dir: str, phase_slug: str) -> int:
+        """Number of RV-fix agents that have completed for this phase.
+
+        Counted from the run-log so the value survives runner restarts.
+        Used both to gate spawning (cap at MAX_VR_FIX_ATTEMPTS) and to
+        stamp rv_file so the reset logic can detect staleness.
+
+        Counts either `rv_fix_complete` (the explicit signal emitted by
+        the main loop) OR `task_complete` events whose `task_id` starts
+        with `RV-fix-<phase_slug>-`. The dual path is a safety net: if
+        the explicit emission stops firing (as happened historically when
+        finished agents were removed from self.agents before the emitter
+        could see them), task_complete records are still written by
+        _poll_agents for every finished agent, so the cap remains
+        functional and the fix_attempt stamp keeps advancing.
+        """
+        log_path = Path(spec_dir) / "run-log.jsonl"
+        if not log_path.is_file():
+            return 0
+        count = 0
+        seen_agent_ids: set[int] = set()
+        task_id_prefix = f"RV-fix-{phase_slug}-"
+        try:
+            with open(log_path) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    event = rec.get("event")
+                    if event == "rv_fix_complete":
+                        if rec.get("phase") != phase_slug:
+                            continue
+                        agent_id = rec.get("agent_id")
+                        if agent_id is not None:
+                            if agent_id in seen_agent_ids:
+                                continue
+                            seen_agent_ids.add(agent_id)
+                        count += 1
+                    elif event == "task_complete":
+                        task_id = rec.get("task_id", "")
+                        if not task_id.startswith(task_id_prefix):
+                            continue
+                        agent_id = rec.get("agent_id")
+                        if agent_id is not None and agent_id in seen_agent_ids:
+                            continue
+                        if agent_id is not None:
+                            seen_agent_ids.add(agent_id)
+                        count += 1
+        except OSError:
+            return 0
+        return count
+
+    def _spec_abandoned_reason(self, spec_dir: str) -> Optional[str]:
+        """If spec_dir did NOT reach all_complete, return a short reason.
+
+        Returns None when the feature is fully done (tasks + validation +
+        review-clean + runner-verified across every phase). Otherwise
+        returns one of:
+          - "stalled_runner_verify" — at least one phase has tasks_complete
+             + review_clean but runner_verified is False (the bug we hit)
+          - "stalled_validation"    — at least one phase has tasks_complete
+             but not validated/review_clean (no VR cleanup happened)
+          - "pending_tasks"         — at least one phase still has PENDING/REWORK
+             tasks (the feature was abandoned before reaching its tasks)
+        """
+        task_file = Path(spec_dir) / "tasks.md"
+        if not task_file.exists():
+            return None  # No tasks.md — nothing to be abandoned
+        try:
+            phases, phase_deps = parse_task_file(task_file)
+        except Exception:
+            return None
+        if not phases:
+            return None
+        phase_states = scan_phase_validation_states(spec_dir)
+        validated_phases = {s for s, st in phase_states.items() if st.complete}
+        scheduler = Scheduler(phases, phase_deps, validated_phases, phase_states)
+        if scheduler.all_complete():
+            return None
+
+        # Diagnose the *most actionable* failure mode by precedence.
+        for phase in phases:
+            if not scheduler.phase_tasks_complete(phase.slug):
+                continue
+            state = phase_states.get(phase.slug, PhaseValidationState())
+            if state.complete:
+                continue
+            if state.validated and state.review_clean and not state.runner_verified:
+                return "stalled_runner_verify"
+            return "stalled_validation"
+        # No phase had tasks complete + missing validation — must be pending tasks
+        return "pending_tasks"
+
+    def _write_stalled_marker(self, spec_dir: str, reason: str):
+        """Write STALLED.md next to BLOCKED.md so the human sees the failure.
+
+        Mirrors the BLOCKED.md / AMENDMENT-*.md convention: a top-level file
+        that the runner refuses to advance past until a human acks it.
+        """
+        feature_name = Path(spec_dir).name
+        phases = []
+        try:
+            phases, _ = parse_task_file(Path(spec_dir) / "tasks.md")
+        except Exception:
+            pass
+        phase_states = scan_phase_validation_states(spec_dir)
+        lines = [
+            f"# STALLED: {feature_name}",
+            "",
+            f"Reason: `{reason}`",
+            "",
+            "The runner stopped processing this feature because it could not make",
+            "forward progress. It refused to advance to the next feature because",
+            "`--continue-on-stall` was not set.",
+            "",
+            "## Phase state",
+            "",
+        ]
+        for phase in phases:
+            state = phase_states.get(phase.slug, PhaseValidationState())
+            rv_file = Path(spec_dir) / "validate" / phase.slug / "runner-verified.json"
+            rv_summary = "no rv_file"
+            if rv_file.exists():
+                try:
+                    rv_data = json.loads(rv_file.read_text())
+                    failed = [r["label"] for r in rv_data.get("commands", []) if not r.get("passed", True)]
+                    rv_summary = (
+                        f"passed={rv_data.get('passed')} "
+                        f"failed_commands={failed}"
+                    )
+                except (json.JSONDecodeError, OSError) as exc:
+                    rv_summary = f"unreadable ({exc})"
+            tasks_done = all(
+                t.status in (TaskStatus.COMPLETE, TaskStatus.SKIPPED)
+                for t in phase.tasks
+            )
+            lines.append(
+                f"- **{phase.slug}**: tasks_done={tasks_done} "
+                f"validated={state.validated} "
+                f"review_clean={state.review_clean} "
+                f"runner_verified={state.runner_verified} | rv: {rv_summary}"
+            )
+        lines += [
+            "",
+            "## To resolve",
+            "",
+            "1. Inspect the failing rv_file(s) above; fix the underlying issue.",
+            "2. Delete `STALLED.md`.",
+            "3. Re-run the runner. It will retry runner-verify automatically.",
+            "",
+            "To opt out of strict-mode entirely (not recommended), re-run with",
+            "`--continue-on-stall`.",
+            "",
+        ]
+        try:
+            Path("STALLED.md").write_text("\n".join(lines))
+        except OSError as exc:
+            self.log(f"Failed to write STALLED.md: {exc}")
 
     def _cleanup_stale_run(self):
         """Kill any orphaned agents from a previous runner that crashed.
@@ -9092,10 +9739,46 @@ class Runner:
                 sys.exit(2)
 
         try:
-            for spec_dir in self.spec_dirs:
+            for idx, spec_dir in enumerate(self.spec_dirs):
                 if self._shutdown.is_set() or self._draining.is_set():
                     break
                 self._run_feature(spec_dir)
+                # Layer 3: refuse to advance to the next feature if the one
+                # we just ran did not reach all_complete. _run_feature can
+                # return early on noop-exit / drain / shutdown — without
+                # this guard, those paths silently start the next feature
+                # with the current one half-finished. See the runner-verify
+                # failure bug where 001's failed verify let 002 begin.
+                if idx + 1 < len(self.spec_dirs):
+                    next_spec = self.spec_dirs[idx + 1]
+                    abandoned = self._spec_abandoned_reason(spec_dir)
+                    if abandoned:
+                        if self.continue_on_stall:
+                            self.log(
+                                f"⚠ Advancing to {next_spec} despite "
+                                f"{Path(spec_dir).name} abandoned ({abandoned}) "
+                                f"— --continue-on-stall set"
+                            )
+                            self._write_event(
+                                "feature_abandoned", spec_dir,
+                                feature=Path(spec_dir).name,
+                                reason=abandoned,
+                                continued=True,
+                            )
+                        else:
+                            self._write_event(
+                                "feature_abandoned", spec_dir,
+                                feature=Path(spec_dir).name,
+                                reason=abandoned,
+                                continued=False,
+                            )
+                            self._write_stalled_marker(spec_dir, abandoned)
+                            self.log(
+                                f"Refusing to advance to {next_spec}: "
+                                f"{Path(spec_dir).name} not complete "
+                                f"({abandoned}). Wrote STALLED.md."
+                            )
+                            sys.exit(2)
         finally:
             # Guarantee all agents are killed on ANY exit path:
             # normal completion, unhandled exception, KeyboardInterrupt.
@@ -9259,6 +9942,9 @@ class Runner:
         vr_phases: set[str] = set()
         # Track which phases need a fix agent after VR failure
         vr_fix_phases: set[str] = set()
+        # Track which phases need a fix agent after runner-verify failure
+        # (post-REVIEW-CLEAN, deterministic test re-run found regressions).
+        rv_fix_phases: set[str] = set()
 
         # Setup TUI for this feature
         if not self.headless:
@@ -9294,13 +9980,31 @@ class Runner:
                 continue
             if rv_data.get("passed", False):
                 continue  # Clean pass — preserve it
-            # Failed — drop it so verification re-runs this session
+            # Failed — drop it so verification re-runs this session. Also
+            # clear review-*.md so the phase goes back through the full VR
+            # cycle rather than getting stuck in "review_clean but
+            # runner_verify failed and no fix path is reachable" (the
+            # original bug). The next iteration will spawn either a VR
+            # agent (no review files left) or an RV-fix agent (if VR is
+            # re-applied and clean).
             try:
                 rv_file.unlink()
                 self.log(
                     f"Startup: cleared stale failed runner-verified.json for "
                     f"{phase.name} — will re-verify this session"
                 )
+            except OSError:
+                pass
+            phase_vdir = Path(spec_dir) / "validate" / phase.slug
+            try:
+                for rf in phase_vdir.glob("review-*.md"):
+                    try:
+                        rf.unlink()
+                        self.log(
+                            f"  Also cleared {rf.name} so VR re-runs after fix"
+                        )
+                    except OSError:
+                        pass
             except OSError:
                 pass
 
@@ -9326,10 +10030,12 @@ class Runner:
         flake_hash_at_start = _flake_hash()
 
         while not self._shutdown.is_set() and total_runs < self.max_runs:
+            self._activity("scanning for work")
             # If an agent modified flake.nix, drain running agents and
             # re-exec inside the new nix develop shell so updated tools
             # are on PATH for subsequent agents.
             if flake_path.exists() and _flake_hash() != flake_hash_at_start:
+                self._activity("flake.nix changed — draining for nix develop re-exec")
                 self.log("flake.nix changed — draining agents before re-exec into new nix develop shell")
                 self._draining.set()
                 self._drain_agents()
@@ -9340,18 +10046,26 @@ class Runner:
                 nix_cmd = ["nix", "develop", "--command"]
                 if os.environ.get("NIXPKGS_ALLOW_UNFREE") == "1":
                     nix_cmd = ["nix", "develop", "--impure", "--command"]
-                probe = subprocess.run(
-                    nix_cmd + ["true"],
-                    capture_output=True, timeout=120,
-                )
-                if probe.returncode != 0 and b"unfree" in probe.stderr:
-                    self.log("Flake contains unfree packages — retrying with --impure")
-                    os.environ["NIXPKGS_ALLOW_UNFREE"] = "1"
-                    nix_cmd = ["nix", "develop", "--impure", "--command"]
+                try:
                     probe = subprocess.run(
                         nix_cmd + ["true"],
-                        capture_output=True, timeout=120,
+                        capture_output=True, timeout=300,
                     )
+                    if probe.returncode != 0 and b"unfree" in probe.stderr:
+                        self.log("Flake contains unfree packages — retrying with --impure")
+                        os.environ["NIXPKGS_ALLOW_UNFREE"] = "1"
+                        nix_cmd = ["nix", "develop", "--impure", "--command"]
+                        probe = subprocess.run(
+                            nix_cmd + ["true"],
+                            capture_output=True, timeout=300,
+                        )
+                except subprocess.TimeoutExpired:
+                    self.log(
+                        "nix develop probe exceeded 300s — continuing with current shell. "
+                        "Likely cause: dirty working tree (large untracked files copied into the Nix store)."
+                    )
+                    flake_hash_at_start = _flake_hash()
+                    continue
                 if probe.returncode == 0:
                     self.log("Re-execing into new nix develop shell...")
                     os.execvp("nix", nix_cmd + [sys.executable, *sys.argv])
@@ -9392,11 +10106,20 @@ class Runner:
             # Re-scan phase validation states (validation/review/re-validation lifecycle)
             phase_states = scan_phase_validation_states(spec_dir)
 
-            # Reset failed runner verifications when a fix agent has since
-            # completed.  A failed runner-verified.json is a dead end: the
-            # review is still marked clean, so phase_needs_validate_review()
-            # returns False and no VR agent spawns.  Deleting the runner
-            # verified file + review files sends the phase back through VR.
+            # Layer 2: clean-slate reset after a VR-fix agent completed.
+            #
+            # When a VR-fix agent runs (because validation FAILED), we
+            # want the NEXT iteration to spawn a fresh VR cycle. To make
+            # that happen, delete the runner-verified.json and review-*.md
+            # so the phase is back to "validated but not reviewed".
+            #
+            # When an RV-fix agent runs (because runner-verify FAILED
+            # after REVIEW-CLEAN), we want the NEXT iteration to re-run
+            # the runner-verify only — NOT a full VR cycle. The RV-fix
+            # path is the one the original bug exposed; that retry is
+            # handled by the runner-verification block below comparing
+            # fix_attempt stamps, so we explicitly DO NOT clear
+            # review-*.md here.
             for phase in phases:
                 slug = phase.slug
                 state = phase_states.get(slug, PhaseValidationState())
@@ -9412,38 +10135,28 @@ class Runner:
                 if rv_data.get("passed", False):
                     continue  # Passed — nothing to reset
 
-                # Runner verification failed. Check if any agent completed
-                # for this phase AFTER the rv file was written (fix agent).
-                rv_mtime = rv_file.stat().st_mtime
-                fix_ran_since = False
-                if hasattr(self, '_agent_done_tasks'):
-                    # _agent_done_tasks tracks recently completed task IDs
-                    for p in phases:
-                        if p.slug == slug:
-                            for t in p.tasks:
-                                if t.status == TaskStatus.COMPLETE and t.id not in previously_complete:
-                                    fix_ran_since = True
-                                    break
-                            break
-                # Also check if any VR-fix agent completed since the rv file
+                # Has a VR-fix agent completed for this phase since rv_file
+                # was written? If so, the fix likely changed test/lint
+                # behavior and we want the LLM validator to re-evaluate.
+                #
+                # Look at _recently_finished, not self.agents: done agents
+                # are removed from self.agents by _poll_agents in the same
+                # call that marks them done, so the previous formulation
+                # never saw them.
                 with self._lock:
-                    for a in self.agents:
-                        if a.task.phase == slug and a.task.id.startswith("VR-fix-") and a.status == "done":
-                            fix_ran_since = True
-                if not fix_ran_since:
-                    # Check file mtime as fallback — any validation/review
-                    # file newer than rv_file means work happened
-                    phase_vdir = Path(spec_dir) / "validate" / slug
-                    for f in phase_vdir.iterdir():
-                        if f.name != "runner-verified.json" and f.stat().st_mtime > rv_mtime:
-                            fix_ran_since = True
-                            break
-                if not fix_ran_since:
+                    vr_fix_completed = any(
+                        a.task.phase == slug
+                        and a.task.id.startswith("VR-fix-")
+                        and a.status == "done"
+                        and (a.start_time or 0) > rv_file.stat().st_mtime
+                        for a in self._recently_finished
+                    )
+                if not vr_fix_completed:
                     continue
 
                 # Reset: delete runner-verified.json and review files so
                 # phase_needs_validate_review() returns True again
-                self.log(f"Resetting failed runner verification for {phase.name} — fix applied, re-validating")
+                self.log(f"Resetting failed runner verification for {phase.name} — VR-fix applied, re-validating")
                 rv_file.unlink(missing_ok=True)
                 phase_vdir = Path(spec_dir) / "validate" / slug
                 for rf in phase_vdir.glob("review-*.md"):
@@ -9468,6 +10181,11 @@ class Runner:
 
             if scheduler.all_complete():
                 self.log("All tasks complete!")
+                self._write_event(
+                    "feature_complete", spec_dir,
+                    feature=Path(spec_dir).name,
+                    completed=scheduler.completed_count(),
+                )
                 break
 
             # Draining: don't spawn new tasks, just wait for running agents.
@@ -9549,12 +10267,17 @@ class Runner:
             if breaker_wait and available_slots > 0:
                 with self._lock:
                     if not self.agents:  # only pause when no agents running
+                        self._activity(
+                            f"circuit breaker — cooling down for "
+                            f"{breaker_wait // 60}m after 3 connection errors"
+                        )
                         self.log(f"Circuit breaker tripped — last 3 attempts were connection errors. Waiting {breaker_wait // 60}m...")
                         # Sleep in small increments so we can respond to shutdown
                         for _ in range(breaker_wait):
                             if self._shutdown.is_set():
                                 break
                             time.sleep(1)
+                        self._activity("circuit breaker — cooldown complete, resuming")
                         self.log("Circuit breaker cooldown complete, resuming")
                         continue  # re-enter main loop
 
@@ -9686,6 +10409,9 @@ class Runner:
 
                 attempt_num = len(history) + 1 if history else 1
                 att_str = f" (attempt #{attempt_num})" if attempt_num > 1 else ""
+                self._activity(
+                    f"spawning agent #{agent_id} for {task.id}{att_str}"
+                )
                 self.log(f"Spawning Agent {agent_id} for task {task.id}{att_str}: {task.description[:60]}")
                 self._write_event("task_spawn", spec_dir,
                                   task_id=task.id, agent_id=agent_id,
@@ -9925,6 +10651,11 @@ class Runner:
                 log_path = self.log_dir / f"agent-{agent_id}-{vr_task_id}-{self.timestamp}.jsonl"
                 stderr_path = self.log_dir / f"agent-{agent_id}-{vr_task_id}-{self.timestamp}.stderr"
 
+                self._activity(
+                    f"spawning {spawn_kind} agent #{agent_id} ({model}) "
+                    f"for {phase.name}"
+                    + (f" cycle {cycle}" if spawn_kind == "review" else "")
+                )
                 self.log(
                     f"Spawning {spawn_kind} Agent {agent_id} ({model}) for {phase.name}"
                     + (f" cycle {cycle}" if spawn_kind == "review" else "")
@@ -9970,6 +10701,41 @@ class Runner:
                     if a.task.id.startswith("VR-fix-")
                 }
             vr_fix_phases &= running_fix_slugs
+
+            # Same cleanup for RV-fix agents (runner-verify failure path).
+            with self._lock:
+                running_rv_fix_slugs = {
+                    a.task.phase for a in self.agents
+                    if a.task.id.startswith("RV-fix-")
+                }
+            rv_fix_phases &= running_rv_fix_slugs
+
+            # Emit completion events for RV-fix agents that just transitioned
+            # to done since the last loop iteration. Used by
+            # _rv_fix_attempt_count and the reset logic.
+            #
+            # Scan _recently_finished, not self.agents: _poll_agents removes
+            # done slots from self.agents in the same call that sets
+            # status="done", so they would never be visible here. The
+            # recently-finished buffer keeps them around until the main loop
+            # has a chance to drain them.
+            if not hasattr(self, "_rv_fix_emitted"):
+                self._rv_fix_emitted: set[int] = set()
+            with self._lock:
+                done_rv_fix = [
+                    a for a in self._recently_finished
+                    if a.task.id.startswith("RV-fix-")
+                    and a.status == "done"
+                    and a.agent_id not in self._rv_fix_emitted
+                ]
+            for a in done_rv_fix:
+                self._rv_fix_emitted.add(a.agent_id)
+                self._write_event(
+                    "rv_fix_complete", spec_dir,
+                    phase=a.task.phase,
+                    agent_id=a.agent_id,
+                    task_id=a.task.id,
+                )
 
             # ── Dispatch fix agents for VR failures ───────────────────
             # When a VR agent finished with FAIL and no fix agent is
@@ -10036,6 +10802,10 @@ class Runner:
                 log_path = self.log_dir / f"agent-{agent_id}-{fix_task_id}-{self.timestamp}.jsonl"
                 stderr_path = self.log_dir / f"agent-{agent_id}-{fix_task_id}-{self.timestamp}.stderr"
 
+                self._activity(
+                    f"spawning VR-fix agent #{agent_id} (attempt "
+                    f"{fix_attempt}) for {phase.name}"
+                )
                 self.log(f"Spawning VR fix Agent {agent_id} (attempt {fix_attempt}) for {phase.name}")
                 self._write_event("vr_fix_spawn", spec_dir,
                                   phase=slug, agent_id=agent_id,
@@ -10062,6 +10832,147 @@ class Runner:
                 spawned += 1
                 total_runs += 1
 
+            # ── Dispatch fix agents for RUNNER-VERIFY failures ────────
+            # Distinct from VR-fix: the LLM validation already passed
+            # (REVIEW-CLEAN) but the runner's deterministic re-run of the
+            # gate commands FAILED. Without this dispatcher, that state
+            # is a dead end — the VR-fix dispatcher above only triggers
+            # on a FAIL validation file, which doesn't exist here. The
+            # runner would noop-exit after ~100s and silently abandon
+            # the feature.
+            for phase in phases:
+                slug = phase.slug
+                if slug in vr_phases or slug in vr_fix_phases or slug in rv_fix_phases:
+                    continue
+                if not scheduler.phase_tasks_complete(slug):
+                    continue
+                state = phase_states.get(slug, PhaseValidationState())
+                if state.complete or slug in validated_phases:
+                    continue
+                # Only trigger when VR is clean but runner-verify hasn't passed.
+                if not (state.validated and state.review_clean):
+                    continue
+                if state.runner_verified:
+                    continue
+                rv_file = Path(spec_dir) / "validate" / slug / "runner-verified.json"
+                if not rv_file.exists():
+                    continue  # runner-verify hasn't run yet
+                try:
+                    rv_data = json.loads(rv_file.read_text())
+                except (json.JSONDecodeError, OSError):
+                    continue
+                if rv_data.get("passed", False):
+                    continue  # passed — nothing to fix
+
+                attempts_so_far = self._rv_fix_attempt_count(spec_dir, slug)
+                next_attempt = attempts_so_far + 1
+                if next_attempt > MAX_VR_FIX_ATTEMPTS:
+                    self._activity(
+                        f"STALLED: {phase.name} hit RV fix cap "
+                        f"({MAX_VR_FIX_ATTEMPTS}) — inspect rv_file"
+                    )
+                    self.log(
+                        f"RV fix cap ({MAX_VR_FIX_ATTEMPTS}) reached for "
+                        f"{phase.name} — refusing to spawn another fix agent. "
+                        f"This phase will trip the strict-mode stall guard."
+                    )
+                    continue
+
+                # No-progress check: if the last 3 runner_verify cycles for
+                # this phase all failed with the IDENTICAL set of commands,
+                # the fix agents are declaring success without actually
+                # reducing the failure set. Stall fast instead of burning
+                # more attempts. Common causes: environment skew (TTY
+                # prompt, missing tool, wrong CWD), agents fixing the
+                # wrong thing, agents not running the gates themselves.
+                if attempts_so_far >= 2 and self._no_progress_for_phase(
+                    spec_dir, slug, lookback=3,
+                ):
+                    last_sigs = self._recent_runner_verify_failures(
+                        spec_dir, slug, n=3,
+                    )
+                    failed_labels = ", ".join(last_sigs[-1]) if last_sigs else "(unknown)"
+                    self._activity(
+                        f"STALLED: {phase.name} — last 3 verify cycles "
+                        f"failed identically on [{failed_labels}]"
+                    )
+                    self.log(
+                        f"RV no-progress detected for {phase.name}: last 3 "
+                        f"verify cycles all failed with the same commands "
+                        f"[{failed_labels}] across {attempts_so_far} fix "
+                        f"attempts. Refusing to spawn another fix agent — "
+                        f"this is likely environment skew (TTY prompt, "
+                        f"missing tool, wrong CWD) or agents fixing the "
+                        f"wrong thing. Inspect "
+                        f"`{rv_file}` stdout_tail/stderr_tail and either "
+                        f"fix the project locally OR clear "
+                        f"`runner-verified.json` and review-*.md to retry."
+                    )
+                    self._write_event(
+                        "rv_no_progress_stall", spec_dir,
+                        phase=slug,
+                        attempts=attempts_so_far,
+                        failed_commands=last_sigs[-1] if last_sigs else [],
+                    )
+                    continue
+
+                if available_slots <= 0:
+                    break
+
+                prompt = build_rv_fix_prompt(
+                    spec_dir, str(task_file), str(learnings_file),
+                    phase, rv_file, next_attempt,
+                )
+
+                fix_task_id = f"RV-fix-{slug}-{next_attempt}"
+                fix_task = Task(
+                    id=fix_task_id,
+                    description=f"Fix runner-verify failure #{next_attempt}: {phase.name}",
+                    phase=slug,
+                    parallel=False,
+                    status=TaskStatus.RUNNING,
+                    line_num=0,
+                )
+
+                self.agent_counter += 1
+                agent_id = self.agent_counter
+
+                log_path = self.log_dir / f"agent-{agent_id}-{fix_task_id}-{self.timestamp}.jsonl"
+                stderr_path = self.log_dir / f"agent-{agent_id}-{fix_task_id}-{self.timestamp}.stderr"
+
+                self._activity(
+                    f"spawning RV-fix agent #{agent_id} (attempt "
+                    f"{next_attempt}/{MAX_VR_FIX_ATTEMPTS}) for {phase.name}"
+                )
+                self.log(
+                    f"Spawning RV fix Agent {agent_id} "
+                    f"(attempt {next_attempt}) for {phase.name}"
+                )
+                self._write_event(
+                    "rv_fix_spawn", spec_dir,
+                    phase=slug, agent_id=agent_id,
+                    attempt=next_attempt,
+                    rv_file=str(rv_file),
+                )
+
+                proc = spawn_agent(fix_task, prompt, log_path, stderr_path)
+
+                slot = AgentSlot(
+                    agent_id=agent_id,
+                    task=fix_task,
+                    process=proc,
+                    pid=proc.pid,
+                    start_time=time.time(),
+                    log_file=log_path,
+                    status="running",
+                )
+                with self._lock:
+                    self.agents.append(slot)
+                rv_fix_phases.add(slug)
+                available_slots -= 1
+                spawned += 1
+                total_runs += 1
+
             # ── Runner-side independent verification ──────────────────
             # After VR agents finish and a phase has validated + review_clean,
             # the runner independently re-runs test commands before accepting.
@@ -10081,30 +10992,45 @@ class Runner:
                 rv_file = phase_vdir / "runner-verified.json"
                 if rv_file.exists():
                     # If verification previously passed, skip.
-                    # If it failed, check if any agent has since completed
-                    # for this phase (fix agent, VR agent, etc.) by comparing
-                    # file mtimes. If newer work exists, retry verification.
+                    # If it failed, retry only when a fix agent has completed
+                    # since the rv_file was written. Layer 2: we compare the
+                    # `fix_attempt` stamp in the rv_file against the current
+                    # _rv_fix_attempt_count. The old "any newer file in
+                    # phase_vdir" heuristic was too permissive (a touched
+                    # review-N.md would trigger a retry with no actual code
+                    # change) and too narrow (it missed code-only fixes from
+                    # RV-fix agents that don't touch validate/).
                     try:
                         rv_data = json.loads(rv_file.read_text())
                         if rv_data.get("passed", False):
                             continue  # Already passed
-                        # Failed — check if anything changed since the failure
-                        rv_mtime = rv_file.stat().st_mtime
-                        # Check for newer validation/review files OR newer
-                        # source code changes (git tracks this)
-                        any_newer = False
-                        for f in phase_vdir.iterdir():
-                            if f.name != "runner-verified.json" and f.stat().st_mtime > rv_mtime:
-                                any_newer = True
-                                break
-                        if not any_newer:
-                            continue  # Nothing changed since failure
-                        self.log(f"Retrying runner verification for {phase.name} (prior attempt failed, newer files found)")
+                        stamped_attempt = rv_data.get("fix_attempt")
+                        current_attempt = self._rv_fix_attempt_count(spec_dir, slug)
+                        if stamped_attempt is None:
+                            # Legacy rv_file with no fix_attempt stamp.
+                            # Conservative fallback: if any RV-fix or VR-fix
+                            # agent has completed in this session, retry.
+                            advanced = current_attempt > 0
+                        else:
+                            advanced = current_attempt > stamped_attempt
+                        if not advanced:
+                            continue  # No fix has run since the failure
+                        self._write_event(
+                            "runner_verify_retry", spec_dir,
+                            phase=slug,
+                            previous_fix_attempt=stamped_attempt,
+                            current_fix_attempt=current_attempt,
+                        )
+                        self.log(
+                            f"Retrying runner verification for {phase.name} "
+                            f"(fix_attempt: {stamped_attempt} → {current_attempt})"
+                        )
                         rv_file.unlink()
                     except (json.JSONDecodeError, OSError):
                         continue
 
                 try:
+                    self._activity(f"runner-verify: {phase.name} — discovering commands")
                     self.log(f"Runner verification for phase {phase.name}...")
 
                     # Discover test commands from CLAUDE.md or Makefile
@@ -10144,6 +11070,7 @@ class Runner:
                             break
                     wrap_env_rv = env_sh_rv is not None
                     for cmd, label in test_cmds:
+                        self._activity(f"runner-verify: {phase.name} — running `{label}`")
                         self.log(f"  Running: {label}")
                         try:
                             to_run = cmd
@@ -10158,23 +11085,42 @@ class Runner:
                                 timeout=600,
                             )
                             passed = result.returncode == 0
-                            results.append({
+                            entry = {
                                 "command": cmd, "label": label,
                                 "exit_code": result.returncode,
                                 "passed": passed,
-                            })
+                            }
+                            # Layer 1: capture tail of stdout+stderr for the
+                            # fix agent. Cap each stream at 8 KiB to keep
+                            # rv_file bounded; the tail is what matters for
+                            # test failures (last assertion, stack trace).
+                            if not passed:
+                                entry["stdout_tail"] = (result.stdout or "")[-8192:]
+                                entry["stderr_tail"] = (result.stderr or "")[-8192:]
+                            results.append(entry)
                             if not passed:
                                 self.log(f"  FAILED (exit {result.returncode}): {label}")
                                 self.log(f"  stderr: {result.stderr[:300]}")
                                 all_passed = False
                             else:
                                 self.log(f"  PASSED: {label}")
-                        except subprocess.TimeoutExpired:
-                            results.append({
+                        except subprocess.TimeoutExpired as te:
+                            entry = {
                                 "command": cmd, "label": label,
                                 "exit_code": -1, "passed": False,
                                 "error": "timeout after 600s",
-                            })
+                            }
+                            if te.stdout:
+                                tail_out = te.stdout
+                                if isinstance(tail_out, bytes):
+                                    tail_out = tail_out.decode("utf-8", errors="replace")
+                                entry["stdout_tail"] = tail_out[-8192:]
+                            if te.stderr:
+                                tail_err = te.stderr
+                                if isinstance(tail_err, bytes):
+                                    tail_err = tail_err.decode("utf-8", errors="replace")
+                                entry["stderr_tail"] = tail_err[-8192:]
+                            results.append(entry)
                             self.log(f"  TIMEOUT: {label}")
                             all_passed = False
 
@@ -10217,10 +11163,16 @@ class Runner:
                             ],
                         })
 
+                    # Layer 2: record which fix-attempt iteration produced
+                    # this rv_file. Used by the reset logic to detect when
+                    # a fix agent has since run (and thus the rv_file is
+                    # stale and must be re-verified).
+                    fix_attempt_at_write = self._rv_fix_attempt_count(spec_dir, slug)
                     rv_file.write_text(json.dumps({
                         "passed": all_passed,
                         "reason": "all commands passed" if all_passed else "some commands failed or skips detected",
                         "commands": results,
+                        "fix_attempt": fix_attempt_at_write,
                     }, indent=2))
                     runner_verified_any = True
 
@@ -10279,7 +11231,25 @@ class Runner:
                     ]
                     if unmet:
                         self.log(f"  Blocked by unmet deps: {', '.join(unmet)}")
+                    # Layer 3 + 4: emit a feature_abandoned event so the
+                    # outer loop and post-mortem tools can see this exit
+                    # cleanly. The outer for-loop applies the strict-mode
+                    # policy (refuse to advance to the next feature unless
+                    # --continue-on-stall is set).
+                    reason = self._spec_abandoned_reason(spec_dir) or "noop_timeout"
+                    self._write_event(
+                        "feature_abandoned", spec_dir,
+                        feature=Path(spec_dir).name,
+                        reason=reason,
+                        completed=completed,
+                        pending=pending,
+                        unvalidated=unvalidated,
+                    )
                     break
+                self._activity(
+                    f"no work ready — idle tick "
+                    f"{consecutive_noop}/{max_consecutive_noop} before exit"
+                )
                 self.log(f"No tasks ready ({consecutive_noop}/{max_consecutive_noop} before exit). Waiting...")
                 self._poll_agents()
                 time.sleep(5)
@@ -10581,6 +11551,14 @@ class Runner:
             if finished:
                 with self._lock:
                     self.agents = [a for a in self.agents if a not in finished]
+                    # Append to recently-finished buffer so main-loop scans
+                    # that need to see the just-completed agent (e.g. the
+                    # rv_fix_complete emitter, VR-fix completion detector)
+                    # can find them after they're removed from self.agents.
+                    self._recently_finished.extend(finished)
+                    if len(self._recently_finished) > self._recently_finished_cap:
+                        # Drop oldest, keep most recent _recently_finished_cap entries
+                        self._recently_finished = self._recently_finished[-self._recently_finished_cap:]
 
                 # Handle retryable agents
                 for agent in finished:
@@ -12122,8 +13100,18 @@ Full log: `{setup_log.relative_to(project_dir) if setup_log.is_absolute() else s
         e2e_dir = Path(spec_dir) / "validate" / "e2e"
         e2e_dir.mkdir(parents=True, exist_ok=True)
 
+        # Scope the per-thread Android-app override for the lifetime of
+        # this task's E2E loop. _platform_manager may not exist yet (created
+        # lazily by ensure_runtime); ensure it before scoping so the TLS
+        # set on it is read by every downstream platform call.
+        if not hasattr(self, '_platform_manager'):
+            self._platform_manager = PlatformManager(log_fn=self.log)
+        app_override = getattr(task, "android_app", None)
+
         try:
-            return self._run_e2e_loop_inner(task, spec_dir, task_file, learnings_file)
+            with self._platform_manager._scoped_app_override(app_override):
+                return self._run_e2e_loop_inner(
+                    task, spec_dir, task_file, learnings_file)
         except AgentAuthError:
             self.log(f"FATAL: Auth error in E2E loop for {task.id}")
             self._shutdown.set()
@@ -14659,11 +15647,14 @@ cannot apply the fix" for the full contract.
 
                 # App crashed — pull the crash log
                 e2e_log(f"App health check: CRASHED (attempt {crash_fix_attempt + 1}/{APP_CRASH_FIX_MAX})")
-                crash_log_result = subprocess.run(
-                    "adb -s emulator-5554 logcat -d -t 200 '*:E' 2>/dev/null",
-                    shell=True, capture_output=True, text=True, timeout=15,
-                )
-                crash_lines = crash_log_result.stdout if crash_log_result.returncode == 0 else "(could not read logcat)"
+                try:
+                    crash_log_result = subprocess.run(
+                        "adb -s emulator-5554 logcat -d -t 200 '*:E' 2>/dev/null",
+                        shell=True, capture_output=True, text=True, timeout=30,
+                    )
+                    crash_lines = crash_log_result.stdout if crash_log_result.returncode == 0 else "(could not read logcat)"
+                except subprocess.TimeoutExpired:
+                    crash_lines = "(logcat timed out — emulator may be unresponsive)"
                 # Filter to relevant lines
                 relevant = "\n".join(
                     l for l in crash_lines.splitlines()
@@ -18161,6 +19152,8 @@ def main():
                         help="Disable bubblewrap sandbox (not recommended)")
     parser.add_argument("--and-later", action="store_true",
                         help="After the specified spec_dir completes, also run all later specs (sorted alphabetically)")
+    parser.add_argument("--continue-on-stall", action="store_true",
+                        help="If a feature stalls (e.g. runner-verify failed and no fix path is reachable), advance to the next feature instead of writing STALLED.md and exiting (default: refuse).")
 
     args = parser.parse_args()
 
@@ -18248,6 +19241,7 @@ def main():
         headless=args.headless,
         max_parallel=args.max_parallel,
         layout=args.layout,
+        continue_on_stall=args.continue_on_stall,
     )
     runner.run()
 
