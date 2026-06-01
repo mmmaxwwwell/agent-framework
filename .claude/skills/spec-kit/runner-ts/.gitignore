@@ -1,0 +1,57 @@
+# Added by code-review-graph
+.code-review-graph/
+
+# Spec-kit / agent artifacts
+test-logs/
+logs/
+validate/
+attempts/
+ci-debug/
+BLOCKED.md
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Direnv
+.direnv/
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+
+# Nix
+result
+
+# Security
+*.pem
+*.key
+credentials.json
+
+# Database
+*.sqlite
+*.sqlite3
+*.db
+
+# Coverage
+coverage/
+.nyc_output/
+
+# PWA build output
+public/sw.js
+public/*.js
+public/*.css
+public/*.html
+!public/manifest.webmanifest

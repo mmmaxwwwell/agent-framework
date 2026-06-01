@@ -4,13 +4,17 @@ This file holds the mandatory rules for phase-boundary validation and code revie
 
 This file lives at a stable path (`reference/validate-review.md`), so every spawn's Read of it hits the prompt cache.
 
+**Read `reference/proof-discipline.md` FIRST.** It explains the substrate every rule in this file operates on: artifacts not claims. Many failure modes that "passed" validation under the previous version of this file were silent-skip and vacuous-artifact failures that proof-discipline now names explicitly. If the proof-discipline rules and any specific rule below conflict, proof-discipline wins.
+
 ## Part 1: Validate — four-step sequence
 
 Run these steps **in order**, stopping at the first failure category. Do NOT skip steps — every step that has a command must run.
 
 **Step 1 — Build**: Compile/transpile the project. If there's no explicit build step, skip.
 
-**Step 2 — Test**: Run the full test suite. Capture all output.
+**Step 2 — Test**: Run the full test suite. Capture all output. **Read every proof artifact** the test command was supposed to produce (e.g. `test-logs/e2e/run-summary.json`, vitest JSON reports, JUnit XML). If a proof artifact is missing, or has `executed: 0`, or has `status != "pass"`, the step is FAIL regardless of the test command's exit code. Silent skips — where a wrapper exits 0 because a precondition was missing — are FAIL. See `reference/proof-discipline.md` for the full rules and `reason_if_zero` semantics.
+
+**Step 2 (UI projects) — Real-runtime verification**: For any phase that modified user-visible UI files (`.astro`, `.tsx`, `.vue`, `.svelte`, components rendered in client-hydrated islands), the validator MUST exercise the changed routes against a real production build, not a dev server, and not with JS disabled. Open each modified or newly-added route in a browser/Playwright session, wait for hydration, and assert content remains visible after hydration completes. A page that renders SSG content then goes blank after hydration is FAIL — this is the exact failure shape that produced the May 22 incident. The visual regression snapshot suite is NOT a substitute: snapshots with `javaScriptEnabled: false` validate only the static surface and intentionally sidestep hydration bugs. See `reference/proof-discipline.md` § "Why this exists — the May 22 incident".
 
 **Step 3 — Lint**: Run the project's linter(s) (e.g. `eslint`, `golangci-lint`, `ruff`, `clippy`). Check `CLAUDE.md`, `package.json` scripts, and `Makefile` for the lint command. If a linter is configured but not in CLAUDE.md, still run it.
 
@@ -65,6 +69,10 @@ Report any missing artifacts or failed commands as FAIL (same as test failure).
 **Unable to validate = FAIL**: If a phase modifies source code in a build system but you cannot run that build system's tests (toolchain missing, SDK not available, emulator won't boot), that is a **FAIL**. Either fix the environment or write FAIL. A validation that only tests Go when the phase modified Kotlin is incomplete and MUST be FAIL.
 
 **Zero test results = FAIL**: If you run a test command and it reports 0 passed, 0 failed, 0 skipped, that means the test runner found nothing to execute. This is NOT a pass — it means test discovery is broken (wrong directory, missing wrapper script, `| tee` swallowing exit codes). Zero results from a build system with changed source files is FAIL.
+
+**Silent-skip wrapper = FAIL**: If a wrapper script (e.g. `run-e2e.sh`, `run-a11y.sh`) returns 0 because a precondition was missing (service not running, port unbound, fixture absent), that is FAIL. The proof artifact's `executed` field is the source of truth — `executed == 0` is FAIL even when exit code is 0. See `reference/proof-discipline.md` rule #2.
+
+**Coverage matrix gap = FAIL**: If the phase added or modified user-visible routes/screens/features and the diff does not contain a test that exercises each new/modified surface, the phase is FAIL. The validator MUST extract the route set from the production diff and the route set from the test diff, and confirm every production route appears in at least one test. One representative route is NOT sufficient when the spec describes multiple routes (e.g. four loadout presets). See `reference/proof-discipline.md` rule #5.
 
 **Any skipped test = FAIL**: If `skip > 0` in the test summary, the phase is FAIL. No exceptions, no matter the reason. `describe.skip`, `t.Skip`, `pytest.mark.skipif`, `if (!canRun) return`, try/catch that swallows setup errors — all equivalent silent-skip loopholes. If the test didn't run, treat it as FAIL and fix it. Do NOT add more skip guards to "hide" the problem; the fix is to remove the guard and make the test run against live services. If a test physically cannot run in the target environment (iOS tests on Linux, emulator-only Android tests in a Linux-only runner), exclude it from the test list at list-building time (separate file pattern, separate npm script, CI matrix) — it must be absent, not skipped. See `reference/testing.md` § "Zero-skips rule" for the full pattern.
 

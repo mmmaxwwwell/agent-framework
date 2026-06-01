@@ -1,0 +1,9 @@
+# BEGIN code-review-graph managed (from flake.nix excludeDirs)
+test-logs/**
+logs/**
+validate/**
+attempts/**
+ci-debug/**
+public/**
+dist/**
+# END code-review-graph managed

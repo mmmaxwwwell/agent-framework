@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import hashlib
 import json
 import math
@@ -203,6 +204,16 @@ def _required_reads_block(role: str, abs_paths: list[str]) -> str:
     paths = list(abs_paths)
     if not role.startswith("e2e-") and "CLAUDE.md" not in paths:
         paths.insert(0, "CLAUDE.md")
+    # coding-behavior.md is auto-prepended for EVERY role (including e2e):
+    # these are universal rules about how to approach coding work
+    # (think-before-coding, simplicity-first, surgical-changes,
+    # goal-driven-execution), not project-specific conventions. Keeping
+    # it as the very first read means every spawned agent loads the
+    # behavioral floor before any other context. The path is stable so
+    # Claude Code's Read cache hits across spawns within the 5-min TTL.
+    _coding_behavior_path = str(_REF_DIR / "coding-behavior.md")
+    if _coding_behavior_path not in paths:
+        paths.insert(0, _coding_behavior_path)
 
     lines = [
         "## Required reading (MANDATORY — do these reads BEFORE anything else)",
@@ -864,6 +875,38 @@ def scan_phase_validation_states(spec_dir: str) -> dict[str, PhaseValidationStat
                         break
             except OSError:
                 pass
+
+        # Require verification.json with non-vacuous per-task entries
+        # alongside REVIEW-CLEAN. See reference/proof-discipline.md §
+        # "verification.json schema". A REVIEW-CLEAN record without a
+        # valid verification.json is NOT a clean phase — the runner
+        # treats it as not-yet-reviewed so the review agent re-spawns.
+        if state.review_clean:
+            verification_file = phase_dir / "verification.json"
+            if not verification_file.exists():
+                state.review_clean = False
+            else:
+                try:
+                    vdata = json.loads(verification_file.read_text())
+                    tasks_verified = vdata.get("tasks_verified", [])
+                    overall = vdata.get("overall_verdict", "")
+                    if not isinstance(tasks_verified, list) or not tasks_verified:
+                        state.review_clean = False
+                    elif overall != "pass":
+                        state.review_clean = False
+                    else:
+                        # Every entry must have the substrate-evidence fields.
+                        for t in tasks_verified:
+                            if not isinstance(t, dict):
+                                state.review_clean = False
+                                break
+                            if not t.get("commands_run") or \
+                               not t.get("artifacts_inspected") or \
+                               not t.get("lie_check"):
+                                state.review_clean = False
+                                break
+                except (json.JSONDecodeError, OSError):
+                    state.review_clean = False
 
         # Check for runner-verified file (runner independently ran tests)
         runner_verified_file = phase_dir / "runner-verified.json"
@@ -2040,6 +2083,71 @@ def build_rv_fix_prompt(spec_dir: str, task_file: str, learnings_file: str,
     )
     _ref_index = _reference_index_pointer()
 
+    # Prior-attempt summaries: discover reasoning files written by earlier
+    # RV-fix agents on this phase and surface them as Read-on-demand
+    # pointers. Each prior file contains a "## Reasoning" section with
+    # What I did / Why / Next step if this fails — exactly the context
+    # the next attempt needs to avoid repeating dead ends. We pass paths
+    # (not inlined content) so the next agent's Read calls hit cache and
+    # we don't blow the prompt budget on attempt 5 of 5.
+    prior_attempts = _list_prior_rv_fix_attempts(spec_dir, phase_slug, attempt)
+    if prior_attempts:
+        prior_lines = [
+            "## Prior fix attempts on this phase (READ before planning)",
+            "",
+            f"You are attempt #{attempt}. Earlier RV-fix agents already worked on "
+            "this phase and the runner-verify still fails. **Read every prior "
+            "reasoning file listed below before you start planning** — each one "
+            "ends with a `## Reasoning` section covering what was tried, why, "
+            "what was deliberately not touched, and what the agent recommended "
+            "trying next if their fix failed. Do not repeat their dead ends. "
+            "If your plan duplicates a prior attempt, stop and reconsider.",
+            "",
+        ]
+        for r in prior_attempts:
+            prior_lines.append(
+                f"- **Attempt {r['attempt']}** (agent {r['agent_id']}, "
+                f"{r['timestamp']}) — `{r['reasoning_path']}`"
+            )
+        prior_lines.append("")
+        prior_lines.append(
+            "These are the most important reads in this prompt for attempt "
+            f"#{attempt}. Skipping them is the #1 way to burn a fix cycle "
+            "rediscovering what attempt 1 already wrote down."
+        )
+        prior_lines.append("")
+        prior_section = "\n".join(prior_lines)
+    else:
+        prior_section = ""
+
+    # Curated pointers to spec-kit artifacts the agent may need on
+    # demand. NOT mandatory reads — only consult when the current failure
+    # implicates one of them. The list is short and stable; we resist
+    # padding it with auto-derived paths because the failure output and
+    # prior reasoning already surface project-specific hotspots.
+    useful_paths_section = f"""## Useful paths (consult on demand only)
+
+These are spec-kit artifacts and conventional locations that may be
+relevant to *some* failures. Do not pre-read them — open one only if
+your specific failure points at it.
+
+- `{learnings_file}` — phase-wide notes prior agents wrote about
+  non-obvious gotchas. Worth a glance if the failure looks
+  environmental or recurring across attempts.
+- `{task_file}` — task list with acceptance criteria. Read the entry
+  for the specific T-* id implicated by a failure when the test asserts
+  contract-shaped behavior.
+- `{spec_dir}/reasoning/` — every agent's `## Reasoning` writeup
+  archived here. Grep for related task ids or phase slugs if a failure
+  echoes something earlier work touched.
+- `{validate_dir}/` — VR-cycle validation reports for this phase
+  (`1.md`, `2.md`, …, `review-N.md`). Useful only if the runner failure
+  duplicates a complaint the LLM validate cycle already raised.
+- `{rv_file}` — the full JSON the failure section above was rendered
+  from. Read it directly if you need fields beyond stdout/stderr tails
+  (e.g. exit codes, durations, env).
+"""
+
     # Build the list of exact re-run commands the agent must satisfy. The
     # agent's mandatory exit checklist references these by number so it
     # can't "fix one thing and declare done" without confirming every
@@ -2074,6 +2182,7 @@ in there.
 
 {failed_section}
 
+{prior_section}
 ## Exit checklist (NON-NEGOTIABLE)
 
 Before you finish, you MUST run each of these commands FROM THE REPO ROOT
@@ -2103,10 +2212,14 @@ make them pass.
 
 {_ref_index}
 
+{useful_paths_section}
 ## Instructions
 
 1. Read each failed-command block above. The stdout/stderr tails contain
    the actual failure output captured by the runner — do not guess; read.
+   If this is attempt #2 or later, the **Prior fix attempts** section
+   above is your most important read — skim the prior reasoning files
+   first so you don't repeat work or dead ends.
 2. For each failure, read the relevant source files and identify the root
    cause. Common categories:
    - A test asserts behavior the implementation doesn't yet provide
@@ -2307,6 +2420,7 @@ def build_validate_prompt(spec_dir: str, task_file: str, phase: "Phase",
         "validate",
         [
             "CLAUDE.md",
+            str(_REF_DIR / "proof-discipline.md"),
             str(_REF_DIR / "testing.md"),
             str(_REF_DIR / "validate-review.md"),
             str(_REF_DIR / "pre-pr.md"),
@@ -2315,6 +2429,18 @@ def build_validate_prompt(spec_dir: str, task_file: str, phase: "Phase",
     _ref_index = _reference_index_pointer()
 
     return f"""You are the **validate** agent for phase **{phase.name}** ({phase_slug}).
+
+## STANCE: ADVERSARIAL
+
+You are looking for the case where the previous agents claimed success without doing the work. **Assume that case.** Find the evidence. Prior agents' commit messages, completion claims, and self-authored validation records are NOT a source of truth — they are advertising. The substrate (artifacts on disk, output of re-run commands, the actual diff) is the source of truth. When the substrate disagrees with a claim, the substrate wins, and the phase is FAIL.
+
+Specific failure shapes to look for (every one of these has produced a real incident):
+
+1. **Silent skip with green claim**. A wrapper script (e.g. `run-e2e.sh`, `run-a11y.sh`) returned exit 0 because a precondition was missing — service not running, port unbound, fixture absent. The wrapping `npm run` step inherits exit 0. The pre-PR gate reports green. The proof artifact (e.g. `test-logs/e2e/run-summary.json`) shows `executed: 0` and a `reason_if_zero` naming the missing precondition. **Verdict: FAIL.** Exit 0 is necessary but not sufficient for pass.
+2. **Pattern-matched rule satisfaction**. Specs contain `expect()` calls (passes the no-vacuous-tests grep) but every `expect` targets static literals (`expect(2+2).toBe(4)`) or assertions disconnected from the code under test. Verify by reading what each assertion actually checks — not by counting `expect` tokens.
+3. **Coverage shortcut**. The spec demands N routes/screens/cases; the diff parametrizes over one representative case. Read the route set from the production diff and the route set referenced by tests. The latter MUST cover the former.
+4. **Test ran with the failure-mode disabled**. Visual-regression tests that disable JavaScript to "stabilize snapshots" cannot exercise hydration-time bugs in JS-driven UI. A test that turns off the failure surface is not a test of that surface.
+5. **Anchored on prior validate/N.md or completion-*.json**. Prior agents wrote reasoning that turned out to be wrong. Re-derive every claim. Do NOT read `claims/completion-*.json` or self-authored summaries in prior `validate/<phase>/*.md` records as load-bearing input — read them only to know what claims you need to falsify.
 
 Your job is ONLY Part 1 from `reference/validate-review.md` — run tests, build, lint, security scan; write a PASS or FAIL record. You are NOT doing code review; a separate review agent is spawned afterward when you write PASS.
 {_nix_devshell_note()}
@@ -2335,6 +2461,14 @@ Your job is ONLY Part 1 from `reference/validate-review.md` — run tests, build
 
 Follow `reference/validate-review.md` § Part 1 through § Part 1.10. Write your outcome to `{validate_dir}/{attempt_num}.md` using the exact template in that reference file's "Part 1 output format" section.
 
+**Before writing PASS, do all of the following:**
+
+1. **Read every proof artifact** under `test-logs/` that was produced by this phase. For each, check `status`, `executed`, and `reason_if_zero`. Any artifact with `status != "pass"` or `executed == 0` is a FAIL regardless of exit codes from the surrounding `npm run`.
+2. **Cross-check executed vs expected**. If `test-logs/e2e/expected-spec-count.txt` exists, read it; the executed count MUST be >= expected. If `coverage/coverage-summary.json` exists, read it; coverage MUST be non-empty for every modified source file.
+3. **Re-run the gate command yourself**, do not trust prior runs. The relevant test artifacts MUST be regenerated by this validation attempt (so older artifacts from prior runs cannot poison the verdict).
+4. **Extract route/screen coverage matrix** for UI phases. List every route added or modified in the diff, and every route referenced by tests. The latter MUST be a superset of the former.
+5. **Read the diff** for tests that disable JS, intercept network, mock the unit-under-test, or otherwise neutralize the failure mode the phase was supposed to test. Flag and FAIL.
+
 - On FAIL: exit immediately after writing the record. Do NOT spawn a review. The runner will dispatch a fix agent.
 - On PASS: write the record with the coverage proof block, then exit. The runner will spawn a review agent separately.
 
@@ -2344,6 +2478,8 @@ Follow `reference/validate-review.md` § Part 1 through § Part 1.10. Write your
 - Do NOT run `git diff` for review purposes — you only need it for the coverage-proof file list
 - Do NOT read ROUTER.md or load any skills
 - Do NOT use the Skill tool
+- Do NOT read prior `claims/completion-*.json` files as truth — read them only to know what to falsify
+- When the substrate and a claim disagree, the substrate wins
 """
 
 
@@ -2457,6 +2593,7 @@ issues and so you can verify that prior fixes landed:
         "review",
         [
             "CLAUDE.md",
+            str(_REF_DIR / "proof-discipline.md"),
             str(_REF_DIR / "validate-review.md"),
             str(review_skill),
         ],
@@ -2464,6 +2601,15 @@ issues and so you can verify that prior fixes landed:
     _ref_index = _reference_index_pointer()
 
     return f"""You are the **review** agent for phase **{phase.name}** ({phase_slug}). Review cycle #{review_cycle}.
+
+## STANCE: ADVERSARIAL
+
+The validate agent wrote PASS for this phase. **Do not trust that PASS.** Re-derive whether the phase actually accomplished what `tasks.md` demanded. Specifically, before the standard spec-conformance / test-depth / bug-scan checks, do these substrate audits:
+
+1. **Read every proof artifact under `test-logs/`** that this phase should have produced. Check `status`, `executed`, `reason_if_zero`. Any artifact with `executed == 0` is a FAIL — overrule the validate PASS by writing REVIEW-FIXES with that finding (and fix the underlying gap).
+2. **Read the diff for tests that disable the failure mode** they exist to test (e.g. visual-regression tests setting `javaScriptEnabled: false` on hydrated JS UI; integration tests mocking the database; E2E tests intercepting the network call they are supposed to verify). Each is a coverage gap.
+3. **Build the route/screen coverage matrix** for UI phases. List every route added or modified in the production diff; list every route exercised by tests in the diff. If the latter is not a superset of the former, fix the test diff or fail the review.
+4. **Check that prior-agent claims are consistent with the artifacts**. Read `claims/completion-*.json` and `validate/{phase_slug}/*.md` ONLY to know what claims were made — then re-derive each from the substrate. When a claim and the substrate disagree, the substrate wins; fix or flag.
 
 Part 1 (validate) already wrote PASS for this phase. Your job is ONLY Part 2 from `reference/validate-review.md`: spec-conformance audit + test-depth audit + bug scan + apply fixes + write `review-{review_cycle}.md`.
 {_nix_devshell_note()}
@@ -2495,9 +2641,41 @@ Follow `reference/validate-review.md` § Part 2 end-to-end:
 5. **Re-run tests** if you made fixes, to verify you didn't break anything
 6. **Write `{review_file}`** with REVIEW-CLEAN or REVIEW-FIXES heading per the reference
 
+## Mandatory output: verification.json
+
+In addition to the markdown review record, write `{validate_dir}/verification.json` containing the evidence for your verdict. This is the substrate the runner reads; the markdown is for humans. Schema (see `reference/proof-discipline.md` § "verification.json schema"):
+
+```json
+{{
+  "phase": "{phase_slug}",
+  "verifier_version": "1.0",
+  "timestamp": "ISO-8601",
+  "tasks_verified": [
+    {{
+      "task_id": "T123",
+      "demand_summary": "what tasks.md asked for, in your own words",
+      "commands_run": [
+        {{"command": "...", "exit_code": 0, "stdout_excerpt": "..."}}
+      ],
+      "artifacts_inspected": [
+        {{"path": "test-logs/e2e/run-summary.json", "key_fields": {{"status": "pass", "executed": 29}}}}
+      ],
+      "verdict": "satisfied | unsatisfied | inconclusive",
+      "evidence": "concrete evidence — file paths, line numbers, output excerpts",
+      "lie_check": "what you looked for to detect a lie, and what you found"
+    }}
+  ],
+  "overall_verdict": "pass | fail",
+  "blocking_failures": []
+}}
+```
+
+A `verification.json` without `commands_run`, `artifacts_inspected`, or `lie_check` per task is vacuous — the runner rejects it and you will be re-spawned.
+
 ## Rules
 
 - Heading of `{review_file}` MUST contain either `REVIEW-CLEAN` or `REVIEW-FIXES` — the runner parses this
+- `{validate_dir}/verification.json` MUST exist with non-vacuous per-task entries — the runner parses this
 - Do NOT modify validation records (`<N>.md`) — the validate agent owns those
 - Do NOT read ROUTER.md or load any skills
 - Do NOT use the Skill tool
@@ -3770,7 +3948,12 @@ def check_rate_limited(stderr_path: Path, log_path: Optional[Path] = None) -> Op
                     continue
                 if msg.get("type") == "rate_limit_event":
                     info = msg.get("rate_limit_info", {})
-                    if info.get("status") == "rejected" or info.get("overageDisabledReason") == "out_of_credits":
+                    # Only `status == "rejected"` means THIS request was throttled.
+                    # `overageDisabledReason` is a sticky account-config field that
+                    # describes overage policy, not the outcome of this request —
+                    # an event with status="allowed" + overageDisabledReason set
+                    # is informational and must NOT be treated as a rate-limit.
+                    if info.get("status") == "rejected":
                         resets_at = info.get("resetsAt")
                         if resets_at:
                             return float(resets_at)
@@ -4356,6 +4539,60 @@ def write_reasoning_record(spec_dir: str, task_id: str, agent_id: int,
         return None
 
 
+def _list_prior_rv_fix_attempts(spec_dir: str, phase_slug: str,
+                                current_attempt: int) -> list[dict]:
+    """Discover reasoning files from prior RV-fix attempts on this phase.
+
+    Returns a list of dicts (oldest first) with the metadata each prior
+    attempt produced. The next attempt's prompt embeds pointers to these
+    files so the agent can read the prior diagnoses on demand rather
+    than re-deriving them from scratch.
+
+    Each record:
+      - attempt: int (1-indexed)
+      - agent_id: int
+      - reasoning_path: str (absolute path, agent reads with the Read tool)
+      - timestamp: str (ISO compact form)
+
+    Filenames look like:
+      NNNNNN-YYYYMMDDTHHMMSS-task-RV-fix-<phase_slug>-<N>-agent<ID>.md
+
+    Older attempts past the current one are filtered out (defensive — should
+    not happen, but if the runner is restarted mid-loop we don't want to
+    show attempt N's own writeup back to itself).
+    """
+    reasoning_dir = Path(spec_dir) / "reasoning"
+    if not reasoning_dir.is_dir():
+        return []
+    # Anchor on the task-id stem so we don't accidentally match
+    # phase10-* when looking for phase1-*.
+    pattern = re.compile(
+        rf"^\d+-(\d{{8}}T\d{{6}})-task-RV-fix-{re.escape(phase_slug)}-(\d+)-agent(\d+)\.md$"
+    )
+    out: list[dict] = []
+    for f in reasoning_dir.iterdir():
+        m = pattern.match(f.name)
+        if not m:
+            continue
+        ts, attempt_str, agent_str = m.groups()
+        try:
+            n = int(attempt_str)
+        except ValueError:
+            continue
+        if n >= current_attempt:
+            # Don't show the current attempt or any future ones back to
+            # the agent that's about to run.
+            continue
+        out.append({
+            "attempt": n,
+            "agent_id": int(agent_str),
+            "reasoning_path": str(f.resolve()),
+            "timestamp": ts,
+        })
+    out.sort(key=lambda r: r["attempt"])
+    return out
+
+
 def read_attempt_history(spec_dir: str, task_id: str,
                          session_id: str | None = None) -> list[dict]:
     """Read attempt records for a task.
@@ -4545,6 +4782,176 @@ def _scan_for_skipped_tests(
                         names.append(n)
         results.append((str(p), skip_count, names[:20]))  # cap name list
     return results
+
+
+def _scan_proof_artifacts(
+    min_mtime: Optional[float] = None,
+) -> list[tuple[str, str, int, str]]:
+    """Scan test-logs/ for proof artifacts and return failures.
+
+    A proof artifact is a JSON file under test-logs/ that contains both
+    a `status` and an `executed` field — the canonical shape defined in
+    `reference/proof-discipline.md`. A failure is any artifact where:
+
+    - `status != "pass"`, OR
+    - `executed == 0`
+
+    Returns a list of (path, status, executed, reason_if_zero) tuples.
+    Empty list means no failures (or no proof artifacts exist, which is
+    itself a coverage gap — caller decides what to do with that).
+
+    If `min_mtime` is provided, only artifacts modified at or after that
+    timestamp are considered, so stale artifacts from prior verification
+    runs cannot poison the result.
+    """
+    failures: list[tuple[str, str, int, str]] = []
+    roots = [Path("test-logs"), Path("api/test-logs"), Path("site/test-logs")]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for p in root.rglob("*.json"):
+            try:
+                if min_mtime is not None and p.stat().st_mtime < min_mtime:
+                    continue
+                data = json.loads(p.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            # Look for the canonical proof-artifact shape. Tolerate the
+            # shape produced by various wrappers (run-e2e.sh, pre-pr.mjs,
+            # ad-hoc test runners that happen to write status+executed).
+            if "status" not in data or "executed" not in data:
+                continue
+            status = str(data.get("status", ""))
+            try:
+                executed = int(data.get("executed", 0) or 0)
+            except (TypeError, ValueError):
+                executed = 0
+            reason = str(data.get("reason_if_zero", "") or "")
+            if status != "pass":
+                failures.append((str(p), status, executed, reason))
+            elif executed == 0:
+                failures.append((str(p), status, executed, reason))
+    return failures
+
+
+def _scan_coverage_matrix(base_sha: Optional[str]) -> list[str]:
+    """Detect routes added/modified in the diff that no test references.
+
+    Heuristic but mechanical. Builds two sets:
+
+    - **Production routes**: every new/modified path under common
+      route-source directories (`pages/`, `app/`, `routes/`, `src/pages/`,
+      `site/src/pages/`) keyed by file path with extensions stripped and
+      dynamic-segment placeholders normalized.
+    - **Tested routes**: every string passed to `page.goto(...)` or
+      `cy.visit(...)` in `**/*.spec.ts`, `**/*.spec.js`, `**/*.test.ts`
+      files (any tier) — and any `siteUrl("X")` helper string. Tested
+      routes are normalized the same way.
+
+    Returns the list of production routes not present in the tested
+    set. An empty list means coverage is complete (or no UI routes
+    were changed in the diff — both are acceptable).
+
+    Skipped when no base_sha can be detected.
+    """
+    if not base_sha:
+        return []
+    try:
+        diff = subprocess.run(
+            ["git", "diff", f"{base_sha}...HEAD", "--name-status"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if diff.returncode != 0:
+            return []
+    except (subprocess.SubprocessError, OSError):
+        return []
+
+    # Production route candidates from the diff.
+    prod_routes: set[str] = set()
+    route_root_re = re.compile(
+        r"(?:^|/)(?:src/)?(?:site/src/)?(?:pages|app|routes)/(.+?)\."
+        r"(?:astro|tsx?|jsx?|vue|svelte|md|mdx)$"
+    )
+    for line in diff.stdout.splitlines():
+        # `A path` or `M path` or `R100 oldpath newpath`
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        st = parts[0]
+        path = parts[-1]
+        if st.startswith("D"):
+            continue  # deletions are not coverage concerns
+        m = route_root_re.search(path)
+        if not m:
+            continue
+        # Normalize: trailing `/index` collapses, dynamic segments
+        # become `:param`.
+        route = m.group(1)
+        route = re.sub(r"/index$", "", route)
+        route = re.sub(r"\[(?:\.\.\.)?([^\]]+)\]", r":\1", route)
+        if not route.startswith("/"):
+            route = "/" + route
+        prod_routes.add(route)
+
+    if not prod_routes:
+        return []
+
+    # Tested routes — scan every spec/test file in the diff.
+    tested: set[str] = set()
+    test_patterns = (
+        re.compile(r'page\.goto\(\s*[`"\']([^`"\']+)'),
+        re.compile(r'cy\.visit\(\s*[`"\']([^`"\']+)'),
+        re.compile(r'siteUrl\(\s*[`"\']([^`"\']+)'),
+    )
+    # Look at all spec/test files in the repo so a coverage-additive
+    # phase that adds a route plus its test in separate spec files is
+    # detected as covered.
+    try:
+        find = subprocess.run(
+            ["bash", "-c",
+             "find . -type f \\( -name '*.spec.ts' -o -name '*.spec.js' "
+             "-o -name '*.test.ts' -o -name '*.test.js' \\) "
+             "-not -path '*/node_modules/*'"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for fp in find.stdout.splitlines():
+            try:
+                body = Path(fp).read_text(errors="replace")
+            except OSError:
+                continue
+            for pat in test_patterns:
+                for m in pat.finditer(body):
+                    route = m.group(1).strip()
+                    # Strip protocol+host if absolute.
+                    route = re.sub(r"^https?://[^/]+", "", route)
+                    # Strip trailing slashes and query/hash.
+                    route = re.sub(r"[?#].*$", "", route)
+                    route = route.rstrip("/")
+                    # Strip BASE_URL-like prefixes (e.g. /kanix/).
+                    # Heuristic: try both with and without one leading segment.
+                    if not route.startswith("/"):
+                        route = "/" + route
+                    tested.add(route)
+                    # Also add a version with the first segment dropped.
+                    parts = route.split("/", 2)
+                    if len(parts) >= 3:
+                        tested.add("/" + parts[2])
+    except (subprocess.SubprocessError, OSError):
+        return []
+
+    uncovered: list[str] = []
+    for r in sorted(prod_routes):
+        # Match by exact equality OR by suffix (so `/loadouts/pro`
+        # matches if any test references that suffix).
+        hit = any(
+            t == r or t.endswith(r) or r.endswith(t)
+            for t in tested
+        )
+        if not hit:
+            uncovered.append(r)
+    return uncovered
 
 
 def _discover_test_commands() -> list[tuple[str, str]]:
@@ -9358,10 +9765,1257 @@ The full history of CI attempts is in `{debug_dir}/`. Reference it for the learn
 """
 
 
+# ── Meta-planner: planning brief + supervisor loop ─────────────────────
+#
+# Opt-in via --use-meta-planner. Two features:
+#
+#   1. specs/META.md (the "planning brief"): a dense, repo-wide markdown
+#      summary of every prior Claude Code planning session in this repo,
+#      regenerated synchronously when source planning material changes.
+#      Acts as the cache target for downstream agents.
+#
+#   2. Meta-planner loop: a single Opus 4.7 agent that ticks on its own
+#      cadence (default 15min), reads tasks.md + run-log.jsonl tail +
+#      recent review files, and emits a unified diff against tasks.md
+#      to nudge the executor pool. It cannot touch code or evidence —
+#      only tasks.md.
+#
+# Both features are NO-OPs unless --use-meta-planner is set.
+
+_META_BRIEF_PATH = Path("specs") / "META.md"
+_META_HASH_PATH = Path("specs") / ".META.hash"
+_META_LOCK_PATH = Path("specs") / ".META.lock"
+_META_LOG_PATH = Path("specs") / ".meta-planner-log.jsonl"
+_META_LOGS_DIR = Path("specs") / ".meta-planner-logs"
+
+_BRIEF_GENERATOR_TIMEOUT_S = 300  # 5 minutes — Opus max effort can be slow
+_META_PLANNER_TIMEOUT_S = 600    # 10 minutes per tick
+_META_PLANNER_DIFF_LINE_CAP = 200
+_META_PLANNER_DEFAULT_INTERVAL_MIN = 15
+
+
+def _meta_log(event: str, **fields) -> None:
+    """Append an audit record to specs/.meta-planner-log.jsonl.
+
+    Best-effort — never raises. Used for both brief regen and the loop
+    so a single grep on the file reconstructs every meta-planner decision.
+    """
+    try:
+        _META_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "timestamp": datetime.now().isoformat(),
+            "event": event,
+            **fields,
+        }
+        with open(_META_LOG_PATH, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+def _global_session_dir() -> Path:
+    """Path to Claude Code's per-repo session directory under ~/.claude/."""
+    repo_slug = str(Path.cwd().resolve()).replace("/", "-")
+    if not repo_slug.startswith("-"):
+        repo_slug = "-" + repo_slug
+    return Path.home() / ".claude" / "projects" / repo_slug
+
+
+def _pinned_jsonls_for_feature(spec_dir: Path) -> list[Path]:
+    """JSONLs pinned at specs/<feature>/planning-sessions/*.jsonl.
+
+    These take precedence over the global Claude Code session directory
+    so the brief can be regenerated reproducibly across machines and the
+    inputs are auditable in git.
+    """
+    pinned_dir = spec_dir / "planning-sessions"
+    if not pinned_dir.is_dir():
+        return []
+    try:
+        return sorted(pinned_dir.glob("*.jsonl"))
+    except OSError:
+        return []
+
+
+def _planning_jsonls() -> list[Path]:
+    """Return sorted JSONL session files for the brief generator.
+
+    Precedence:
+      1. Any specs/<feature>/planning-sessions/*.jsonl files (pinned,
+         per-feature, committed). When ANY feature has pinned files, the
+         global ~/.claude/projects/<repo-slug>/ is ignored entirely —
+         pinning is opt-in but exclusive once you start. This keeps the
+         brief reproducible.
+      2. Fallback: global ~/.claude/projects/<repo-slug>/*.jsonl (live,
+         per-machine, not version-controlled).
+
+    Missing dir or no files in both → empty list (brief generator will
+    fall back to reading spec artifacts + reference files directly).
+    """
+    specs_root = Path("specs")
+    pinned: list[Path] = []
+    if specs_root.is_dir():
+        for spec_dir in sorted(specs_root.iterdir()):
+            if not spec_dir.is_dir() or spec_dir.name.startswith("."):
+                continue
+            pinned.extend(_pinned_jsonls_for_feature(spec_dir))
+    if pinned:
+        return pinned
+
+    session_dir = _global_session_dir()
+    if not session_dir.is_dir():
+        return []
+    try:
+        return sorted(session_dir.glob("*.jsonl"))
+    except OSError:
+        return []
+
+
+def _spec_kit_reference_files() -> list[Path]:
+    """All markdown files under the spec-kit skill's reference/ and phases/
+    directories. Used as a fallback knowledge base for the brief generator
+    when a feature has no pinned planning JSONLs.
+
+    Stable absolute paths → Read tool cache hits across regen runs.
+    """
+    out: list[Path] = []
+    skill_root = Path(__file__).parent
+    for sub in ("reference", "phases"):
+        d = skill_root / sub
+        if not d.is_dir():
+            continue
+        try:
+            out.extend(sorted(p for p in d.glob("*.md") if p.is_file()))
+        except OSError:
+            continue
+    return out
+
+
+def _planning_spec_files() -> list[Path]:
+    """Every spec.md / plan.md / data-model.md / workflows.md / research.md
+    under specs/, excluding META.md and dotfiles."""
+    specs_root = Path("specs")
+    if not specs_root.is_dir():
+        return []
+    names = ("spec.md", "plan.md", "data-model.md", "workflows.md", "research.md")
+    out: list[Path] = []
+    try:
+        for spec_dir in sorted(specs_root.iterdir()):
+            if not spec_dir.is_dir():
+                continue
+            if spec_dir.name.startswith("."):
+                continue
+            for name in names:
+                p = spec_dir / name
+                if p.is_file():
+                    out.append(p)
+    except OSError:
+        pass
+    return out
+
+
+def _planning_task_ids() -> set[str]:
+    """The set of all task IDs across every specs/*/tasks.md.
+
+    Used by the staleness hash: a tasks.md modification that flips
+    `[ ]` → `[x]` doesn't add or remove IDs, so the hash is unchanged.
+    A modification that adds a new task ID does change the hash.
+    """
+    specs_root = Path("specs")
+    ids: set[str] = set()
+    if not specs_root.is_dir():
+        return ids
+    try:
+        for spec_dir in sorted(specs_root.iterdir()):
+            if not spec_dir.is_dir() or spec_dir.name.startswith("."):
+                continue
+            tasks = spec_dir / "tasks.md"
+            if not tasks.is_file():
+                continue
+            try:
+                text = tasks.read_text()
+            except OSError:
+                continue
+            # Match `T123` / `T123a` style IDs only at line/section starts
+            # so prose mentions don't count.
+            for m in re.finditer(r"^\s*-\s*\[[ x!~]\]\s*\*?\*?([A-Z]+\d+\w*)",
+                                 text, re.MULTILINE):
+                ids.add(m.group(1))
+    except OSError:
+        pass
+    return ids
+
+
+def _planning_brief_specs_included() -> list[str]:
+    """Specs the brief should reference, as relative paths.
+
+    Drives the auto-regen-on-new-feature trigger: when this list contains
+    a name not present in the prior brief's frontmatter, the brief is
+    forced stale even if the hash matches.
+    """
+    return sorted({str(p) for p in _planning_spec_files()})
+
+
+def _read_brief_specs_included() -> set[str]:
+    """Parse the `specs_included:` block from the current specs/META.md.
+
+    Returns the empty set when the file is missing or has no frontmatter.
+    """
+    if not _META_BRIEF_PATH.is_file():
+        return set()
+    try:
+        text = _META_BRIEF_PATH.read_text()
+    except OSError:
+        return set()
+    if not text.startswith("---\n"):
+        return set()
+    # Find end of frontmatter
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return set()
+    fm = text[4:end]
+    out: set[str] = set()
+    in_specs = False
+    for line in fm.splitlines():
+        if line.startswith("specs_included:"):
+            in_specs = True
+            continue
+        if in_specs:
+            stripped = line.lstrip()
+            if stripped.startswith("- "):
+                out.add(stripped[2:].strip())
+            elif line and not line.startswith(" "):
+                # Left the specs_included block
+                in_specs = False
+    return out
+
+
+def _planning_source_hash() -> str:
+    """Hash of (jsonls + mtimes) ∪ (planning .md + mtimes) ∪ (task IDs).
+
+    The point of the hash: tasks.md being touched to flip `[ ]` → `[x]`
+    on an existing ID changes its mtime but NOT the set of IDs, so the
+    overall hash stays the same. Adding a brand new ID or modifying any
+    of the planning .md files DOES change the hash.
+    """
+    h = hashlib.sha256()
+    for jsonl in _planning_jsonls():
+        try:
+            mtime = jsonl.stat().st_mtime
+        except OSError:
+            continue
+        h.update(f"jsonl:{jsonl}:{mtime}\n".encode())
+    for md in _planning_spec_files():
+        try:
+            mtime = md.stat().st_mtime
+        except OSError:
+            continue
+        h.update(f"md:{md}:{mtime}\n".encode())
+    for tid in sorted(_planning_task_ids()):
+        h.update(f"tid:{tid}\n".encode())
+    return h.hexdigest()
+
+
+def _planning_brief_is_stale(force: bool = False) -> tuple[bool, str]:
+    """True iff specs/META.md needs to be regenerated.
+
+    Returns (stale, reason). Reasons (for logging):
+      - "forced"                 — caller passed force=True
+      - "missing"                — specs/META.md does not exist
+      - "hash-mismatch"          — recorded hash differs from current
+      - "new-spec-dir:<name>"    — a planning spec exists that isn't in
+                                   the brief's specs_included frontmatter
+      - "fresh"                  — no regen needed
+    """
+    if force:
+        return True, "forced"
+    if not _META_BRIEF_PATH.is_file():
+        return True, "missing"
+    current_hash = _planning_source_hash()
+    try:
+        recorded = _META_HASH_PATH.read_text().strip() if _META_HASH_PATH.is_file() else ""
+    except OSError:
+        recorded = ""
+    if recorded != current_hash:
+        return True, "hash-mismatch"
+    recorded_specs = _read_brief_specs_included()
+    current_specs = set(_planning_brief_specs_included())
+    new = current_specs - recorded_specs
+    if new:
+        return True, f"new-spec-dir:{sorted(new)[0]}"
+    return False, "fresh"
+
+
+_BRIEF_STRUCTURE = """---
+generated_at: <ISO timestamp>
+source_hash: <hex>
+sources:
+  - uuid: <jsonl-uuid>
+    first_user_msg: "<first 200 chars>"
+    started: <iso>
+    role: diagnosis | planning | strategist | unclassified
+  - ...
+specs_included:
+  - <feature>/spec.md
+  - <feature>/plan.md
+  - ...
+---
+
+# Project Planning Brief
+
+## Cross-feature context
+<things true of the whole repo: tech stack, conventions, hard constraints,
+recurring failure modes, what the user values vs. tolerates>
+
+## Feature: <name>
+### Discoveries
+- <what the diagnosis sessions surfaced — bugs, root causes, dead ends>
+### Decisions
+- <architectural choices made during planning, with the reason>
+### Watch-for
+- <gotchas an executor or meta-planner must avoid; failure modes the planning
+  sessions explicitly anticipated>
+### Open questions
+- <known unknowns the planner flagged but didn't resolve>
+
+## Feature: <next>
+...
+"""
+
+
+def _build_brief_generator_prompt(jsonls: list[Path],
+                                  spec_files: list[Path],
+                                  source_hash: str,
+                                  reference_files: Optional[list[Path]] = None,
+                                  features_without_jsonls: Optional[list[str]] = None) -> str:
+    jsonl_block = "\n".join(f"  - {p}" for p in jsonls) or "  (none)"
+    md_block = "\n".join(f"  - {p}" for p in spec_files) or "  (none)"
+    ref_block = "\n".join(f"  - {p}" for p in (reference_files or [])) or "  (none — skill not on PATH)"
+    no_jsonl_block = "\n".join(f"  - {f}" for f in (features_without_jsonls or [])) or "  (none — every feature has at least one pinned JSONL)"
+
+    return f"""You are generating a planning brief for a spec-kit project.
+
+INPUTS — read all of these:
+
+(1) JSONL session files (the primary planning record):
+{jsonl_block}
+
+(2) Planning markdown files (per-feature artifacts on disk):
+{md_block}
+
+(3) Spec-kit reference / phase knowledge base (consult as needed — these
+    define the rules and conventions every feature is expected to follow,
+    and they are the de-facto planning context for features that have no
+    JSONL):
+{ref_block}
+
+FEATURES WITHOUT PINNED JSONLs — for each of these, the founding planning
+session is not available. Derive that feature's section from its on-disk
+artifacts (spec.md, plan.md, data-model.md, research.md, workflows.md,
+interview-notes.md, learnings.md) PLUS the spec-kit reference docs. Mark
+its Discoveries / Decisions / Watch-for / Open questions accordingly and
+add a one-line note in the section explaining the JSONL is unavailable:
+{no_jsonl_block}
+
+OUTPUT — write exactly one file: specs/META.md
+SCHEMA — the file MUST match this structure:
+{_BRIEF_STRUCTURE}
+
+Additionally, the frontmatter `source_hash:` field MUST be exactly:
+  {source_hash}
+
+RULES:
+- Print only the literal string "OK" to stdout. Nothing else.
+- Do not explain what you wrote. Do not summarize your reasoning.
+- The brief is read by other agents — be dense, factual, specific. No
+  filler. No "the user asked", no "the agent then", no chit-chat.
+- For each Discovery / Decision / Watch-for / Open question, lead with
+  the specific concrete fact, then a parenthetical with file:line or
+  session UUID for traceability.
+- For features WITHOUT JSONLs, traceability points at the on-disk artifact
+  (e.g. `specs/admin/plan.md:142`) rather than a session UUID.
+- Length budget: 15-25k tokens. Compress aggressively but do not omit
+  load-bearing constraints.
+- If two sessions cover the same feature, merge their content under
+  one Feature heading. Do not duplicate.
+- Sources frontmatter must list every JSONL you read with role inferred
+  from its first user message. For features without JSONLs, add an entry
+  to sources with uuid="(no-jsonl)" and role="derived-from-artifacts".
+- specs_included frontmatter must list every planning markdown file you
+  read, as paths relative to the repo root (e.g. `specs/001-foo/spec.md`).
+- The Cross-feature context section MUST capture the spec-kit conventions
+  the reference docs encode (testing discipline, proof-discipline, etc.)
+  when they shape what the executors and meta-planner must do.
+
+Exit with status 0 when the file is written.
+"""
+
+
+def _spawn_brief_generator(model: str = "claude-opus-4-7",
+                           log_fn=None) -> bool:
+    """Synchronously invoke the brief generator. Returns True on success.
+
+    Writes specs/META.md and specs/.META.hash on success. Logs the
+    invocation to specs/.meta-planner-log.jsonl with token usage.
+    """
+    jsonls = _planning_jsonls()
+    spec_files = _planning_spec_files()
+    source_hash = _planning_source_hash()
+    reference_files = _spec_kit_reference_files()
+
+    # Identify features that lack pinned JSONLs so the prompt can tell the
+    # generator to fall back to artifact + reference reading for them.
+    features_without_jsonls: list[str] = []
+    specs_root = Path("specs")
+    if specs_root.is_dir():
+        for spec_dir in sorted(specs_root.iterdir()):
+            if not spec_dir.is_dir() or spec_dir.name.startswith("."):
+                continue
+            if not _pinned_jsonls_for_feature(spec_dir):
+                features_without_jsonls.append(spec_dir.name)
+
+    prompt = _build_brief_generator_prompt(
+        jsonls, spec_files, source_hash,
+        reference_files=reference_files,
+        features_without_jsonls=features_without_jsonls,
+    )
+
+    _META_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stderr_path = _META_LOGS_DIR / f"brief-{ts}.stderr"
+    stdout_path = _META_LOGS_DIR / f"brief-{ts}.stdout"
+
+    claude_cmd = [
+        "claude",
+        "--print",
+        "--output-format", "json",
+        "--model", model,
+        "--dangerously-skip-permissions",
+        prompt,
+    ]
+
+    if _sandbox_enabled and _bwrap_path:
+        cmd = _build_sandbox_cmd(Path.cwd(), claude_cmd)
+        env = _build_sandbox_env(capabilities=set())
+    else:
+        cmd = claude_cmd
+        env = dict(os.environ)
+        env.pop("CLAUDECODE", None)
+        env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        token_file = Path.home() / ".claude" / "token"
+        claude_oauth = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+        if not claude_oauth and token_file.is_file():
+            try:
+                claude_oauth = token_file.read_text().strip()
+            except OSError:
+                pass
+        if claude_oauth:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = claude_oauth
+
+    if log_fn:
+        log_fn(f"meta-planner: regenerating specs/META.md (model={model})")
+    _meta_log("brief_regen_start", model=model,
+              jsonls=len(jsonls), spec_files=len(spec_files),
+              source_hash=source_hash)
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=open(stdout_path, "w"),
+            stderr=open(stderr_path, "w"),
+            stdin=subprocess.DEVNULL,
+            env=env,
+            timeout=_BRIEF_GENERATOR_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        _meta_log("brief_regen_timeout",
+                  elapsed_s=int(time.monotonic() - started),
+                  stderr_log=str(stderr_path))
+        if log_fn:
+            log_fn(f"meta-planner: brief regen TIMED OUT after "
+                   f"{_BRIEF_GENERATOR_TIMEOUT_S}s — keeping existing brief")
+        return False
+    except (FileNotFoundError, OSError) as e:
+        _meta_log("brief_regen_error", error=str(e))
+        if log_fn:
+            log_fn(f"meta-planner: brief regen failed: {e}")
+        return False
+
+    elapsed = int(time.monotonic() - started)
+    rc = result.returncode
+
+    # Parse JSON result for token usage if possible
+    usage = {}
+    try:
+        stdout_text = stdout_path.read_text()
+        # --output-format json prints a single JSON envelope; the literal
+        # "OK" the prompt asks for is the `.result` field's content.
+        envelope = json.loads(stdout_text) if stdout_text.strip() else {}
+        if isinstance(envelope, dict):
+            usage = envelope.get("usage", {}) or {}
+            result_text = envelope.get("result", "") or ""
+            if len(result_text) > 100:
+                _meta_log("brief_generator_chatty",
+                          result_len=len(result_text))
+                if log_fn:
+                    log_fn("meta-planner: warning — generator emitted "
+                           f"{len(result_text)} chars instead of just OK")
+    except (json.JSONDecodeError, OSError):
+        pass
+
+    if rc != 0 or not _META_BRIEF_PATH.is_file():
+        _meta_log("brief_regen_fail", returncode=rc, elapsed_s=elapsed,
+                  stderr_log=str(stderr_path))
+        if log_fn:
+            log_fn(f"meta-planner: brief regen FAILED (rc={rc}). "
+                   f"See {stderr_path}")
+        return False
+
+    # Persist the hash that the brief was generated against, so the next
+    # staleness check sees a match.
+    try:
+        _META_HASH_PATH.write_text(source_hash + "\n")
+    except OSError:
+        pass
+
+    _meta_log("brief_regen_ok", elapsed_s=elapsed,
+              input_tokens=usage.get("input_tokens"),
+              output_tokens=usage.get("output_tokens"),
+              cache_read_tokens=usage.get("cache_read_input_tokens"),
+              cache_creation_tokens=usage.get("cache_creation_input_tokens"),
+              source_hash=source_hash)
+    if log_fn:
+        log_fn(f"meta-planner: brief regenerated in {elapsed}s")
+    return True
+
+
+_META_GITIGNORE_BLOCK = """
+# Meta-planner (parallel_runner.py --use-meta-planner) — generated artifacts.
+# specs/META.md IS committed (it's a checked-in planning brief). Everything
+# else is per-checkout state.
+specs/.META.hash
+specs/.META.lock
+specs/.meta-planner-log.jsonl
+specs/.meta-planner-logs/
+# Interactive-mode fork folders (--meta-planner-interactive). Plain copies
+# of the repo for scratchpad work; not tracked.
+.agent-work/
+"""
+
+
+def _ensure_meta_planner_gitignore() -> None:
+    """Append the meta-planner ignore block to .gitignore if missing.
+
+    Idempotent: checks for a unique sentinel string from the block before
+    appending. Best-effort — never raises.
+    """
+    gi = Path(".gitignore")
+    sentinel = "specs/.meta-planner-log.jsonl"
+    try:
+        if gi.is_file():
+            existing = gi.read_text()
+            if sentinel in existing:
+                return
+            with open(gi, "a") as f:
+                if not existing.endswith("\n"):
+                    f.write("\n")
+                f.write(_META_GITIGNORE_BLOCK)
+        else:
+            gi.write_text(_META_GITIGNORE_BLOCK.lstrip())
+    except OSError:
+        pass
+
+
+def _ensure_planning_brief(force: bool = False, log_fn=None) -> bool:
+    """Regenerate specs/META.md if stale. Idempotent.
+
+    Honors SPEC_KIT_SKIP_BRIEF_REGEN=1 (kill switch). Uses an flock on
+    specs/.META.lock so concurrent runner invocations don't race.
+
+    Returns True if the brief is fresh (regenerated or already current),
+    False if regen was attempted and failed.
+    """
+    if os.environ.get("SPEC_KIT_SKIP_BRIEF_REGEN"):
+        if log_fn:
+            log_fn("meta-planner: SPEC_KIT_SKIP_BRIEF_REGEN set — skipping "
+                   "brief regen")
+        return True
+
+    # First-touch: make sure the generated artifacts won't pollute git.
+    _ensure_meta_planner_gitignore()
+
+    stale, reason = _planning_brief_is_stale(force=force)
+    if not stale:
+        return True
+
+    # Need to regen. Acquire the lock so concurrent invocations serialize.
+    _META_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lock_fd = open(_META_LOCK_PATH, "w")
+    except OSError as e:
+        _meta_log("brief_lock_error", error=str(e))
+        return False
+    try:
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+        except OSError as e:
+            _meta_log("brief_lock_error", error=str(e))
+            return False
+        # Recheck under the lock — someone else may have regenerated while
+        # we waited.
+        stale_recheck, reason_recheck = _planning_brief_is_stale(force=force)
+        if not stale_recheck:
+            return True
+        _meta_log("brief_stale_detected", reason=reason_recheck)
+        return _spawn_brief_generator(log_fn=log_fn)
+    finally:
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            lock_fd.close()
+        except OSError:
+            pass
+
+
+# ── Meta-planner loop helpers ─────────────────────────────────────────
+
+
+def _infer_active_feature_from_run_log(spec_dirs: list[str]) -> Optional[str]:
+    """Return the spec_dir whose run-log.jsonl had the most recent
+    task_spawn event. Falls back to mtime of tasks.md if no events.
+
+    Used by the meta-planner thread to decide which feature it should
+    target this tick.
+    """
+    best: tuple[float, Optional[str]] = (0.0, None)
+    for sd in spec_dirs:
+        log = Path(sd) / "run-log.jsonl"
+        if log.is_file():
+            try:
+                with open(log) as f:
+                    last_ts = 0.0
+                    for line in f:
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if rec.get("event") != "task_spawn":
+                            continue
+                        ts_str = rec.get("timestamp", "")
+                        try:
+                            ts = datetime.fromisoformat(ts_str).timestamp()
+                            last_ts = max(last_ts, ts)
+                        except ValueError:
+                            continue
+                    if last_ts > best[0]:
+                        best = (last_ts, sd)
+            except OSError:
+                pass
+    if best[1]:
+        return best[1]
+    # Fallback: pick the spec_dir whose tasks.md has the newest mtime.
+    fallback_best: tuple[float, Optional[str]] = (0.0, None)
+    for sd in spec_dirs:
+        tasks = Path(sd) / "tasks.md"
+        if tasks.is_file():
+            try:
+                mtime = tasks.stat().st_mtime
+                if mtime > fallback_best[0]:
+                    fallback_best = (mtime, sd)
+            except OSError:
+                pass
+    return fallback_best[1]
+
+
+def _task_ids_touched_since(spec_dir: str, since_ts: float) -> set[str]:
+    """Set of task IDs that have task_spawn events newer than since_ts.
+
+    Drives the forward-only rule: meta-planner cannot edit a task that an
+    executor has started since the last meta-planner tick.
+    """
+    out: set[str] = set()
+    log = Path(spec_dir) / "run-log.jsonl"
+    if not log.is_file():
+        return out
+    try:
+        with open(log) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("event") != "task_spawn":
+                    continue
+                ts_str = rec.get("timestamp", "")
+                try:
+                    ts = datetime.fromisoformat(ts_str).timestamp()
+                except ValueError:
+                    continue
+                if ts < since_ts:
+                    continue
+                tid = rec.get("task_id")
+                if tid:
+                    out.add(tid)
+    except OSError:
+        pass
+    return out
+
+
+def _recent_run_log_tail(spec_dir: str, since_ts: float,
+                        max_lines: int = 200) -> list[str]:
+    """Return run-log.jsonl entries newer than since_ts (max max_lines)."""
+    log = Path(spec_dir) / "run-log.jsonl"
+    out: list[str] = []
+    if not log.is_file():
+        return out
+    try:
+        with open(log) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts_str = rec.get("timestamp", "")
+                try:
+                    ts = datetime.fromisoformat(ts_str).timestamp()
+                except ValueError:
+                    continue
+                if ts >= since_ts:
+                    out.append(line.rstrip())
+    except OSError:
+        pass
+    return out[-max_lines:]
+
+
+def _recent_review_files(spec_dir: str, since_ts: float) -> list[Path]:
+    """Recent review-*.md files under specs/<feature>/validate/."""
+    out: list[Path] = []
+    vdir = Path(spec_dir) / "validate"
+    if not vdir.is_dir():
+        return out
+    try:
+        for phase_dir in vdir.iterdir():
+            if not phase_dir.is_dir():
+                continue
+            for review in phase_dir.glob("review-*.md"):
+                try:
+                    if review.stat().st_mtime >= since_ts:
+                        out.append(review)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+def _hunk_target_task_ids(hunk_lines: list[str]) -> set[str]:
+    """Extract the task IDs a unified-diff hunk touches.
+
+    Looks at added/removed lines for `T123` / `T123a` style IDs in the
+    leading position (matches the same pattern as _planning_task_ids).
+    Used by the forward-only enforcement to strip hunks affecting tasks
+    an executor already picked up.
+    """
+    ids: set[str] = set()
+    for line in hunk_lines:
+        if not (line.startswith("+") or line.startswith("-")):
+            continue
+        # Skip diff headers (+++/---).
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        for m in re.finditer(r"\*?\*?([A-Z]+\d+\w*)\*?\*?", line):
+            ids.add(m.group(1))
+    return ids
+
+
+def _split_diff_into_hunks(diff_text: str) -> tuple[list[str], list[list[str]]]:
+    """Split a unified diff into (header_lines, hunks).
+
+    Headers: everything before the first `@@` (file headers + any preamble).
+    Each hunk starts with `@@` and continues until the next `@@` or EOF.
+    """
+    lines = diff_text.splitlines(keepends=True)
+    headers: list[str] = []
+    hunks: list[list[str]] = []
+    current: Optional[list[str]] = None
+    for line in lines:
+        if line.startswith("@@"):
+            if current is not None:
+                hunks.append(current)
+            current = [line]
+        elif current is None:
+            headers.append(line)
+        else:
+            current.append(line)
+    if current is not None:
+        hunks.append(current)
+    return headers, hunks
+
+
+def _diff_touches_only(diff_text: str, allowed_paths: set[str]) -> tuple[bool, set[str]]:
+    """Validate that a unified diff modifies only files in allowed_paths.
+
+    Returns (ok, files_seen). Files are extracted from `+++ b/<path>` and
+    `--- a/<path>` headers. allowed_paths entries are matched verbatim
+    (e.g. "specs/001-foo/tasks.md").
+    """
+    seen: set[str] = set()
+    for line in diff_text.splitlines():
+        if line.startswith("+++ ") or line.startswith("--- "):
+            parts = line.split(maxsplit=1)
+            if len(parts) < 2:
+                continue
+            path = parts[1].strip()
+            if path.startswith("a/") or path.startswith("b/"):
+                path = path[2:]
+            if path == "/dev/null":
+                continue
+            seen.add(path)
+    return (seen.issubset(allowed_paths), seen)
+
+
+def _build_meta_planner_prompt(spec_dir: str, since_ts: float,
+                               recent_log_lines: list[str],
+                               recent_reviews: list[Path]) -> str:
+    """Assemble the dynamic-delta prompt for the meta-planner agent.
+
+    Stable Tier-1 references (specs/META.md, spec-kit phase/reference
+    files) are listed by absolute path so the agent reads them itself
+    and benefits from Claude Code's cross-spawn Read cache.
+    """
+    feature = Path(spec_dir).name
+    tasks_path = Path(spec_dir) / "tasks.md"
+    blocked_path = Path(spec_dir) / "BLOCKED.md"
+    since_iso = datetime.fromtimestamp(since_ts).isoformat()
+
+    # Tier-1 stable paths (cache target). Scoped to what the SUPERVISOR
+    # actually needs: planning context (META), task-list authoring rules
+    # (phases/tasks.md + traceability), what executors do (phases/implement),
+    # file schemas it must parse (agent-file-schemas, validate-review), the
+    # silent-skip rule (proof-discipline — so it doesn't propose vacuous
+    # tasks), and parallel-safety semantics (interface-contracts, phase-deps).
+    #
+    # Deliberately omitted:
+    # - fix-agent-playbook.md / verification.md — for different roles
+    # - reference/index.md — supervisor doesn't lazy-load; explicit list above
+    refs = [
+        str(_META_BRIEF_PATH.resolve()),
+    ]
+    # Constitution is repo-wide constraint — only some presets have one.
+    constitution = Path(".specify/memory/constitution.md")
+    if constitution.is_file():
+        refs.append(str(constitution.resolve()))
+    skill_dir = Path(__file__).parent
+    refs.extend([
+        str((skill_dir / "phases" / "tasks.md").resolve()),
+        str((skill_dir / "phases" / "implement.md").resolve()),
+        str(_REF_DIR / "traceability.md"),
+        str(_REF_DIR / "agent-file-schemas.md"),
+        str(_REF_DIR / "validate-review.md"),
+        str(_REF_DIR / "proof-discipline.md"),
+        str(_REF_DIR / "interface-contracts.md"),
+        str(_REF_DIR / "phase-deps.md"),
+    ])
+    refs_block = "\n".join(f"- {p}" for p in refs)
+
+    reviews_block = "\n".join(f"- {p}" for p in recent_reviews) or "  (none)"
+    blocked_block = (
+        f"- {blocked_path} EXISTS — read it"
+        if blocked_path.is_file() else "  (none)"
+    )
+    log_tail = "\n".join(recent_log_lines[-50:]) or "  (no events since last tick)"
+
+    return f"""You are the meta-planner for a spec-kit execution. You watch a pool of
+executor agents and amend specs/{feature}/tasks.md to keep them on track.
+
+REQUIRED READS (cached across ticks — read each with the Read tool):
+{refs_block}
+
+CURRENT FEATURE: {feature}
+SINCE TIMESTAMP: {since_iso}
+
+DYNAMIC INPUTS:
+- Current tasks.md: {tasks_path}
+- Recent review files (modified since {since_iso}):
+{reviews_block}
+- BLOCKED.md status:
+{blocked_block}
+- run-log.jsonl tail (most recent {len(recent_log_lines)} events since last tick):
+```
+{log_tail}
+```
+
+YOUR JOB:
+Decide whether tasks.md needs to change based on what executors have been
+doing since {since_iso}. Reasons to change:
+- An executor wrote BLOCKED.md → insert an investigation task before the
+  blocked one, or relax the blocked task's done-criteria with a reason.
+- A review-*.md surfaces a gap not covered by the existing task list →
+  append a follow-up task in the affected phase.
+- An executor produced output that violated a planning constraint (see
+  Watch-for sections of specs/META.md) → mark the task [!] for rework
+  and add a clarifying note inline.
+- Two parallel tasks are stepping on each other → drop the [P] from one.
+- A task as written is unachievable given new info → split it into
+  smaller tasks or mark it [~] (skipped) with a reason.
+
+DO NOT:
+- Edit any task whose ID appears in run-log.jsonl events newer than
+  {since_iso} (the runner will strip those hunks anyway, but try to
+  avoid producing them).
+- Add tasks that contradict specs/META.md's Decisions section.
+- Touch any file other than specs/{feature}/tasks.md.
+- Write reasoning prose. Your output IS the diff.
+
+OUTPUT (strict — anything else is treated as malformed and discarded):
+- If no change needed: print exactly "NOCHANGE" to stdout. Exit 0.
+- Otherwise: print a unified diff (the kind `patch -p1` accepts) of
+  tasks.md changes to stdout. No header text. No trailing explanation.
+  Headers MUST be:
+    --- a/specs/{feature}/tasks.md
+    +++ b/specs/{feature}/tasks.md
+  Exit 0.
+
+The diff will be rejected if:
+- It touches any file other than specs/{feature}/tasks.md.
+- It is longer than {_META_PLANNER_DIFF_LINE_CAP} lines total.
+- It edits a task that an executor already picked up since {since_iso}.
+"""
+
+
+def _spawn_meta_planner_invocation(prompt: str, model: str,
+                                   log_fn=None) -> tuple[int, str, str]:
+    """Run the meta-planner claude invocation. Returns (rc, stdout, stderr_path).
+
+    Sandbox restricts writes — agent is forbidden from touching anything
+    other than its log output. We don't apply the diff inside the sandbox;
+    the diff comes back on stdout and the runner (outside the sandbox)
+    decides whether to apply it.
+    """
+    _META_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stderr_path = _META_LOGS_DIR / f"meta-planner-{ts}.stderr"
+    stdout_path = _META_LOGS_DIR / f"meta-planner-{ts}.stdout"
+
+    claude_cmd = [
+        "claude",
+        "--print",
+        "--output-format", "json",
+        "--model", model,
+        "--dangerously-skip-permissions",
+        prompt,
+    ]
+
+    if _sandbox_enabled and _bwrap_path:
+        cmd = _build_sandbox_cmd(Path.cwd(), claude_cmd)
+        env = _build_sandbox_env(capabilities=set())
+    else:
+        cmd = claude_cmd
+        env = dict(os.environ)
+        env.pop("CLAUDECODE", None)
+        env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        token_file = Path.home() / ".claude" / "token"
+        claude_oauth = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+        if not claude_oauth and token_file.is_file():
+            try:
+                claude_oauth = token_file.read_text().strip()
+            except OSError:
+                pass
+        if claude_oauth:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = claude_oauth
+
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=open(stdout_path, "w"),
+            stderr=open(stderr_path, "w"),
+            stdin=subprocess.DEVNULL,
+            env=env,
+            timeout=_META_PLANNER_TIMEOUT_S,
+        )
+        rc = result.returncode
+    except subprocess.TimeoutExpired:
+        _meta_log("meta_planner_timeout", stderr_log=str(stderr_path))
+        if log_fn:
+            log_fn("meta-planner: tick TIMED OUT — treating as NOCHANGE")
+        return (-1, "NOCHANGE", str(stderr_path))
+    except (FileNotFoundError, OSError) as e:
+        _meta_log("meta_planner_invoke_error", error=str(e))
+        if log_fn:
+            log_fn(f"meta-planner: invocation failed: {e}")
+        return (-1, "NOCHANGE", str(stderr_path))
+
+    try:
+        envelope_text = stdout_path.read_text()
+        envelope = json.loads(envelope_text) if envelope_text.strip() else {}
+        diff_text = envelope.get("result", "") if isinstance(envelope, dict) else ""
+        # Capture usage for the audit log
+        usage = envelope.get("usage", {}) if isinstance(envelope, dict) else {}
+        if usage:
+            _meta_log("meta_planner_usage",
+                      input_tokens=usage.get("input_tokens"),
+                      output_tokens=usage.get("output_tokens"),
+                      cache_read_tokens=usage.get("cache_read_input_tokens"),
+                      cache_creation_tokens=usage.get("cache_creation_input_tokens"))
+    except (json.JSONDecodeError, OSError):
+        diff_text = ""
+
+    return (rc, diff_text, str(stderr_path))
+
+
+# ── Meta-planner one-shot + interactive modes ─────────────────────────
+
+
+def _meta_planner_run_once(spec_dir: Optional[str],
+                           model: str,
+                           log_fn=None) -> int:
+    """Run one supervisor tick and exit. Returns process exit code.
+
+    Behavior:
+      1. Regen specs/META.md if stale (honors SPEC_KIT_SKIP_BRIEF_REGEN).
+      2. Resolve target feature: explicit spec_dir if passed, else
+         _infer_active_feature_from_run_log over specs/.
+      3. Spawn supervisor with since_ts = (now - 1 hour) so it sees recent
+         activity but not the entire run-log.
+      4. Validate + apply diff, or report NOCHANGE. Either way exit.
+
+    The "since" window for one-shot is arbitrary — there's no "last tick"
+    to anchor it to. 1 hour is enough to catch a typical execution batch
+    without overwhelming the prompt.
+    """
+    log = log_fn or (lambda m: print(m, file=sys.stderr, flush=True))
+
+    # Step 1: brief regen
+    if not _ensure_planning_brief(log_fn=log):
+        log("meta-planner-once: brief regen failed — aborting")
+        return 1
+
+    # Step 2: resolve target
+    if spec_dir:
+        target = spec_dir
+        if not (Path(target) / "tasks.md").is_file():
+            log(f"meta-planner-once: {target}/tasks.md does not exist")
+            return 1
+    else:
+        if not Path("specs").is_dir():
+            log("meta-planner-once: no specs/ directory")
+            return 1
+        candidates = [
+            str(d) for d in Path("specs").iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        ]
+        target = _infer_active_feature_from_run_log(candidates)
+        if not target:
+            log("meta-planner-once: could not infer active feature "
+                "(no run-log.jsonl, no tasks.md mtime to compare). "
+                "Pass [spec_dir] explicitly.")
+            return 1
+        log(f"meta-planner-once: targeting {Path(target).name}")
+
+    # Step 3: spawn supervisor
+    since_ts = time.time() - 3600  # 1 hour window
+    recent_log = _recent_run_log_tail(target, since_ts)
+    recent_reviews = _recent_review_files(target, since_ts)
+    prompt = _build_meta_planner_prompt(target, since_ts, recent_log, recent_reviews)
+    _meta_log("meta_planner_once_start",
+              feature=Path(target).name,
+              recent_events=len(recent_log),
+              recent_reviews=len(recent_reviews))
+    rc, diff_text, stderr_path = _spawn_meta_planner_invocation(
+        prompt, model=model, log_fn=log,
+    )
+    if rc != 0:
+        log(f"meta-planner-once: invocation rc={rc} (see {stderr_path})")
+
+    # Step 4: handle output
+    diff_text = (diff_text or "").strip()
+    if not diff_text or diff_text == "NOCHANGE":
+        log("meta-planner-once: NOCHANGE")
+        _meta_log("meta_planner_once_nochange", feature=Path(target).name)
+        return 0
+
+    # Apply via the same validation path as the loop. Inline a stripped-down
+    # version of Runner._apply_meta_planner_diff so this helper doesn't need
+    # a Runner instance.
+    feature = Path(target).name
+    allowed = {f"specs/{feature}/tasks.md"}
+    ok, files_seen = _diff_touches_only(diff_text, allowed)
+    if not ok:
+        log(f"meta-planner-once: diff rejected — touches "
+            f"{sorted(files_seen - allowed)}")
+        _meta_log("meta_planner_once_reject",
+                  feature=feature, reason="touches_other_files",
+                  files=sorted(files_seen))
+        return 2
+    line_count = diff_text.count("\n")
+    if line_count > _META_PLANNER_DIFF_LINE_CAP:
+        log(f"meta-planner-once: diff rejected — {line_count} lines "
+            f"> cap {_META_PLANNER_DIFF_LINE_CAP}")
+        _meta_log("meta_planner_once_reject",
+                  feature=feature, reason="too_large", line_count=line_count)
+        return 2
+    # Forward-only stripping is meaningless in one-shot mode (no prior
+    # tick), so skip it. Go straight to dry-run + apply.
+    try:
+        dry = subprocess.run(
+            ["patch", "-p1", "--dry-run", "--silent"],
+            input=diff_text, text=True, capture_output=True, timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log(f"meta-planner-once: patch dry-run error: {e}")
+        _meta_log("meta_planner_once_reject",
+                  feature=feature, reason="patch_dry_run_error", error=str(e))
+        return 2
+    if dry.returncode != 0:
+        log(f"meta-planner-once: patch --dry-run failed: {dry.stderr[:200]}")
+        _meta_log("meta_planner_once_reject",
+                  feature=feature, reason="patch_dry_run_failed",
+                  stderr=dry.stderr[:500])
+        return 2
+    real = subprocess.run(
+        ["patch", "-p1", "--silent"],
+        input=diff_text, text=True, capture_output=True, timeout=30,
+    )
+    if real.returncode != 0:
+        log(f"meta-planner-once: patch apply failed: {real.stderr[:200]}")
+        _meta_log("meta_planner_once_reject",
+                  feature=feature, reason="patch_apply_failed",
+                  stderr=real.stderr[:500])
+        return 2
+    log(f"meta-planner-once: applied diff to {feature}/tasks.md "
+        f"({line_count} lines)")
+    _meta_log("meta_planner_once_apply",
+              feature=feature, line_count=line_count,
+              diff_summary="\n".join(diff_text.splitlines()[:5]))
+    return 0
+
+
+def _copy_repo_for_fork(src: Path, dst: Path, log_fn=None) -> bool:
+    """Plain `cp -r` of src → dst, excluding common large dirs.
+
+    This is NOT a git clone or worktree — the destination has no git
+    relationship to the source. Used by --meta-planner-interactive as a
+    scratchpad where the user can talk to claude without risking the
+    live tree.
+
+    Skipped: .git, node_modules, .direnv, .venv, __pycache__, dist, build,
+    target, .next, .agent-work, test-logs, logs.
+    """
+    log = log_fn or (lambda m: print(m, file=sys.stderr, flush=True))
+    excludes = {
+        ".git", "node_modules", ".direnv", ".venv", "__pycache__",
+        "dist", "build", "target", ".next", ".agent-work",
+        "test-logs", "logs", ".code-review-graph",
+    }
+    if dst.exists():
+        log(f"meta-planner-interactive: {dst} already exists — refusing to overwrite")
+        return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    def _ignore(_dir, names):
+        return [n for n in names if n in excludes]
+
+    try:
+        shutil.copytree(src, dst, ignore=_ignore, symlinks=True)
+    except (OSError, shutil.Error) as e:
+        log(f"meta-planner-interactive: copy failed: {e}")
+        return False
+    return True
+
+
+def _meta_planner_interactive(spec_dir: Optional[str],
+                              fork_dir: Optional[Path],
+                              log_fn=None) -> int:
+    """Create a fork folder, prime a supervisor prompt, exec `claude` in it.
+
+    Replaces the current process via os.execvp — the user gets dropped
+    straight into the interactive REPL. Caller's invocation of
+    parallel_runner.py terminates as soon as claude exits.
+    """
+    log = log_fn or (lambda m: print(m, file=sys.stderr, flush=True))
+
+    # Resolve target feature first (so the primed prompt has it).
+    if spec_dir:
+        target_name = Path(spec_dir).name
+        if not (Path(spec_dir) / "tasks.md").is_file():
+            log(f"meta-planner-interactive: {spec_dir}/tasks.md does not exist")
+            return 1
+    else:
+        if not Path("specs").is_dir():
+            log("meta-planner-interactive: no specs/ directory")
+            return 1
+        candidates = [
+            str(d) for d in Path("specs").iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        ]
+        target = _infer_active_feature_from_run_log(candidates)
+        if not target:
+            log("meta-planner-interactive: could not infer active feature. "
+                "Pass [spec_dir] explicitly.")
+            return 1
+        target_name = Path(target).name
+        log(f"meta-planner-interactive: targeting {target_name}")
+
+    # Brief regen so the fork has fresh META.md.
+    if not _ensure_planning_brief(log_fn=log):
+        log("meta-planner-interactive: brief regen failed — continuing with existing brief")
+
+    # Default fork dir: .agent-work/meta-plan-<ts>/ inside cwd.
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if fork_dir is None:
+        fork_dir = Path(".agent-work") / f"meta-plan-{ts}"
+    fork_dir = fork_dir.resolve()
+
+    log(f"meta-planner-interactive: copying {Path.cwd()} → {fork_dir}")
+    if not _copy_repo_for_fork(Path.cwd(), fork_dir, log_fn=log):
+        return 1
+
+    # Write a primed prompt into the fork. The user can paste it or claude
+    # can be invoked with it as a positional arg.
+    since_ts = time.time() - 3600
+    recent_log = _recent_run_log_tail(str(Path("specs") / target_name), since_ts)
+    recent_reviews = _recent_review_files(str(Path("specs") / target_name), since_ts)
+    primed_prompt = _build_meta_planner_prompt(
+        str(Path("specs") / target_name), since_ts, recent_log, recent_reviews,
+    )
+    # Rewrite absolute paths in the prompt to point INSIDE the fork.
+    # The prompt's refs use absolute paths to the original repo; rewrite
+    # them to the fork's copy.
+    primed_prompt = primed_prompt.replace(str(Path.cwd().resolve()),
+                                          str(fork_dir))
+    prompt_path = fork_dir / ".meta-planner-prompt.md"
+    try:
+        prompt_path.write_text(primed_prompt)
+    except OSError as e:
+        log(f"meta-planner-interactive: could not write primed prompt: {e}")
+
+    _meta_log("meta_planner_interactive_launch",
+              feature=target_name,
+              fork_dir=str(fork_dir),
+              prompt_path=str(prompt_path))
+
+    log(f"meta-planner-interactive: launching claude in {fork_dir}")
+    log(f"  Primed prompt at: {prompt_path}")
+    log("  To use it: in claude, ask `Read .meta-planner-prompt.md and follow it`")
+
+    os.chdir(fork_dir)
+    try:
+        os.execvp("claude", ["claude"])
+    except FileNotFoundError:
+        log("meta-planner-interactive: `claude` not on PATH — "
+            "is the spec-kit dev shell active?")
+        return 1
+
+
 # ── Main orchestrator ─────────────────────────────────────────────────
 
 class Runner:
-    def __init__(self, spec_dirs: list[str], max_runs: int, headless: bool, max_parallel: int, layout: str = "vertical", continue_on_stall: bool = False):
+    def __init__(self, spec_dirs: list[str], max_runs: int, headless: bool, max_parallel: int, layout: str = "vertical", continue_on_stall: bool = False,
+                 use_meta_planner: bool = False,
+                 meta_planner_interval_min: int = _META_PLANNER_DEFAULT_INTERVAL_MIN,
+                 meta_planner_model: str = "claude-opus-4-7"):
         self.spec_dirs = spec_dirs
         self.max_runs = max_runs
         self.headless = headless
@@ -9372,6 +11026,13 @@ class Runner:
         # rather than silently advancing to the next spec_dir. See
         # _run_feature noop-exit branch and the outer feature loop.
         self.continue_on_stall = continue_on_stall
+        # Meta-planner is opt-in. When False, _ensure_planning_brief is
+        # never called and the supervisor thread is never started.
+        self.use_meta_planner = use_meta_planner
+        self.meta_planner_interval_min = meta_planner_interval_min
+        self.meta_planner_model = meta_planner_model
+        self._meta_planner_thread: Optional[threading.Thread] = None
+        self._meta_planner_stop = threading.Event()
         self.script_dir = Path(__file__).parent
         self.skills_dir = self.script_dir.parent
         self.blocked_file = Path("BLOCKED.md")
@@ -9738,6 +11399,12 @@ class Runner:
                 print("\nEnsure BLOCKED.md contains a task ID, then re-run. The runner will clean up the file.")
                 sys.exit(2)
 
+        # Start the meta-planner supervisor (opt-in). It runs on its own
+        # cadence in a background thread. Always stopped on exit via the
+        # finally block below.
+        if self.use_meta_planner:
+            self._start_meta_planner_thread()
+
         try:
             for idx, spec_dir in enumerate(self.spec_dirs):
                 if self._shutdown.is_set() or self._draining.is_set():
@@ -9784,6 +11451,7 @@ class Runner:
             # normal completion, unhandled exception, KeyboardInterrupt.
             self._kill_all_agents()
             self._teardown_platform_runtimes()
+            self._stop_meta_planner_thread()
             self._remove_pidfile()
 
         self._print_summary()
@@ -9894,6 +11562,230 @@ class Runner:
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             pass
 
+    # ── Meta-planner thread lifecycle ────────────────────────────────
+
+    def _start_meta_planner_thread(self) -> None:
+        """Spawn the supervisor thread. Called from run() when opt-in."""
+        if self._meta_planner_thread and self._meta_planner_thread.is_alive():
+            return
+        self._meta_planner_stop.clear()
+        self._meta_planner_thread = threading.Thread(
+            target=self._meta_planner_loop,
+            name="meta-planner",
+            daemon=True,
+        )
+        self._meta_planner_thread.start()
+        self.log(
+            f"meta-planner: thread started "
+            f"(interval={self.meta_planner_interval_min}min, "
+            f"model={self.meta_planner_model})"
+        )
+
+    def _stop_meta_planner_thread(self, join_timeout: float = 5.0) -> None:
+        """Signal the supervisor to exit and join it. Safe no-op if not running."""
+        if not self._meta_planner_thread:
+            return
+        self._meta_planner_stop.set()
+        try:
+            self._meta_planner_thread.join(timeout=join_timeout)
+        except RuntimeError:
+            pass
+        self._meta_planner_thread = None
+
+    def _meta_planner_loop(self) -> None:
+        """Background tick loop: spawn supervisor agent, apply diffs.
+
+        Honors:
+          - self._shutdown (hard stop from signal handler)
+          - self._draining (drain mode — finish work, don't spawn new ticks)
+          - self._meta_planner_stop (per-thread shutdown)
+        """
+        interval_s = max(60, self.meta_planner_interval_min * 60)
+        last_tick_ts = time.time()
+        consecutive_change_ticks = 0
+        while not self._meta_planner_stop.is_set():
+            if self._shutdown.is_set():
+                return
+            # Sleep with shutdown awareness. wait() returns True if the
+            # event was set during the wait.
+            if self._meta_planner_stop.wait(timeout=interval_s):
+                return
+            if self._shutdown.is_set() or self._draining.is_set():
+                continue
+            try:
+                active_feature = _infer_active_feature_from_run_log(self.spec_dirs)
+            except Exception as e:
+                _meta_log("meta_planner_tick_error",
+                          phase="infer_active_feature", error=str(e))
+                continue
+            if not active_feature:
+                _meta_log("meta_planner_tick_skip", reason="no_active_feature")
+                continue
+            if consecutive_change_ticks >= 3:
+                _meta_log("meta_planner_tick_skip",
+                          reason="thrash_cooldown",
+                          consecutive=consecutive_change_ticks)
+                self.log("meta-planner: thrash cooldown — skipping tick")
+                consecutive_change_ticks = 0
+                last_tick_ts = time.time()
+                continue
+            try:
+                diff = self._spawn_meta_planner(active_feature, last_tick_ts)
+            except Exception as e:
+                _meta_log("meta_planner_tick_error",
+                          phase="spawn", error=str(e))
+                last_tick_ts = time.time()
+                continue
+            if diff and diff.strip() and diff.strip() != "NOCHANGE":
+                applied = self._apply_meta_planner_diff(
+                    active_feature, diff, last_tick_ts,
+                )
+                if applied:
+                    consecutive_change_ticks += 1
+                else:
+                    consecutive_change_ticks = 0
+            else:
+                consecutive_change_ticks = 0
+                _meta_log("meta_planner_tick_nochange",
+                          feature=Path(active_feature).name)
+            last_tick_ts = time.time()
+
+    def _spawn_meta_planner(self, spec_dir: str,
+                            since_ts: float) -> str:
+        """Run one meta-planner invocation. Returns its stdout (diff or
+        'NOCHANGE')."""
+        recent_log = _recent_run_log_tail(spec_dir, since_ts)
+        recent_reviews = _recent_review_files(spec_dir, since_ts)
+        prompt = _build_meta_planner_prompt(
+            spec_dir, since_ts, recent_log, recent_reviews,
+        )
+        _meta_log("meta_planner_tick_start",
+                  feature=Path(spec_dir).name,
+                  since_ts=since_ts,
+                  recent_events=len(recent_log),
+                  recent_reviews=len(recent_reviews))
+        rc, diff_text, stderr_path = _spawn_meta_planner_invocation(
+            prompt, model=self.meta_planner_model, log_fn=self.log,
+        )
+        if rc != 0:
+            _meta_log("meta_planner_tick_nonzero",
+                      feature=Path(spec_dir).name,
+                      returncode=rc,
+                      stderr_log=stderr_path)
+        return diff_text or ""
+
+    def _apply_meta_planner_diff(self, spec_dir: str, diff_text: str,
+                                 since_ts: float) -> bool:
+        """Validate and apply a meta-planner-produced unified diff.
+
+        Returns True iff a non-trivial change was applied to tasks.md.
+
+        Rejection reasons logged to specs/.meta-planner-log.jsonl:
+          - touches_other_files
+          - too_large
+          - all_hunks_forward_only_stripped
+          - patch_dry_run_failed
+          - patch_apply_failed
+        """
+        feature = Path(spec_dir).name
+        allowed = {f"specs/{feature}/tasks.md"}
+        ok, files_seen = _diff_touches_only(diff_text, allowed)
+        if not ok:
+            _meta_log("meta_planner_diff_reject",
+                      feature=feature, reason="touches_other_files",
+                      files=sorted(files_seen))
+            self.log(f"meta-planner: diff rejected — touches "
+                     f"{sorted(files_seen - allowed)}")
+            return False
+        line_count = diff_text.count("\n")
+        if line_count > _META_PLANNER_DIFF_LINE_CAP:
+            _meta_log("meta_planner_diff_reject",
+                      feature=feature, reason="too_large",
+                      line_count=line_count)
+            self.log(f"meta-planner: diff rejected — {line_count} lines "
+                     f"exceeds cap {_META_PLANNER_DIFF_LINE_CAP}")
+            return False
+
+        # Forward-only: strip hunks affecting tasks executors already
+        # picked up since the last tick.
+        touched = _task_ids_touched_since(spec_dir, since_ts)
+        headers, hunks = _split_diff_into_hunks(diff_text)
+        kept: list[list[str]] = []
+        stripped: list[set[str]] = []
+        for hunk in hunks:
+            ids = _hunk_target_task_ids(hunk)
+            collision = ids & touched
+            if collision:
+                stripped.append(collision)
+            else:
+                kept.append(hunk)
+        if not kept:
+            _meta_log("meta_planner_diff_reject",
+                      feature=feature,
+                      reason="all_hunks_forward_only_stripped",
+                      hunks_total=len(hunks),
+                      hunks_stripped=len(stripped),
+                      touched_ids=sorted(touched))
+            self.log("meta-planner: would have edited executor-touched "
+                     "tasks; suppressed")
+            return False
+        if stripped:
+            _meta_log("meta_planner_diff_partial_strip",
+                      feature=feature,
+                      hunks_total=len(hunks),
+                      hunks_stripped=len(stripped),
+                      hunks_kept=len(kept))
+
+        # Reassemble and dry-run with `patch -p1 --dry-run`.
+        reassembled = "".join(headers) + "".join("".join(h) for h in kept)
+        # Use a temp file so we can pass to patch via stdin.
+        try:
+            dry = subprocess.run(
+                ["patch", "-p1", "--dry-run", "--silent"],
+                input=reassembled,
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            _meta_log("meta_planner_diff_reject",
+                      feature=feature, reason="patch_dry_run_error",
+                      error=str(e))
+            return False
+        if dry.returncode != 0:
+            _meta_log("meta_planner_diff_reject",
+                      feature=feature, reason="patch_dry_run_failed",
+                      stderr=dry.stderr[:500])
+            self.log(f"meta-planner: patch --dry-run failed: "
+                     f"{dry.stderr[:200]}")
+            return False
+        # Real apply.
+        try:
+            real = subprocess.run(
+                ["patch", "-p1", "--silent"],
+                input=reassembled,
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            _meta_log("meta_planner_diff_reject",
+                      feature=feature, reason="patch_apply_timeout")
+            return False
+        if real.returncode != 0:
+            _meta_log("meta_planner_diff_reject",
+                      feature=feature, reason="patch_apply_failed",
+                      stderr=real.stderr[:500])
+            return False
+        first_lines = "\n".join(reassembled.splitlines()[:5])
+        _meta_log("meta_planner_diff_apply",
+                  feature=feature,
+                  line_count=reassembled.count("\n"),
+                  diff_summary=first_lines)
+        self.log(f"meta-planner: applied diff to {feature}/tasks.md "
+                 f"({reassembled.count(chr(10))} lines)")
+        return True
+
     def _run_feature(self, spec_dir: str):
         self._current_spec_dir = spec_dir  # for _poll_agents attempt tracking
         self._amendment_dir = Path(spec_dir)
@@ -9904,6 +11796,12 @@ class Runner:
         if not task_file.exists():
             self.log(f"Skipping {spec_dir} — no tasks.md")
             return
+
+        # Meta-planner brief regen (opt-in via --use-meta-planner). Runs
+        # synchronously before any executor spawns. Idempotent — no-op when
+        # the brief is fresh. Honors SPEC_KIT_SKIP_BRIEF_REGEN=1.
+        if self.use_meta_planner and not os.environ.get("SPEC_KIT_SKIP_BRIEF_REGEN"):
+            _ensure_planning_brief(log_fn=self.log)
 
         # Parse tasks
         phases, phase_deps = parse_task_file(task_file)
@@ -11124,6 +13022,69 @@ class Runner:
                             self.log(f"  TIMEOUT: {label}")
                             all_passed = False
 
+                    # Proof-artifact enforcement: any JSON file under
+                    # test-logs/ whose schema looks like a proof artifact
+                    # (has `status` and `executed` fields) MUST show
+                    # status="pass" and executed>0. A wrapper that exited
+                    # 0 with executed=0 is a silent skip — FAIL.
+                    # See reference/proof-discipline.md for the schema.
+                    proof_failures = _scan_proof_artifacts(
+                        min_mtime=verify_start_mtime,
+                    )
+                    if proof_failures:
+                        all_passed = False
+                        for path, status, executed, reason in proof_failures:
+                            self.log(
+                                f"  PROOF ARTIFACT FAIL: {path} — "
+                                f"status={status}, executed={executed}"
+                                + (f" ({reason})" if reason else "")
+                            )
+                        results.append({
+                            "command": "runner proof-artifact scan",
+                            "label": "proof-discipline enforcement",
+                            "exit_code": 1,
+                            "passed": False,
+                            "error": (
+                                "proof artifact(s) show executed=0 or "
+                                "status!=pass — silent-skip wrapper or "
+                                "vacuous test run. See reference/"
+                                "proof-discipline.md."
+                            ),
+                            "proof_failures": [
+                                {"path": p, "status": s,
+                                 "executed": e, "reason": r}
+                                for (p, s, e, r) in proof_failures
+                            ],
+                        })
+
+                    # Coverage-matrix enforcement: if the phase added or
+                    # modified user-visible routes (e.g. `pages/**/*.astro`,
+                    # `pages/**/*.tsx`, route entries), the test diff MUST
+                    # reference every new/modified route. One representative
+                    # route is not enough when the spec describes N.
+                    coverage_gaps = _scan_coverage_matrix(
+                        base_sha=_detect_phase_diff_base(phase),
+                    )
+                    if coverage_gaps:
+                        all_passed = False
+                        for route in coverage_gaps:
+                            self.log(
+                                f"  COVERAGE GAP: route {route!r} added/"
+                                f"modified in diff but referenced by no test"
+                            )
+                        results.append({
+                            "command": "runner coverage-matrix scan",
+                            "label": "coverage-matrix enforcement",
+                            "exit_code": 1,
+                            "passed": False,
+                            "error": (
+                                "production diff added/modified routes "
+                                "that no test exercises. See "
+                                "reference/proof-discipline.md rule #5."
+                            ),
+                            "uncovered_routes": coverage_gaps,
+                        })
+
                     # Zero-skips enforcement: even if every command exited 0,
                     # scan test summary files for skipped tests. Any skip is a
                     # FAIL regardless of reporter exit code. See
@@ -11276,6 +13237,11 @@ class Runner:
              run_in_background Bash command has a process subtree with 0 CPU
              ticks accumulated over AGENT_BG_DEADLOCK_S
 
+        Once the agent's stream-json log has emitted a terminal `type:"result"`
+        line, the idle and bg-deadlock signals are suppressed — the SDK is
+        done and the process is reaping, even if the OS hasn't returned yet.
+        Wall-clock is still enforced.
+
         When killing, this method also writes a hang-diagnosis file that the
         next attempt's prompt may reference.
         """
@@ -11283,6 +13249,12 @@ class Runner:
         wall_s = now - (agent.start_time or now)
         if wall_s > AGENT_HARD_TIMEOUT_S:
             return self._finalize_hang(agent, f"wall-clock {int(wall_s)}s exceeded {AGENT_HARD_TIMEOUT_S}s")
+
+        # If the SDK has already emitted its terminal result line,
+        # agent.exit_code is set. Suppress idle/bg-deadlock signals — the
+        # process is finishing and the completion branch will reap it.
+        if agent.exit_code is not None:
+            return None
 
         try:
             log_mtime = agent.log_file.stat().st_mtime
@@ -11471,7 +13443,24 @@ class Runner:
                     rc = agent.process.returncode
                     stderr_path = self.log_dir / f"agent-{agent.agent_id}-{agent.task.id}-{self.timestamp}.stderr"
 
-                    if rc == 0:
+                    # If the SDK emitted a terminal `type:"result"` line, trust
+                    # that over the process return code. The SDK occasionally
+                    # exits non-zero (or is reaped by an external signal)
+                    # *after* writing a successful result; the result line is
+                    # the authoritative outcome.
+                    sdk_result = agent.exit_code  # 0 = success result, 1 = error result, None = no result line
+                    if sdk_result == 0:
+                        if check_deferred(agent.task.id):
+                            agent.status = "deferred"
+                            self.log(f"Agent {agent.agent_id} ({agent.task.id}) deferred — will retry when solo")
+                        else:
+                            agent.status = "done"
+                            self.log(f"Agent {agent.agent_id} ({agent.task.id}) completed successfully (rc={rc}, sdk_result=success)")
+                            if not agent.task.id.startswith(("VR-", "verify-")):
+                                if not hasattr(self, '_agent_done_tasks'):
+                                    self._agent_done_tasks: set[str] = set()
+                                self._agent_done_tasks.add(agent.task.id)
+                    elif rc == 0:
                         # Check if agent wrote a DEFER file instead of completing
                         if check_deferred(agent.task.id):
                             agent.status = "deferred"
@@ -19154,6 +21143,45 @@ def main():
                         help="After the specified spec_dir completes, also run all later specs (sorted alphabetically)")
     parser.add_argument("--continue-on-stall", action="store_true",
                         help="If a feature stalls (e.g. runner-verify failed and no fix path is reachable), advance to the next feature instead of writing STALLED.md and exiting (default: refuse).")
+    parser.add_argument("--use-meta-planner", action="store_true",
+                        help="OPT-IN: enable the meta-planner. Regenerates "
+                             "specs/META.md on staleness (synchronously, "
+                             "before any executor spawns) and starts a "
+                             "background supervisor thread that ticks every "
+                             "--meta-planner-interval-min and may amend "
+                             "tasks.md based on executor activity. Default: off.")
+    parser.add_argument("--meta-planner-interval-min", type=int,
+                        default=_META_PLANNER_DEFAULT_INTERVAL_MIN,
+                        help=f"Minutes between meta-planner ticks "
+                             f"(default {_META_PLANNER_DEFAULT_INTERVAL_MIN}). "
+                             f"Ignored unless --use-meta-planner is set.")
+    parser.add_argument("--meta-planner-model", default="claude-opus-4-7",
+                        help="Model for the meta-planner agent "
+                             "(default claude-opus-4-7). Ignored unless "
+                             "--use-meta-planner is set.")
+    parser.add_argument("--regen-brief", action="store_true",
+                        help="ONE-SHOT: regenerate specs/META.md and exit. "
+                             "Forces regen regardless of staleness. Does not "
+                             "run any feature work or start the meta-planner "
+                             "loop. Useful for refreshing the brief after "
+                             "manually editing planning material.")
+    parser.add_argument("--meta-planner-once", action="store_true",
+                        help="ONE-SHOT: run a single supervisor tick against "
+                             "the active feature (or [spec_dir] if given), "
+                             "apply any valid diff to tasks.md, and exit. "
+                             "Regenerates specs/META.md first if stale. "
+                             "Does not start the loop or run executors.")
+    parser.add_argument("--meta-planner-interactive", action="store_true",
+                        help="INTERACTIVE: copy the repo into a fork folder "
+                             "(default .agent-work/meta-plan-<ts>/), prime a "
+                             "supervisor prompt, then exec the claude REPL "
+                             "inside that folder. The fork is a plain "
+                             "directory copy with no git relationship; "
+                             "changes are not merged back automatically.")
+    parser.add_argument("--meta-planner-fork-dir", default=None,
+                        help="Where to place the interactive-mode fork "
+                             "folder (default: .agent-work/meta-plan-<ts>/). "
+                             "Ignored unless --meta-planner-interactive is set.")
 
     args = parser.parse_args()
 
@@ -19210,14 +21238,50 @@ def main():
             if nix_cmd is not None:
                 os.execvp("nix", nix_cmd + [sys.executable, *sys.argv])
 
-    # Resolve spec dirs
+    def _stderr_log(msg: str) -> None:
+        print(msg, file=sys.stderr, flush=True)
+
+    # One-shot brief regen. Bypasses staleness check (forces regen) and
+    # exits without running any feature work.
+    if args.regen_brief:
+        if not Path("specs").is_dir():
+            print("Error: No specs/ directory found. Are you in a spec-kit project root?")
+            sys.exit(1)
+        ok = _ensure_planning_brief(force=True, log_fn=_stderr_log)
+        sys.exit(0 if ok else 1)
+
+    # One-shot supervisor tick. Apply one diff (or NOCHANGE) and exit.
+    if args.meta_planner_once:
+        rc = _meta_planner_run_once(
+            spec_dir=args.spec_dir or None,
+            model=args.meta_planner_model,
+            log_fn=_stderr_log,
+        )
+        sys.exit(rc)
+
+    # Interactive: fork the repo into a scratch folder and exec claude in it.
+    if args.meta_planner_interactive:
+        fork_dir = Path(args.meta_planner_fork_dir) if args.meta_planner_fork_dir else None
+        rc = _meta_planner_interactive(
+            spec_dir=args.spec_dir or None,
+            fork_dir=fork_dir,
+            log_fn=_stderr_log,
+        )
+        sys.exit(rc or 1)  # execvp succeeds = process replaced; rc only set on failure
+
+    # Resolve spec dirs. _is_feature_dir filters out specs/META.md (a file,
+    # already excluded by is_dir but make it explicit) and dotfiles like
+    # specs/.META.lock / specs/.meta-planner-logs/.
+    def _is_feature_dir(p: Path) -> bool:
+        return p.is_dir() and not p.name.startswith(".")
+
     if args.spec_dir:
         if args.and_later:
             # Run the specified spec and all alphabetically-later specs
             if not Path("specs").is_dir():
                 print("Error: No specs/ directory found. Are you in a spec-kit project root?")
                 sys.exit(1)
-            all_specs = sorted(str(d) for d in Path("specs").iterdir() if d.is_dir())
+            all_specs = sorted(str(d) for d in Path("specs").iterdir() if _is_feature_dir(d))
             # Normalize the user-provided path for comparison
             target = str(Path(args.spec_dir))
             spec_dirs = [s for s in all_specs if s >= target]
@@ -19230,7 +21294,7 @@ def main():
         if not Path("specs").is_dir():
             print("Error: No specs/ directory found. Are you in a spec-kit project root?")
             sys.exit(1)
-        spec_dirs = sorted(str(d) for d in Path("specs").iterdir() if d.is_dir())
+        spec_dirs = sorted(str(d) for d in Path("specs").iterdir() if _is_feature_dir(d))
         if not spec_dirs:
             print("Error: No feature directories found in specs/")
             sys.exit(1)
@@ -19242,6 +21306,9 @@ def main():
         max_parallel=args.max_parallel,
         layout=args.layout,
         continue_on_stall=args.continue_on_stall,
+        use_meta_planner=args.use_meta_planner,
+        meta_planner_interval_min=args.meta_planner_interval_min,
+        meta_planner_model=args.meta_planner_model,
     )
     runner.run()
 
