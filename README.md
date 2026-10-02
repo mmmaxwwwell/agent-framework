@@ -1,54 +1,66 @@
 # Agent Framework
 
-A collection of reusable Claude Code skills — self-contained prompts that teach an agent how to perform specific workflows.
+A collection of reusable Claude Code skills — self-contained prompts that teach an agent how to perform specific workflows. Packaged as nix flake outputs.
 
 ## Prerequisites
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI installed
-- [Nix](https://nixos.org/download/) (recommended) — skills default to Nix flakes for dependency and environment management. Without Nix, skills fall back to Docker/devcontainers, but the experience is best with Nix.
+- [Nix](https://nixos.org/download/) with flakes enabled
 
 ## Install
 
-Add this to your `~/CLAUDE.md` so the agent can discover skills automatically:
+### With nix + home-manager
 
-```markdown
-Before starting any task, read the skill router at /path/to/agent-framework/ROUTER.md.
-Follow the instructions of every skill that matches the task. If no skill matches, proceed normally.
+Add to your flake inputs:
+
+```nix
+inputs.agent-framework.url = "github:mmmaxwwwell/agent-framework";
 ```
 
-Replace `/path/to/agent-framework` with the actual path (e.g. `~/git/agent-framework`).
+Then enable in your home-manager config:
 
-## How it works
+```nix
+{ inputs, ... }: {
+  imports = [ inputs.agent-framework.homeManagerModules.default ];
 
-Each skill is a `SKILL.md` file containing a complete prompt. Skills can be invoked as Claude Code slash commands or pasted into any AI chat. The [`ROUTER.md`](ROUTER.md) file lets agents discover and select skills automatically without slash commands.
+  programs.claude-skills = {
+    enable = true;
+    # Install all skills (default), or pick specific ones:
+    # skills = [ "code-review" "eng-standards" "spec-kit" ];
+  };
+}
+```
 
-## Getting started
+This installs slash commands (`/code-review`, `/spec-kit`, etc.) into `~/.claude/commands/`.
 
-### With Claude Code
+### Individual skill packages
 
-Install the skills by copying `.claude/skills/` into your project (or `~/.claude/skills/` for global access). Then invoke them as slash commands (e.g. `/generate-project`, `/run-tasks`).
+Each skill is a separate nix package:
 
-### Autonomous skill discovery
+```bash
+nix build github:mmmaxwwwell/agent-framework#code-review
+nix build github:mmmaxwwwell/agent-framework#spec-kit
+nix build github:mmmaxwwwell/agent-framework#all  # everything
+```
 
-Point any agent at [`ROUTER.md`](ROUTER.md) and it will match the task to the right skill automatically.
+### eng-standards auto-load
 
-### Without Claude Code
+Add to your `~/CLAUDE.md` to auto-apply engineering standards on all software tasks:
 
-The skill files at `.claude/skills/*/SKILL.md` contain the full prompts. Paste the contents of any `SKILL.md` into any AI chat and it will work — the frontmatter is ignored by non-Claude-Code tools.
+```markdown
+For software, programming, or computer-related tasks: read and apply the engineering standards skill at ~/git/agent-framework/skills/eng-standards/SKILL.md before starting work.
+```
+
+### Without nix
+
+The skill files at `skills/*/SKILL.md` contain the full prompts. Paste the contents of any `SKILL.md` into any AI chat and it will work — the frontmatter is ignored by non-Claude-Code tools.
 
 ## Which skill should I use?
 
 ```
 Building something new from scratch?
-├── Want full spec-driven development (specs → plans → tasks → autonomous implementation)?
-│   └── /spec-kit
-└── Want a quick project scaffold (prompt file + task list, no formal specs)?
-    └── /generate-project
-
-Adding to an existing project?
-├── New feature → /generate-feature
-├── Run an existing task list → /run-tasks
-└── Fix a failing build or test suite → /fix-build
+└── Want full spec-driven development (specs → plans → tasks → autonomous implementation)?
+    └── /spec-kit
 
 Reviewing code?
 ├── React / Next.js → /code-review-react
@@ -57,54 +69,46 @@ Reviewing code?
 
 Reviewing UI?
 └── /ux-review
+
+Want engineering standards without a workflow?
+└── /eng-standards (or auto-loaded via ~/CLAUDE.md)
+
+Setting up MCP toolbelt in a project?
+└── /toolbelt-setup (one-time, or on update)
 ```
-
-### spec-kit vs generate-project
-
-Both create new projects, but they work very differently:
-
-- **`/spec-kit`** is the full Specification-Driven Development workflow. It interviews you, writes a formal spec, runs an analyze loop to find gaps, generates an architecture plan with data models and API contracts, then produces a task list. Implementation agents run in a sandboxed parallel runner with fix-validate loops. Best for: real projects you intend to ship.
-
-- **`/generate-project`** is a lightweight scaffolder. It interviews you briefly, then generates a prompt file and task list. No formal specs, no architecture docs, no sandbox. Best for: quick prototypes, experiments, or when you already know what you want and just need a task list to hand to `/run-tasks`.
-
-## Example: starting a project with spec-kit
-
-```
-you:   /spec-kit my-api
-claude: Loading skill: spec-kit. Installing specify CLI into flake.nix...
-        Project initialized. Starting Phase 2: Specification Interview.
-        What are you building? Tell me about the core problem this solves.
-you:   A REST API for managing book reviews. Users can post reviews, rate books,
-       and see aggregated ratings.
-claude: [asks ~10 follow-up questions about auth, data model, deployment, etc.]
-        ...
-        Interview complete. Generating specification with specify...
-        Running analyze loop — checking for ambiguities...
-        [2 issues found, auto-fixing...]
-        Specification clean. Moving to Phase 5: Plan.
-        [generates architecture plan, data model, API contracts]
-        Plan complete. Moving to Phase 6: Tasks.
-        [generates task list with 14 tasks across 4 phases]
-        Ready for implementation. Run the parallel runner? (y/n)
-you:   y
-claude: [launches sandboxed agents to implement tasks in parallel]
-```
-
-Each phase auto-advances to the next. The agent asks for confirmation before launching implementation.
 
 ## Skills
 
 | Skill | Description |
 |-------|-------------|
-| [`code-review`](.claude/skills/code-review/SKILL.md) | Review code for bugs, security, performance — language-agnostic base layer |
-| [`code-review-node`](.claude/skills/code-review-node/SKILL.md) | Node.js-specific review (extends code-review with async, event loop, dependency checks) |
-| [`code-review-react`](.claude/skills/code-review-react/SKILL.md) | React-specific review (extends code-review with hooks, render perf, state management checks) |
-| [`fix-build`](.claude/skills/fix-build/SKILL.md) | Iteratively fix a failing build/test command with sub-agents |
-| [`generate-project`](.claude/skills/generate-project/SKILL.md) | Scaffold a new agent-framework project via interview |
-| [`generate-feature`](.claude/skills/generate-feature/SKILL.md) | Plan and add a feature to an existing project |
-| [`run-tasks`](.claude/skills/run-tasks/SKILL.md) | Automate task execution with Opus sub-agents |
-| [`spec-kit`](.claude/skills/spec-kit/SKILL.md) | Initialize and drive spec-kit (SDD) projects — specs, plans, tasks, implementation |
-| [`ux-review`](.claude/skills/ux-review/SKILL.md) | Review and fix accessibility, layout, and UX in React apps |
+| [`code-review`](skills/code-review/SKILL.md) | Review code for bugs, security, performance — language-agnostic base layer |
+| [`code-review-node`](skills/code-review-node/SKILL.md) | Node.js-specific review (extends code-review with async, event loop, dependency checks) |
+| [`code-review-react`](skills/code-review-react/SKILL.md) | React-specific review (extends code-review with hooks, render perf, state management checks) |
+| [`eng-standards`](skills/eng-standards/SKILL.md) | Engineering rigor baselines (presets) + reference standards library |
+| [`execute-milestone`](skills/execute-milestone/SKILL.md) | Run one milestone of a `-TASKS.md` with fresh subagents per task, review, ≤2 fix rounds, rulings ledger, ship gate (+ `verify-gate.sh` Stop hook) |
+| [`handoff`](skills/handoff/SKILL.md) | Regenerate a project's `-megaprompt.md` paste-to-resume prompt from plan/TASKS/git state |
+| [`scout`](skills/scout/SKILL.md) | Match a plan or milestone against the registry of in-house MCP servers, skills and prior-art repos (`registry/inventory.md`), and record USE/PORT/LEARN verdicts in the plan |
+| [`plan-feature`](skills/plan-feature/SKILL.md) | Interview → three-file funnel: `-plan.md` (LOCKED decisions + verification gate), `-TASKS.md`, `-megaprompt.md` |
+| [`spec-kit`](skills/spec-kit/SKILL.md) | Initialize and drive spec-kit (SDD) projects — specs, plans, tasks, implementation |
+| [`toolbelt`](skills/toolbelt/SKILL.md) | Behavioral skill — tells the agent to prefer MCP tools over built-ins (auto-loaded) |
+| [`toolbelt-setup`](skills/toolbelt-setup/SKILL.md) | Set up mcp-toolbelt in a project: flake input, mkDevShell, CLAUDE.md, README |
+| [`ux-review`](skills/ux-review/SKILL.md) | Review and fix accessibility, layout, and UX in React apps |
+
+## Sub-flakes
+
+spec-kit includes sub-projects that can be used as standalone flake inputs:
+
+| Sub-flake | Path | Description |
+|-----------|------|-------------|
+| `runner-ts` | `skills/spec-kit/runner-ts/` | TypeScript parallel task runner |
+| `runner` | `skills/spec-kit/runner/` | Python parallel task runner |
+| `code-review-graph` | `skills/spec-kit/code-review-graph/` | Code knowledge graph for review |
+
+Include them as flake inputs:
+
+```nix
+inputs.spec-kit-runner.url = "github:mmmaxwwwell/agent-framework?dir=skills/spec-kit/runner-ts";
+```
 
 ## License
 

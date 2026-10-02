@@ -1,6 +1,6 @@
 # Spec-kit reference/ — rule & guardrail inventory
 
-Scope: every file in `/home/max/git/agent-framework/.claude/skills/spec-kit/reference/` (37 markdown + 4 templates files). The goal is to map every prescriptive rule, where it lives, whether anything enforces it, and where rules contradict, overlap, or leave gaps relative to the user's goals (ship unattended quality, reduce time-per-feature, enforce a quality bar agents wouldn't self-impose, cost-controlled scaling). Known pain points: silent fake completion, ignored/contradictory rules, cost/token waste.
+Scope: every file in `/home/max/git/agent-framework/skills/spec-kit/reference/` (37 markdown + 4 templates files). The goal is to map every prescriptive rule, where it lives, whether anything enforces it, and where rules contradict, overlap, or leave gaps relative to the user's goals (ship unattended quality, reduce time-per-feature, enforce a quality bar agents wouldn't self-impose, cost-controlled scaling). Known pain points: silent fake completion, ignored/contradictory rules, cost/token waste.
 
 Legend for **Enforcement**:
 - **Runner-enforced** = `parallel_runner.py` parses or executes this and refuses to advance on violation. Hardest enforcement.

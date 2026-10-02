@@ -1,7 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "Edit(/.claude/skills/spec-kit/**)",
+      "Edit(/skills/**)",
       "Bash(npm view:*)",
       "Bash(gh repo:*)"
     ]

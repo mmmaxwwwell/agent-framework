@@ -4,7 +4,7 @@
 **Author:** planning session, 2026-06-01
 **Companion to:** [`multi-developer-runner.md`](./multi-developer-runner.md)
 **Touches (when implemented):**
-`agent-framework/.claude/skills/spec-kit/phases/tasks.md` (the task-generation
+`agent-framework/skills/spec-kit/phases/tasks.md` (the task-generation
 prompt), `.specify/templates/tasks-template.md` (the output template), and the
 DAG parser in `parallel_runner.py`.
 

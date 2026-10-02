@@ -8,7 +8,7 @@ I'm resuming a conversation about auditing my spec-kit wrapper + parallel runner
 
 ## What the system is
 
-- **spec-kit wrapper** at `/home/max/git/agent-framework/.claude/skills/spec-kit/` — drives agents through Specification-Driven Development (constitution → specify → clarify → analyze → plan → workflows → tasks → implement). Has 6 presets (poc / local / library / extension / public / enterprise) that override interview/plan/task depth.
+- **spec-kit wrapper** at `/home/max/git/agent-framework/skills/spec-kit/` — drives agents through Specification-Driven Development (constitution → specify → clarify → analyze → plan → workflows → tasks → implement). Has 6 presets (poc / local / library / extension / public / enterprise) that override interview/plan/task depth.
 - **parallel runner** at `parallel_runner.py` (19,737 LOC, monolithic) — spawns Claude CLI subprocesses to execute `tasks.md` with phase dependencies, parallel `[P]` tasks, fix-validate loops at phase boundaries, separate validate (Sonnet) and review (Opus) agents, runner-side independent test re-execution (`runner-verified.json`), proof-discipline gates (`verification.json`), CI/E2E loops with their own sub-agent flows.
 - **cost_report.py** — post-hoc cost analyzer reading `run-log.jsonl`.
 - **41 reference docs** in `reference/*.md` that phase docs and runner prompts load on demand.
@@ -94,8 +94,8 @@ I haven't picked. Read the matrix first (`/tmp/spec-kit-rule-matrix.md`), then h
 1. `/home/max/git/agent-framework/revision/spec-kit-rule-matrix.md` — the matrix (primary)
 2. `/home/max/git/agent-framework/revision/spec-kit-audit-runner.md` — runner audit (for line-number citations)
 3. `/home/max/git/agent-framework/revision/spec-kit-audit-reference.md` — reference audit (for cross-file citations)
-4. `/home/max/git/agent-framework/.claude/skills/spec-kit/README.md` — for the canonical system overview
-5. `/home/max/git/agent-framework/.claude/skills/spec-kit/parallel_runner.py` — only as needed for specific line numbers
+4. `/home/max/git/agent-framework/skills/spec-kit/README.md` — for the canonical system overview
+5. `/home/max/git/agent-framework/skills/spec-kit/parallel_runner.py` — only as needed for specific line numbers
 
 Don't re-read everything; the matrix and the two audit docs have the citations.
 

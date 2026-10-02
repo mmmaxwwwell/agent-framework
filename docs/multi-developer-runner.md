@@ -634,6 +634,132 @@ table only when the flag is set.
 
 ---
 
+## 7c. The developer's external toolset — proxied toolbelt servers
+
+§7 and §7b are the runner's *internal* nervous system. They are not the only
+MCP servers a developer talks to. A developer is a `claude` subprocess doing
+real implementation work, so its tools come in **two layers**, both delivered
+through the same `--mcp-config` injection (§10 resolved-3):
+
+| Layer | Servers | Purpose | Trust |
+|---|---|---|---|
+| **Internal (harness)** | coordination server (§7) | claim/intent/lock/publish — keep N developers from clobbering each other | runner-local, transactional |
+| **External (work)** | the toolbelt servers — `codebase`, `git-guard`, `web-browser`, `task-runner`, … | the actual *superpowers*: structure-aware reads, scoped git, cached web, allowlisted shell | each **fronted by nix-mcp-proxy** |
+
+The external layer is the point of the whole stack. A developer doesn't `Read`
+raw bytes and `Bash` arbitrary commands — it calls high-level toolbelt tools
+that return pre-digested, policy-compliant results. Every one of those servers
+sits behind nix-mcp-proxy.
+
+### 7c.1 The stack spine
+
+```
+Supervisor (the new runner — one process)
+  └── Developer  (a claude subprocess, §2)
+        ├── coordination MCP server      (internal, §7 — claim/intent/lock)
+        └── toolbelt MCP servers         (external, the work)
+              └── each routed through → nix-mcp-proxy
+                    └── → upstream MCP server (codebase / git / web / …)
+```
+
+This is the architecture a stack-aware planner must account for (§7c.4):
+spec-kit generates `tasks.md` → the supervisor runs it as N developers →
+each developer's work tools are proxied → the proxy enforces what each
+developer may touch.
+
+### 7c.2 Why the proxy is the safety complement to coordination
+
+The coordination server gives **correctness among cooperating developers** —
+the file-lock (§6.2) stops two developers writing `flake.nix` at the same
+instant. It does **nothing** about a single developer doing something it
+shouldn't: deleting outside its workstream, `git push --force`, fetching an
+arbitrary URL, committing to `infra/` when it owns `src/`. That is exactly
+what nix-mcp-proxy enforces — tool whitelists, path/field validation, branch
+restrictions, audit logging — declared per the toolbelt's `proxy.config.nix`
+and sealed at `nix build` time.
+
+So the two layers are orthogonal and both required for N untrusted parallel
+developers to be *safe*:
+
+- **Coordination server** — developers don't clobber **each other**.
+- **nix-mcp-proxy** — a developer doesn't clobber **the system**.
+
+Neither subsumes the other. A run with N>1 needs both.
+
+### 7c.3 Teaching a developer to use the proxy — the consumer skill
+
+A developer talking through the proxy must read the narrowed contract first
+(`proxy.describe`), prefer proxied tools over raw built-ins, and recover from
+structured rejections (`validator_rejected`, `field_not_allowed`, …) instead
+of retrying blindly. That behavioral contract lives in the
+**`nix-mcp-proxy-consumer` skill** (shipped *from* nix-mcp-proxy, see its
+`lib.consumerSkillsDir`; forwarded into the project by the toolbelt's
+`claude-with-servers`).
+
+**Delivery is the same problem as the review skill — and the same solution.**
+Developer agents are spawned with the standing rule *"do NOT read ROUTER.md or
+load any skills / do NOT use the Skill tool"* (`parallel_runner.py` ~L1898,
+2479, 2680, 3111). So a skill file sitting in `skills/` never reaches
+them. The runner already solves this for code review: it reads
+`Path(skills_dir) / "code-review*" / "SKILL.md"`, strips the frontmatter, and
+**inlines the body** into the agent prompt (~L2545, L2777). The
+`nix-mcp-proxy-consumer` skill rides the **identical mechanism**: when a
+developer's external toolset is proxied, the runner inlines that skill's body
+into the developer prompt as an `## Operating behind the proxy` section.
+
+Responsibility boundary (each layer owns its slice; the territory lives where
+its consumer can reach it):
+
+| Layer | Owns |
+|---|---|
+| **nix-mcp-proxy** | authors + ships the skill (source of truth for proxy behavior); exposes `lib.consumerSkillsDir` (stable read path) + `lib.installConsumerSkills` (devshell install hook) |
+| **mcp-toolbelt** | fronts each server with `mkProxy`; forwards the skill into the project via `claude-with-servers` |
+| **parallel_runner.py** | inlines the skill body into each proxied developer's prompt (mirrors the review-skill inline) |
+| **spec-kit planner** | generates `tasks.md` aware that developers run proxied (§7c.4) |
+
+The skill is **not** copied into this doc or into agent-framework — it
+describes the *proxy's* contract (its error codes, its `proxy.describe` shape),
+so it stays co-located with the proxy and is referenced, not duplicated. The
+runner is a pure consumer of it.
+
+### 7c.4 Stack-aware planning (spec-kit)
+
+Only one persona needs the whole spine: the **spec-kit planning agent** that
+writes `tasks.md`. When the project it is planning will run under this stack,
+the plan must reflect it — tasks reference proxied tools and `proxy.describe`
+rather than raw `Read`/`Bash`, and the plan includes the proxy-wiring +
+skill-forwarding stories. This is delivered the spec-kit-native way: a
+reference doc (sibling to `reference/code-review-graph.md`) loaded on demand by
+`phases/plan.md` + `phases/tasks.md`, plus a `CLAUDE-STANZA` stamped into the
+generated project so local sessions get a pointer. The planner is the only
+consumer of the full picture; every other persona needs only its one slice
+(table in §7c.3).
+
+### 7c.5 Open question — per-developer proxy profiles
+
+nix-mcp-proxy supports **per-agent profiles** (named tool/field/value subsets,
+resolved per connection — its FR-056). The DAG already carries each story's
+`touches` globs (§3). The open question: should each developer connect under a
+**distinct proxy profile** scoped to its claimed workstream — e.g. a developer
+that owns `servers/edit-surface/**` gets a `git-guard` profile that can only
+commit under that path — turning the conflict-avoidance metadata into an
+*enforced* boundary rather than an advisory one?
+
+- **For:** defense in depth — the proxy would mechanically deny a cross-
+  workstream write even if intent/lock (§6) were bypassed; the `touches`/`shared`
+  data already exists to derive the profile.
+- **Against:** profiles are resolved at connect time but work-stealing (§5)
+  means a developer's claimed set grows *during* the run — a connect-time
+  profile can't widen as it claims more stories without a reconnect. May fit a
+  static per-developer scope (the union of a server's stories) better than a
+  per-story one.
+
+Out of scope for v1 (the coordination correctness layer ships first); recorded
+here because the `touches` → profile mapping is the natural bridge between this
+doc's DAG metadata and the proxy's existing isolation feature.
+
+---
+
 ## 8. Worked example: the 7-server plan
 
 - **Research level** (T005, T010, T014, T018, T022, T026, T030): 7 stories, no
@@ -738,3 +864,8 @@ coordination MCP server.
    agent also be able to *announce* intent / take a file-lock in §7 (so it
    participates in the lock protocol rather than only being repaired-around)?
    Out of scope for v1; the SQLite design doesn't preclude it.
+12. **Per-developer proxy profiles.** Should each developer connect to the
+   proxied toolbelt under a distinct nix-mcp-proxy profile scoped to its
+   workstream `touches` (§3), making conflict-avoidance an *enforced* boundary,
+   not advisory? Full discussion + the connect-time-vs-work-stealing tension in
+   §7c.5. Out of scope for v1.
